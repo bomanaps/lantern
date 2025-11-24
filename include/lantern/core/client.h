@@ -152,6 +152,7 @@ struct lantern_client {
     bool metrics_running;
     struct lantern_http_server http_server;
     bool http_running;
+    bool genesis_fallback_used;
     size_t connected_peers;
     pthread_mutex_t connection_lock;
     bool connection_lock_initialized;

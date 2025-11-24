@@ -140,6 +140,10 @@ static void lantern_client_on_peer_status(
     struct lantern_client *client,
     const LanternStatusMessage *peer_status,
     const char *peer_id);
+static void lantern_client_adopt_peer_genesis(
+    struct lantern_client *client,
+    const LanternStatusMessage *peer_status,
+    const char *peer_id_text);
 static void lantern_client_on_blocks_request_complete(
     struct lantern_client *client,
     const char *peer_id,
@@ -2530,7 +2534,6 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
     int storage_state_rc = lantern_storage_load_state(client->data_dir, &client->state);
     if (storage_state_rc == 0) {
         client->has_state = true;
-        (void)lantern_client_refresh_state_validators(client);
         loaded_from_storage = true;
     } else if (storage_state_rc < 0) {
         lantern_log_error(
@@ -2540,9 +2543,23 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
         goto error;
     } else {
         bool decoded_genesis = false;
-        if (client->genesis.state_bytes && client->genesis.state_size > 0
-            && lantern_ssz_decode_state(&client->state, client->genesis.state_bytes, client->genesis.state_size) == 0) {
+        /* Prefer constructing genesis from config/validators like Zeam does. */
+        if (client->genesis.chain_config.validator_pubkeys
+            && client->genesis.chain_config.validator_pubkeys_count > 0) {
+            size_t vcount = client->genesis.chain_config.validator_pubkeys_count;
+            if (lantern_state_generate_genesis(
+                    &client->state, client->genesis.chain_config.genesis_time, vcount)
+                == 0
+                && lantern_state_set_validator_pubkeys(
+                       &client->state, client->genesis.chain_config.validator_pubkeys, vcount)
+                       == 0) {
+                decoded_genesis = true;
+                client->genesis_fallback_used = false;
+            }
+        } else if (client->genesis.state_bytes && client->genesis.state_size > 0
+                   && lantern_ssz_decode_state(&client->state, client->genesis.state_bytes, client->genesis.state_size) == 0) {
             decoded_genesis = true;
+            client->genesis_fallback_used = false;
         } else {
             lantern_log_warn(
                 "client",
@@ -2592,6 +2609,7 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
                     }
                     if (pubkey_ok && lantern_state_set_validator_pubkeys(&client->state, pubkeys, vcount) == 0) {
                         decoded_genesis = true;
+                        client->genesis_fallback_used = true;
                     }
                     free(pubkeys);
                 }
@@ -2777,7 +2795,6 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
                 spec_header_hex[0] ? spec_header_hex : "0x0",
                 parent_hex[0] ? parent_hex : "0x0");
             client->has_state = true;
-            (void)lantern_client_refresh_state_validators(client);
         }
     }
     if (client->has_state) {
@@ -2852,6 +2869,22 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
             "client",
             &(const struct lantern_log_metadata){.validator = client->node_id},
             "failed to enumerate local validators for '%s'",
+            client->node_id);
+        goto error;
+    }
+    if (client->local_validator_count == 0 || !client->has_state) {
+        lantern_log_error(
+            "client",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "no local validators assigned for '%s'; check validator-config",
+            client->node_id);
+        goto error;
+    }
+    if (lantern_client_refresh_state_validators(client) != 0) {
+        lantern_log_error(
+            "client",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "failed to refresh validator pubkeys for '%s'",
             client->node_id);
         goto error;
     }
@@ -5196,6 +5229,15 @@ static void lantern_client_on_peer_status(
 
     bool should_request = false;
 
+    /* If we bootstrapped via genesis fallback and the peer advertises the genesis head,
+       adopt the peer's head root as our anchor so that subsequent block requests use
+       the correct root. */
+    if (client->genesis_fallback_used && client->has_fork_choice && client->has_state
+        && peer_status->head.slot == 0 && local_slot == 0 && !head_known) {
+        lantern_client_adopt_peer_genesis(client, peer_status, peer_copy);
+        head_known = true;
+    }
+
     if (pthread_mutex_lock(&client->status_lock) != 0) {
         return;
     }
@@ -5288,6 +5330,53 @@ static void lantern_client_on_peer_status(
                 LANTERN_BLOCKS_REQUEST_ABORTED);
         }
     }
+}
+
+static void lantern_client_adopt_peer_genesis(
+    struct lantern_client *client,
+    const LanternStatusMessage *peer_status,
+    const char *peer_id_text) {
+    if (!client || !peer_status || !client->has_fork_choice) {
+        return;
+    }
+
+    LanternBlock anchor;
+    memset(&anchor, 0, sizeof(anchor));
+    anchor.slot = 0;
+    anchor.proposer_index = 0;
+    /* Use the peer's advertised head root as both state_root and hint so our fork-choice
+       anchor matches the peer even if we cannot reproduce their SSZ state. */
+    anchor.state_root = peer_status->head.root;
+    /* empty body / zero attestations */
+    LanternCheckpoint zero_cp = {.root = {{0}}, .slot = 0};
+
+    if (lantern_fork_choice_set_anchor(
+            &client->fork_choice,
+            &anchor,
+            &peer_status->finalized,
+            &peer_status->finalized,
+            &peer_status->head.root)
+        != 0) {
+        lantern_log_warn(
+            "fork_choice",
+            &(const struct lantern_log_metadata){.validator = client->node_id, .peer = peer_id_text},
+            "failed to adopt peer genesis root");
+        return;
+    }
+
+    (void)lantern_fork_choice_set_block_validator_count(
+        &client->fork_choice,
+        &peer_status->head.root,
+        client->state.config.num_validators);
+    client->genesis_fallback_used = false;
+
+    char head_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    format_root_hex(&peer_status->head.root, head_hex, sizeof(head_hex));
+    lantern_log_info(
+        "fork_choice",
+        &(const struct lantern_log_metadata){.validator = client->node_id, .peer = peer_id_text},
+        "adopted peer genesis head_slot=0 root=%s",
+        head_hex);
 }
 
 static void lantern_client_on_blocks_request_complete(
