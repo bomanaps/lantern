@@ -2539,23 +2539,72 @@ int lantern_init(struct lantern_client *client, const struct lantern_client_opti
             "failed to load persisted state");
         goto error;
     } else {
-        if (!client->genesis.state_bytes || client->genesis.state_size == 0) {
-            lantern_log_warn(
-                "client",
-                &(const struct lantern_log_metadata){.validator = client->node_id},
-                "genesis state bytes missing; head snapshot disabled");
-        } else if (lantern_ssz_decode_state(&client->state, client->genesis.state_bytes, client->genesis.state_size) != 0) {
-            lantern_log_warn(
-                "client",
-                &(const struct lantern_log_metadata){.validator = client->node_id},
-                "failed to decode genesis state; head snapshot disabled");
-        } else if (lantern_state_prepare_validator_votes(&client->state, client->state.config.num_validators) != 0) {
-            lantern_log_error(
-                "client",
-                &(const struct lantern_log_metadata){.validator = client->node_id},
-                "failed to prepare validator vote records");
-            goto error;
+        bool decoded_genesis = false;
+        if (client->genesis.state_bytes && client->genesis.state_size > 0
+            && lantern_ssz_decode_state(&client->state, client->genesis.state_bytes, client->genesis.state_size) == 0) {
+            decoded_genesis = true;
         } else {
+            lantern_log_warn(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to decode genesis state; attempting to synthesize genesis from config");
+            /* Fallback: synthesize a minimal genesis state using chain config + validator registry,
+               mirroring Zeam's genesis handling. */
+            size_t vcount = client->genesis.validator_registry.count;
+            if (vcount != client->genesis.chain_config.validator_count || vcount == 0) {
+                lantern_log_warn(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "validator registry count (%zu) does not match chain config (%" PRIu64 "), cannot build genesis",
+                    vcount,
+                    client->genesis.chain_config.validator_count);
+            } else if (lantern_state_generate_genesis(
+                           &client->state, client->genesis.chain_config.genesis_time, vcount)
+                       == 0) {
+                uint8_t *pubkeys = calloc(vcount, LANTERN_VALIDATOR_PUBKEY_SIZE);
+                if (!pubkeys) {
+                    lantern_log_error(
+                        "client",
+                        &(const struct lantern_log_metadata){.validator = client->node_id},
+                        "failed to allocate validator pubkey buffer");
+                } else {
+                    bool pubkey_ok = true;
+                    for (size_t i = 0; i < vcount; ++i) {
+                        const struct lantern_validator_record *rec = &client->genesis.validator_registry.records[i];
+                        if (rec->has_pubkey_bytes) {
+                            memcpy(pubkeys + (i * LANTERN_VALIDATOR_PUBKEY_SIZE), rec->pubkey_bytes, LANTERN_VALIDATOR_PUBKEY_SIZE);
+                        } else if (rec->pubkey_hex
+                                   && lantern_hex_decode(
+                                          rec->pubkey_hex,
+                                          pubkeys + (i * LANTERN_VALIDATOR_PUBKEY_SIZE),
+                                          LANTERN_VALIDATOR_PUBKEY_SIZE)
+                                          == 0) {
+                            /* decoded */
+                        } else {
+                            lantern_log_error(
+                                "client",
+                                &(const struct lantern_log_metadata){.validator = client->node_id},
+                                "missing or invalid pubkey for validator index=%zu; aborting genesis build",
+                                i);
+                            pubkey_ok = false;
+                            break;
+                        }
+                    }
+                    if (pubkey_ok && lantern_state_set_validator_pubkeys(&client->state, pubkeys, vcount) == 0) {
+                        decoded_genesis = true;
+                    }
+                    free(pubkeys);
+                }
+            }
+        }
+        if (decoded_genesis) {
+            if (lantern_state_prepare_validator_votes(&client->state, client->state.config.num_validators) != 0) {
+                lantern_log_error(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to prepare validator vote records");
+                goto error;
+            }
             LanternRoot header_root;
             LanternRoot original_header_state_root = client->state.latest_block_header.state_root;
             LanternRoot state_root;
