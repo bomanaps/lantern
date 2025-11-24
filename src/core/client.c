@@ -5656,11 +5656,13 @@ int lantern_reqresp_read_response_chunk(
         : ((protocol == LANTERN_REQRESP_PROTOCOL_STATUS) || (protocol == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT));
     bool legacy_no_code = !expect_code;
     ssize_t last_err = 0;
+    uint8_t frame_code = 0;
     if (expect_code) {
         while (true) {
             (void)libp2p_stream_set_deadline(stream, LANTERN_REQRESP_STALL_TIMEOUT_MS);
             ssize_t n = libp2p_stream_read(stream, &response_code, 1);
             if (n == 1) {
+                frame_code = response_code;
                 break;
             }
             if (n == (ssize_t)LIBP2P_ERR_AGAIN) {
@@ -5703,6 +5705,7 @@ int lantern_reqresp_read_response_chunk(
             if (out_response_code) {
                 *out_response_code = response_code;
             }
+            frame_code = response_code;
             lantern_log_info(
                 "reqresp",
                 &meta,
@@ -5754,7 +5757,9 @@ int lantern_reqresp_read_response_chunk(
     lantern_log_trace(
         "reqresp",
         &meta,
-        "response using varint framing");
+        "response using varint framing code=0x%02x header_first=0x%02x",
+        (unsigned)frame_code,
+        (unsigned)header_first_byte);
 
     return read_varint_payload_chunk(
         stream,
@@ -5838,6 +5843,15 @@ static int read_varint_payload_chunk(
         label ? label : "chunk",
         payload_len,
         header_hex[0] ? header_hex : "-");
+    if (payload_len > 512) {
+        lantern_log_warn(
+            "reqresp",
+            meta,
+            "%s suspicious large payload_len=%" PRIu64 " header_hex=%s",
+            label ? label : "chunk",
+            payload_len,
+            header_hex[0] ? header_hex : "-");
+    }
 
     if (payload_len > LANTERN_REQRESP_MAX_CHUNK_BYTES || payload_len > SIZE_MAX) {
         if (out_err) {

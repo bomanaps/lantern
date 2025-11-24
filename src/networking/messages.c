@@ -12,27 +12,11 @@
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
 
-/* Status SNAPPY framing mode:
- * Default: framed (RFC 7493 style) to match most libp2p Eth2 RPC stacks.
- * Set LANTERN_STATUS_SNAPPY_RAW=1 to emit raw Snappy blocks instead.
- * The decoder already tolerates both framed and raw encodings. */
-static bool status_use_raw_snappy(void) {
-    static int initialized = 0;
-    static bool use_raw = false;
-    if (initialized) {
-        return use_raw;
-    }
-    initialized = 1;
-    const char *env = getenv("LANTERN_STATUS_SNAPPY_RAW");
-    if (!env || env[0] == '\0') {
-        return use_raw;
-    }
-    if ((env[0] == '1' && env[1] == '\0')
-        || strcasecmp(env, "true") == 0
-        || strcasecmp(env, "yes") == 0) {
-        use_raw = true;
-    }
-    return use_raw;
+/* Status SNAPPY framing mode: always framed (RFC 7493 style) to match Zeam. */
+
+static bool status_payload_is_framed(const uint8_t *data, size_t len) {
+    /* Minimal framed header: chunk type + 24‑bit length + "sNaPpY" magic */
+    return len >= 10 && data[0] == 0xff && memcmp(data + 4, "sNaPpY", 6) == 0;
 }
 
 static int write_u32_le(uint32_t value, uint8_t *out, size_t out_len) {
@@ -262,10 +246,6 @@ int lantern_network_status_encode_snappy(
     if (raw_len) {
         *raw_len = raw_written;
     }
-    if (status_use_raw_snappy()) {
-        int rc = lantern_snappy_compress_raw(raw, raw_written, out, out_len, written);
-        return rc == LANTERN_SNAPPY_OK ? 0 : -1;
-    }
     int rc = lantern_snappy_compress(raw, raw_written, out, out_len, written);
     return rc == LANTERN_SNAPPY_OK ? 0 : -1;
 }
@@ -275,6 +255,10 @@ int lantern_network_status_decode_snappy(
     const uint8_t *data,
     size_t data_len) {
     if (!status || !data) {
+        return -1;
+    }
+    /* Enforce framed snappy: reject raw payloads */
+    if (!status_payload_is_framed(data, data_len)) {
         return -1;
     }
     uint8_t raw[2u * LANTERN_CHECKPOINT_SSZ_SIZE];
