@@ -4251,7 +4251,9 @@ static int metrics_snapshot_cb(void *context, struct lantern_metrics_snapshot *o
     memset(&state_finalized, 0, sizeof(state_finalized));
     bool state_locked = lantern_client_lock_state(client);
     if (client->has_state) {
-        state_head_slot = client->state.slot;
+        /* Use the latest_block_header slot which is the actual block slot,
+           not state.slot which may be advanced during state transition processing */
+        state_head_slot = client->state.latest_block_header.slot;
         state_justified = client->state.latest_justified;
         state_finalized = client->state.latest_finalized;
     }
