@@ -465,6 +465,7 @@ int lantern_gossipsub_service_start(
     cfg.enable_flood_publish = true;
     cfg.on_score_update = lantern_gossipsub_score_update;
     cfg.score_update_user_data = service;
+    cfg.anonymous_mode = true; /* Required for rust-libp2p compatibility (Anonymous validation mode) */
 
     libp2p_gossipsub_t *gs = NULL;
     if (libp2p_gossipsub_new(config->host, &cfg, &gs) != LIBP2P_ERR_OK || !gs) {
