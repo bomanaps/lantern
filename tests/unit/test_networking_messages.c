@@ -581,13 +581,13 @@ static void test_replay_devnet_block_payloads(void) {
     struct block_fixture_case cases[] = {
         {
             .fixture =
-                "consensus/consensus/fork_choice/devnet/fc/test_fork_choice_reorgs/test_reorg_on_newly_justified_slot.json",
+                "consensus/fork_choice/devnet/fc/test_fork_choice_reorgs/test_reorg_on_newly_justified_slot.json",
             .kind = BLOCK_FIXTURE_FORK_CHOICE_STEP,
             .index = 5,
         },
         {
             .fixture =
-                "consensus/consensus/state_transition/devnet/state_transition/test_block_processing/test_linear_chain_multiple_blocks.json",
+                "consensus/state_transition/devnet/state_transition/test_block_processing/test_linear_chain_multiple_blocks.json",
             .kind = BLOCK_FIXTURE_STATE_TRANSITION,
             .index = 1,
         },
