@@ -665,6 +665,32 @@ static bool lantern_state_has_justified_between(
     return false;
 }
 
+/**
+ * Check if any slot between start_slot (exclusive) and end_slot (exclusive)
+ * is justifiable relative to the finalized_slot.
+ *
+ * This implements the LeanSpec finalization check (lines 435-439):
+ *   if not any(
+ *       Slot(slot).is_justifiable_after(self.latest_finalized.slot)
+ *       for slot in range(source_slot + 1, target_slot)
+ *   ):
+ *       latest_finalized = source
+ */
+static bool has_justifiable_slot_between(
+    uint64_t start_slot,
+    uint64_t end_slot,
+    uint64_t finalized_slot) {
+    if (end_slot <= start_slot + 1u) {
+        return false;
+    }
+    for (uint64_t slot = start_slot + 1u; slot < end_slot; ++slot) {
+        if (lantern_slot_is_justifiable(slot, finalized_slot)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slot, bool *out_value) {
     if (!state || !out_value) {
         return -1;
@@ -857,6 +883,7 @@ static int lantern_state_find_justification_root_index(
 
 /**
  * Add a new root to track justification votes for.
+ * Inserts the root in lexicographically sorted order to match LeanSpec behavior.
  * Initializes all validator vote bits to false.
  * Returns the index of the new root, or -1 on error.
  */
@@ -867,21 +894,87 @@ static int lantern_state_add_justification_root(
     if (!state || !root || validator_count == 0) {
         return -1;
     }
-    
-    /* Add the root to the list */
+
+    /* Find the insertion position to maintain sorted order (lexicographically by root bytes) */
+    size_t insert_pos = 0;
+    while (insert_pos < state->justification_roots.length &&
+           memcmp(state->justification_roots.items[insert_pos].bytes, root->bytes, LANTERN_ROOT_SIZE) < 0) {
+        insert_pos++;
+    }
+
+    /* First, expand the root list by appending (we'll shift elements afterward) */
     if (lantern_root_list_append(&state->justification_roots, root) != 0) {
         return -1;
     }
-    
-    /* Expand justification_validators bitlist by validator_count bits (all false) */
+
+    /* Expand justification_validators bitlist by validator_count bits */
+    size_t old_root_count = state->justification_roots.length - 1;
     size_t new_bit_length = state->justification_validators.bit_length + validator_count;
     if (lantern_bitlist_ensure_length(&state->justification_validators, new_bit_length) != 0) {
         /* Rollback root addition */
         state->justification_roots.length--;
         return -1;
     }
-    
-    return (int)(state->justification_roots.length - 1);
+
+    /* If inserting at the end, we're done - no shifting needed */
+    if (insert_pos == old_root_count) {
+        return (int)insert_pos;
+    }
+
+    /* Shift roots from insert_pos to make room for the new root.
+     * The new root is currently at the end, we need to move it to insert_pos. */
+    LanternRoot temp_root = state->justification_roots.items[old_root_count];
+    for (size_t i = old_root_count; i > insert_pos; --i) {
+        state->justification_roots.items[i] = state->justification_roots.items[i - 1];
+    }
+    state->justification_roots.items[insert_pos] = temp_root;
+
+    /* Shift validator bits to match the new root order.
+     * We need to move bits from [insert_pos * validator_count] onward.
+     * The bits for the new root (currently at the end) should move to insert_pos. */
+    size_t bits_to_shift = (old_root_count - insert_pos) * validator_count;
+    if (bits_to_shift > 0) {
+        /* Create a temporary buffer to hold the bits we need to shift */
+        size_t shift_start_bit = insert_pos * validator_count;
+        size_t new_root_start_bit = old_root_count * validator_count;
+
+        /* Copy existing bits from insert_pos onward to temporary storage */
+        size_t temp_bytes_needed = (bits_to_shift + 7) / 8;
+        uint8_t *temp_bits = (uint8_t *)calloc(temp_bytes_needed, 1);
+        if (!temp_bits) {
+            /* Can't shift bits - this is a critical error but we'll proceed with unsorted */
+            return (int)insert_pos;
+        }
+
+        /* Extract bits from [shift_start_bit, new_root_start_bit) */
+        for (size_t i = 0; i < bits_to_shift; ++i) {
+            bool bit_value = false;
+            if (lantern_bitlist_get_bit(&state->justification_validators, shift_start_bit + i, &bit_value) == 0 && bit_value) {
+                temp_bits[i / 8] |= (uint8_t)(1u << (i % 8));
+            }
+        }
+
+        /* Clear the region we're about to rewrite: [shift_start_bit, new_bit_length) */
+        for (size_t i = shift_start_bit; i < new_bit_length; ++i) {
+            lantern_bitlist_set_bit(&state->justification_validators, i, false);
+        }
+
+        /* Write zeros at insert_pos (validator_count bits) - new root votes are all false */
+        /* (already done by clearing above) */
+
+        /* Write shifted bits starting at (insert_pos + 1) * validator_count */
+        size_t dest_start = (insert_pos + 1) * validator_count;
+        for (size_t i = 0; i < bits_to_shift; ++i) {
+            bool bit_value = (temp_bits[i / 8] & (1u << (i % 8))) != 0;
+            if (bit_value) {
+                lantern_bitlist_set_bit(&state->justification_validators, dest_start + i, true);
+            }
+        }
+
+        free(temp_bits);
+    }
+
+    return (int)insert_pos;
 }
 
 /**
@@ -1537,6 +1630,59 @@ static int lantern_state_process_attestations_internal(
             record_attestation_validation_metric(att_validation_start, false);
             continue;
         }
+
+        /* Source root must match the state's historical block hashes (leanSpec line 398) */
+        size_t source_slot_idx = (size_t)vote->source.slot;
+        if (source_slot_idx >= state->historical_block_hashes.length) {
+            if (debug_hash && debug_hash[0] != '\0') {
+                lantern_log_debug(
+                    "state",
+                    NULL,
+                    "attestation rejected: source_slot=%" PRIu64 " >= historical_hashes.len=%zu",
+                    vote->source.slot,
+                    state->historical_block_hashes.length);
+            }
+            record_attestation_validation_metric(att_validation_start, false);
+            continue;
+        }
+        if (memcmp(vote->source.root.bytes, state->historical_block_hashes.items[source_slot_idx].bytes, LANTERN_ROOT_SIZE) != 0) {
+            if (debug_hash && debug_hash[0] != '\0') {
+                lantern_log_debug(
+                    "state",
+                    NULL,
+                    "attestation rejected: source_slot=%" PRIu64 " root mismatch",
+                    vote->source.slot);
+            }
+            record_attestation_validation_metric(att_validation_start, false);
+            continue;
+        }
+
+        /* Target root must match the state's historical block hashes (leanSpec line 402) */
+        size_t target_slot_idx = (size_t)vote->target.slot;
+        if (target_slot_idx >= state->historical_block_hashes.length) {
+            if (debug_hash && debug_hash[0] != '\0') {
+                lantern_log_debug(
+                    "state",
+                    NULL,
+                    "attestation rejected: target_slot=%" PRIu64 " >= historical_hashes.len=%zu",
+                    vote->target.slot,
+                    state->historical_block_hashes.length);
+            }
+            record_attestation_validation_metric(att_validation_start, false);
+            continue;
+        }
+        if (memcmp(vote->target.root.bytes, state->historical_block_hashes.items[target_slot_idx].bytes, LANTERN_ROOT_SIZE) != 0) {
+            if (debug_hash && debug_hash[0] != '\0') {
+                lantern_log_debug(
+                    "state",
+                    NULL,
+                    "attestation rejected: target_slot=%" PRIu64 " root mismatch",
+                    vote->target.slot);
+            }
+            record_attestation_validation_metric(att_validation_start, false);
+            continue;
+        }
+
         if (trace_finalization) {
             lantern_log_debug(
                 "state",
@@ -1703,9 +1849,30 @@ static int lantern_state_process_attestations_internal(
                     vote->target.slot);
             }
 
-            /* Finalization: if the target is the next valid justifiable slot after source (leanSpec lines 435-439) */
-            bool vote_has_consecutive_source =
-                !lantern_state_has_justified_between(state, vote->source.slot, vote->target.slot);
+            /* Finalization: if the target is the next valid justifiable slot after source (leanSpec lines 435-439)
+             *
+             * The key is to check if there's any JUSTIFIABLE slot between source and target,
+             * relative to the current finalized slot. Both Zeam and the devnet use the progressively
+             * updated finalized slot during the loop (self.latest_finalized in Zeam, line 411).
+             *
+             * IMPORTANT: We use latest_finalized.slot (the locally updated value) to match Zeam behavior.
+             */
+            bool has_justifiable_between = has_justifiable_slot_between(
+                vote->source.slot, vote->target.slot, latest_finalized.slot);
+            bool vote_has_consecutive_source = !has_justifiable_between;
+
+            if (debug_hash && debug_hash[0] != '\0') {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization check: source=%" PRIu64 " target=%" PRIu64 " cur_finalized=%" PRIu64
+                    " has_justifiable_between=%s vote_consecutive=%s",
+                    vote->source.slot,
+                    vote->target.slot,
+                    latest_finalized.slot,
+                    has_justifiable_between ? "true" : "false",
+                    vote_has_consecutive_source ? "true" : "false");
+            }
 
             if (trace_finalization) {
                 lantern_log_debug(
@@ -1724,13 +1891,13 @@ static int lantern_state_process_attestations_internal(
                 /* Finalize the source checkpoint */
                 latest_finalized = vote->source;
                 if (debug_hash && debug_hash[0] != '\0') {
-                    char target_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+                    char source_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
                     if (
                         lantern_bytes_to_hex(
-                            vote->target.root.bytes,
+                            vote->source.root.bytes,
                             LANTERN_ROOT_SIZE,
-                            target_hex,
-                            sizeof(target_hex),
+                            source_hex,
+                            sizeof(source_hex),
                             1)
                         == 0) {
                         lantern_log_debug(
@@ -1738,7 +1905,7 @@ static int lantern_state_process_attestations_internal(
                             &meta,
                             "finalized slot=%" PRIu64 " root=%s",
                             vote->source.slot,
-                            target_hex);
+                            source_hex);
                     }
                 }
                 if (trace_finalization) {

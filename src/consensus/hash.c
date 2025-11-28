@@ -140,6 +140,133 @@ static int hash_empty_bitlist_root(size_t bit_limit, LanternRoot *out_root) {
     return ssz_mix_in_length(zero_root.bytes, 0, out_root->bytes) == SSZ_SUCCESS ? 0 : -1;
 }
 
+/**
+ * Compare two LanternRoot values lexicographically.
+ * Returns negative if a < b, positive if a > b, zero if equal.
+ */
+static int compare_roots(const void *a, const void *b) {
+    return memcmp(((const LanternRoot *)a)->bytes, ((const LanternRoot *)b)->bytes, LANTERN_ROOT_SIZE);
+}
+
+/**
+ * Merkleize justification roots and validators with sorted root ordering.
+ * LeanSpec sorts justification roots before storing, so we must do the same
+ * during hashing to ensure consistent state roots across implementations.
+ */
+static int merkleize_sorted_justifications(
+    const struct lantern_root_list *roots,
+    const struct lantern_bitlist *validators,
+    size_t validator_count,
+    LanternRoot *out_roots_root,
+    LanternRoot *out_validators_root) {
+
+    if (!roots || !validators || !out_roots_root || !out_validators_root) {
+        return -1;
+    }
+
+    size_t root_count = roots->length;
+    size_t bits_per_chunk = SSZ_BYTES_PER_CHUNK * 8u;
+
+    /* Handle empty case */
+    if (root_count == 0) {
+        if (hash_empty_list_root(LANTERN_HISTORICAL_ROOTS_LIMIT, out_roots_root) != 0) {
+            return -1;
+        }
+        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, out_validators_root) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Allocate arrays for sorting */
+    size_t *sort_indices = malloc(root_count * sizeof(size_t));
+    LanternRoot *sorted_roots = malloc(root_count * sizeof(LanternRoot));
+    if (!sort_indices || !sorted_roots) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Initialize indices and copy roots */
+    for (size_t i = 0; i < root_count; ++i) {
+        sort_indices[i] = i;
+        memcpy(&sorted_roots[i], &roots->items[i], sizeof(LanternRoot));
+    }
+
+    /* Sort roots and track original indices using insertion sort (stable, simple) */
+    for (size_t i = 1; i < root_count; ++i) {
+        LanternRoot key_root = sorted_roots[i];
+        size_t key_index = sort_indices[i];
+        size_t j = i;
+        while (j > 0 && compare_roots(&sorted_roots[j - 1], &key_root) > 0) {
+            sorted_roots[j] = sorted_roots[j - 1];
+            sort_indices[j] = sort_indices[j - 1];
+            --j;
+        }
+        sorted_roots[j] = key_root;
+        sort_indices[j] = key_index;
+    }
+
+    /* Create sorted root list for merkleization */
+    struct lantern_root_list sorted_root_list;
+    sorted_root_list.items = sorted_roots;
+    sorted_root_list.length = root_count;
+    sorted_root_list.capacity = root_count;
+
+    if (lantern_merkleize_root_list(&sorted_root_list, LANTERN_HISTORICAL_ROOTS_LIMIT, out_roots_root) != 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Reorder validator bits according to sorted root order */
+    size_t total_bits = validators->bit_length;
+    if (total_bits == 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, out_validators_root) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Create reordered bitlist */
+    struct lantern_bitlist sorted_validators;
+    lantern_bitlist_init(&sorted_validators);
+    if (lantern_bitlist_resize(&sorted_validators, total_bits) != 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Copy bits in sorted order: for each sorted root position, copy bits from original position */
+    for (size_t sorted_idx = 0; sorted_idx < root_count; ++sorted_idx) {
+        size_t original_idx = sort_indices[sorted_idx];
+        for (size_t v = 0; v < validator_count; ++v) {
+            size_t src_bit = original_idx * validator_count + v;
+            size_t dst_bit = sorted_idx * validator_count + v;
+            if (src_bit < validators->bit_length && bitlist_bit_is_set(validators, src_bit)) {
+                /* Set the bit in sorted_validators */
+                size_t byte_index = dst_bit / 8u;
+                uint8_t mask = (uint8_t)(1u << (dst_bit % 8u));
+                if (byte_index < sorted_validators.capacity) {
+                    sorted_validators.bytes[byte_index] |= mask;
+                }
+            }
+        }
+    }
+
+    size_t justification_validators_chunk_limit =
+        (LANTERN_JUSTIFICATION_VALIDATORS_LIMIT + bits_per_chunk - 1u) / bits_per_chunk;
+    int result = lantern_merkleize_bitlist(&sorted_validators, justification_validators_chunk_limit, out_validators_root);
+
+    lantern_bitlist_reset(&sorted_validators);
+    free(sort_indices);
+    free(sorted_roots);
+
+    return result;
+}
+
 int lantern_hash_tree_root_config(const LanternConfig *config, LanternRoot *out_root) {
     if (!config || !out_root) {
         return -1;
@@ -513,27 +640,15 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
     } else if (lantern_merkleize_bitlist(&state->justified_slots, justified_chunk_limit, &justified_slots_root) != 0) {
         return -1;
     }
-    if (state->justification_roots.length == 0) {
-        if (hash_empty_list_root(LANTERN_HISTORICAL_ROOTS_LIMIT, &justification_roots_root) != 0) {
-            return -1;
-        }
-    } else if (
-        lantern_merkleize_root_list(&state->justification_roots, LANTERN_HISTORICAL_ROOTS_LIMIT, &justification_roots_root)
-        != 0) {
-        return -1;
-    }
-    size_t justification_validators_chunk_limit =
-        (LANTERN_JUSTIFICATION_VALIDATORS_LIMIT + bits_per_chunk - 1u) / bits_per_chunk;
-    if (state->justification_validators.bit_length == 0) {
-        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, &justification_validators_root) != 0) {
-            return -1;
-        }
-    } else if (
-        lantern_merkleize_bitlist(
+    /* Merkleize justification roots and validators with sorted ordering.
+     * LeanSpec sorts justification roots lexicographically before hashing,
+     * so we must do the same to produce matching state roots. */
+    if (merkleize_sorted_justifications(
+            &state->justification_roots,
             &state->justification_validators,
-            justification_validators_chunk_limit,
-            &justification_validators_root)
-        != 0) {
+            state->validator_count,
+            &justification_roots_root,
+            &justification_validators_root) != 0) {
         return -1;
     }
 
