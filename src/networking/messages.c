@@ -12,6 +12,13 @@
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
 
+/* Status SNAPPY framing mode: always framed (RFC 7493 style) to match Zeam. */
+
+static bool status_payload_is_framed(const uint8_t *data, size_t len) {
+    /* Minimal framed header: chunk type + 24‑bit length + "sNaPpY" magic */
+    return len >= 10 && data[0] == 0xff && memcmp(data + 4, "sNaPpY", 6) == 0;
+}
+
 static int write_u32_le(uint32_t value, uint8_t *out, size_t out_len) {
     if (!out || out_len < sizeof(uint32_t)) {
         return -1;
@@ -250,6 +257,10 @@ int lantern_network_status_decode_snappy(
     if (!status || !data) {
         return -1;
     }
+    /* Enforce framed snappy: reject raw payloads */
+    if (!status_payload_is_framed(data, data_len)) {
+        return -1;
+    }
     uint8_t raw[2u * LANTERN_CHECKPOINT_SSZ_SIZE];
     size_t raw_written = sizeof(raw);
     int rc = lantern_snappy_decompress(data, data_len, raw, sizeof(raw), &raw_written);
@@ -270,17 +281,25 @@ int lantern_network_blocks_by_root_request_encode(
     if (req->roots.length > LANTERN_MAX_REQUEST_BLOCKS) {
         return -1;
     }
+    /* SSZ container: one variable field (roots list) -> 4‑byte offset + payload */
+    const uint32_t offset = (uint32_t)sizeof(uint32_t);
     size_t roots_bytes = req->roots.length * LANTERN_ROOT_SIZE;
-    if (out_len < roots_bytes) {
+    size_t total_bytes = sizeof(uint32_t) + roots_bytes;
+    if (out_len < total_bytes) {
         return -1;
     }
+    /* fixed part */
+    if (write_u32_le(offset, out, out_len) != 0) {
+        return -1;
+    }
+    /* variable part */
     if (roots_bytes > 0) {
         if (!req->roots.items) {
             return -1;
         }
-        memcpy(out, req->roots.items, roots_bytes);
+        memcpy(out + sizeof(uint32_t), req->roots.items, roots_bytes);
     }
-    *written = roots_bytes;
+    *written = total_bytes;
     return 0;
 }
 
@@ -291,6 +310,36 @@ int lantern_network_blocks_by_root_request_decode(
     if (!req || (!data && data_len > 0)) {
         return -1;
     }
+
+    /* New-format decode: expect 4‑byte offset to variable section */
+    if (data_len >= sizeof(uint32_t)) {
+        uint32_t offset = 0;
+        if (read_u32_le(data, data_len, &offset) != 0) {
+            return -1;
+        }
+        if (offset >= sizeof(uint32_t) && offset <= data_len && (offset % sizeof(uint32_t)) == 0) {
+            size_t roots_bytes = data_len - offset;
+            if (roots_bytes % LANTERN_ROOT_SIZE != 0) {
+                return -1;
+            }
+            size_t count = roots_bytes / LANTERN_ROOT_SIZE;
+            if (count > LANTERN_MAX_REQUEST_BLOCKS) {
+                return -1;
+            }
+            if (lantern_root_list_resize(&req->roots, (uint32_t)count) != 0) {
+                return -1;
+            }
+            if (count > 0) {
+                if (!req->roots.items) {
+                    return -1;
+                }
+                memcpy(req->roots.items, data + offset, roots_bytes);
+            }
+            return 0;
+        }
+    }
+
+    /* Legacy fallback (no offset) */
     if (data_len % LANTERN_ROOT_SIZE != 0) {
         return -1;
     }
@@ -323,7 +372,7 @@ int lantern_network_blocks_by_root_request_encode_snappy(
     if (!req || !out || !written) {
         return -1;
     }
-    size_t raw_size = req->roots.length * LANTERN_ROOT_SIZE;
+    size_t raw_size = sizeof(uint32_t) + (req->roots.length * LANTERN_ROOT_SIZE);
     uint8_t *raw = alloc_scratch(raw_size);
     if (!raw) {
         return -1;

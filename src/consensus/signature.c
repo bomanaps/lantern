@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "lantern/support/log.h"
 #include "pq-bindings-c-rust.h"
 
 static bool bytes_are_zero(const uint8_t *bytes, size_t length) {
@@ -44,7 +45,7 @@ bool lantern_signature_verify(
     struct PQSignatureSchemePublicKey *pq_pubkey = NULL;
     enum PQSigningError pk_err = pq_public_key_deserialize(pubkey_bytes, pubkey_len, &pq_pubkey);
     if (pk_err != Success || !pq_pubkey) {
-        fprintf(stderr, "[sig_debug] pq_public_key_deserialize failed err=%d len=%zu\n", (int)pk_err, pubkey_len);
+        lantern_log_debug("signature", NULL, "pq_public_key_deserialize failed err=%d len=%zu", (int)pk_err, pubkey_len);
         return false;
     }
     bool ok = lantern_signature_verify_pk(pq_pubkey, epoch, signature, message, message_len);
@@ -65,15 +66,24 @@ bool lantern_signature_verify_pk(
         return false;
     }
     struct PQSignature *pq_signature = NULL;
+    // Use bincode format (compatible with Zeam/LeanSig)
+    // Note: SSZ/lean bytes format is not supported by LeanSig internals
     enum PQSigningError sig_err =
-        pq_signature_deserialize(signature->bytes, sizeof(signature->bytes), &pq_signature);
+        pq_signature_deserialize_bincode(signature->bytes, sizeof(signature->bytes), &pq_signature);
     if (sig_err != Success || !pq_signature) {
+        lantern_log_debug("signature", NULL, "signature deserialize (bincode) failed");
         return false;
     }
+    // SSZ/lean bytes format - commented out as LeanSig doesn't support SSZ
+    // enum PQSigningError sig_err =
+    //     pq_signature_deserialize(signature->bytes, sizeof(signature->bytes), &pq_signature);
+    // if (sig_err != Success || !pq_signature) {
+    //     return false;
+    // }
     int verify_rc = pq_verify(pubkey, epoch, message, message_len, pq_signature);
     pq_signature_free(pq_signature);
     if (verify_rc != 1) {
-        fprintf(stderr, "[sig_debug] pq_verify rc=%d\n", verify_rc);
+        lantern_log_debug("signature", NULL, "pq_verify rc=%d", verify_rc);
     }
     return verify_rc == 1;
 }
@@ -97,16 +107,25 @@ bool lantern_signature_sign(
     }
 
     uintptr_t written = 0;
-    enum PQSigningError serialize_err = pq_signature_serialize(
+    // Use bincode format (compatible with Zeam/LeanSig)
+    // Note: SSZ/lean bytes format is not supported by LeanSig internals
+    enum PQSigningError serialize_err = pq_signature_serialize_bincode(
         pq_signature,
         out_signature->bytes,
         sizeof(out_signature->bytes),
         &written);
+    // SSZ/lean bytes format - commented out as LeanSig doesn't support SSZ
+    // enum PQSigningError serialize_err = pq_signature_serialize(
+    //     pq_signature,
+    //     out_signature->bytes,
+    //     sizeof(out_signature->bytes),
+    //     &written);
     pq_signature_free(pq_signature);
     if (serialize_err != Success || written == 0 || written > sizeof(out_signature->bytes)) {
-        fprintf(
-            stderr,
-            "lantern_signature_sign serialize failed err=%d needed=%zu buffer=%zu\n",
+        lantern_log_error(
+            "signature",
+            NULL,
+            "lantern_signature_sign serialize failed err=%d needed=%zu buffer=%zu",
             (int)serialize_err,
             (size_t)written,
             sizeof(out_signature->bytes));

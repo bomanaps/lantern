@@ -1,5 +1,6 @@
 #include "lantern/genesis/genesis.h"
 
+#include "lantern/support/log.h"
 #include "lantern/support/strings.h"
 #include "lantern/support/secure_mem.h"
 #include "lantern/networking/libp2p.h"
@@ -24,6 +25,10 @@ static int parse_validator_registry_mapping(const char *path, struct lantern_val
 static int parse_validator_config(const char *path, struct lantern_validator_config *config);
 static int parse_nodes_file(const char *path, struct lantern_enr_record_list *list);
 static int read_state_blob(const char *path, uint8_t **bytes, size_t *size);
+static int parse_genesis_validator_pubkeys(const char *path, uint8_t **out_pubkeys, size_t *out_count);
+static void merge_chain_pubkeys_into_registry(
+    const struct lantern_chain_config *config,
+    struct lantern_validator_registry *registry);
 
 static uint64_t parse_u64(const char *value, int *ok);
 static char *dup_trimmed(const char *value);
@@ -62,6 +67,11 @@ void lantern_genesis_artifacts_reset(struct lantern_genesis_artifacts *artifacts
     artifacts->state_size = 0;
     artifacts->chain_config.genesis_time = 0;
     artifacts->chain_config.validator_count = 0;
+    if (artifacts->chain_config.validator_pubkeys) {
+        free(artifacts->chain_config.validator_pubkeys);
+        artifacts->chain_config.validator_pubkeys = NULL;
+    }
+    artifacts->chain_config.validator_pubkeys_count = 0;
 }
 
 int lantern_genesis_load(struct lantern_genesis_artifacts *artifacts, const struct lantern_genesis_paths *paths) {
@@ -71,7 +81,7 @@ int lantern_genesis_load(struct lantern_genesis_artifacts *artifacts, const stru
 
     if (!paths->config_path || !paths->validator_registry_path || !paths->nodes_path || !paths->state_path
         || !paths->validator_config_path) {
-        fprintf(stderr, "lantern: missing required genesis path\n");
+        lantern_log_error("genesis", NULL, "missing required genesis path");
         return -1;
     }
 
@@ -79,27 +89,47 @@ int lantern_genesis_load(struct lantern_genesis_artifacts *artifacts, const stru
     lantern_genesis_artifacts_init(artifacts);
 
     if (parse_chain_config(paths->config_path, &artifacts->chain_config) != 0) {
-        fprintf(stderr, "lantern: failed to parse chain config at %s\n", paths->config_path);
+        lantern_log_error("genesis", NULL, "failed to parse chain config at %s", paths->config_path);
         goto error;
+    }
+
+    if (!artifacts->chain_config.validator_pubkeys || artifacts->chain_config.validator_pubkeys_count == 0) {
+        uint8_t *pubkeys = NULL;
+        size_t pubkey_count = 0;
+        if (parse_genesis_validator_pubkeys(paths->config_path, &pubkeys, &pubkey_count) == 0
+            && pubkeys && pubkey_count > 0) {
+            artifacts->chain_config.validator_pubkeys = pubkeys;
+            artifacts->chain_config.validator_pubkeys_count = pubkey_count;
+            if (artifacts->chain_config.validator_count == 0) {
+                artifacts->chain_config.validator_count = pubkey_count;
+            }
+            lantern_log_info("genesis", NULL, "loaded %zu genesis pubkeys from %s", pubkey_count, paths->config_path);
+        } else {
+            free(pubkeys);
+            lantern_log_warn("genesis", NULL, "no genesis pubkeys found in %s", paths->config_path);
+        }
     }
 
     if (parse_validator_registry(paths->validator_registry_path, &artifacts->validator_registry) != 0) {
-        fprintf(stderr, "lantern: failed to parse validator registry at %s\n", paths->validator_registry_path);
+        lantern_log_error("genesis", NULL, "failed to parse validator registry at %s", paths->validator_registry_path);
         goto error;
     }
 
+    /* If validators.yaml only lists indices (lean quickstart), hydrate pubkeys from config.yaml */
+    merge_chain_pubkeys_into_registry(&artifacts->chain_config, &artifacts->validator_registry);
+
     if (parse_nodes_file(paths->nodes_path, &artifacts->enrs) != 0) {
-        fprintf(stderr, "lantern: failed to parse nodes at %s\n", paths->nodes_path);
+        lantern_log_error("genesis", NULL, "failed to parse nodes at %s", paths->nodes_path);
         goto error;
     }
 
     if (parse_validator_config(paths->validator_config_path, &artifacts->validator_config) != 0) {
-        fprintf(stderr, "lantern: failed to parse validator-config at %s\n", paths->validator_config_path);
+        lantern_log_error("genesis", NULL, "failed to parse validator-config at %s", paths->validator_config_path);
         goto error;
     }
 
     if (read_state_blob(paths->state_path, &artifacts->state_bytes, &artifacts->state_size) != 0) {
-        fprintf(stderr, "lantern: failed to read genesis state at %s\n", paths->state_path);
+        lantern_log_error("genesis", NULL, "failed to read genesis state at %s", paths->state_path);
         goto error;
     }
 
@@ -473,18 +503,114 @@ static int set_record_pubkey(struct lantern_validator_record *record) {
     return 0;
 }
 
+static void merge_chain_pubkeys_into_registry(
+    const struct lantern_chain_config *config,
+    struct lantern_validator_registry *registry) {
+    if (!config || !registry || !registry->records || registry->count == 0) {
+        return;
+    }
+    if (!config->validator_pubkeys || config->validator_pubkeys_count == 0) {
+        return;
+    }
+    size_t limit = registry->count;
+    if (config->validator_pubkeys_count < limit) {
+        limit = config->validator_pubkeys_count;
+    }
+    for (size_t i = 0; i < limit; ++i) {
+        struct lantern_validator_record *rec = &registry->records[i];
+        if (!rec->has_pubkey_bytes) {
+            memcpy(
+                rec->pubkey_bytes,
+                config->validator_pubkeys + (i * LANTERN_VALIDATOR_PUBKEY_SIZE),
+                LANTERN_VALIDATOR_PUBKEY_SIZE);
+            rec->has_pubkey_bytes = true;
+        }
+        if (!rec->pubkey_hex) {
+            char hex[(LANTERN_VALIDATOR_PUBKEY_SIZE * 2u) + 3u];
+            if (lantern_bytes_to_hex(
+                    rec->pubkey_bytes,
+                    LANTERN_VALIDATOR_PUBKEY_SIZE,
+                    hex,
+                    sizeof(hex),
+                    1)
+                == 0) {
+                rec->pubkey_hex = lantern_string_duplicate(hex);
+            }
+        }
+    }
+}
+
 static int parse_chain_config(const char *path, struct lantern_chain_config *config) {
+    if (!config) {
+        return -1;
+    }
+
+    /* clear any existing pubkeys before re-populating */
+    if (config->validator_pubkeys) {
+        free(config->validator_pubkeys);
+        config->validator_pubkeys = NULL;
+    }
+    config->validator_pubkeys_count = 0;
+
     FILE *fp = fopen(path, "r");
     if (!fp) {
         perror("lantern: fopen chain config");
         return -1;
     }
 
+    uint8_t *pubkeys = NULL;
+    size_t pubkeys_count = 0;
+    size_t pubkeys_cap = 0;
+    bool in_pubkey_array = false;
+
     char line[1024];
     while (fgets(line, sizeof(line), fp)) {
         char *trimmed = trim_whitespace(line);
         if (*trimmed == '#' || *trimmed == '\0') {
             continue;
+        }
+
+        if (strncmp(trimmed, "GENESIS_VALIDATORS", strlen("GENESIS_VALIDATORS")) == 0) {
+            in_pubkey_array = true;
+            continue;
+        }
+        if (in_pubkey_array) {
+            if (*trimmed != '-') {
+                /* end of the list */
+                in_pubkey_array = false;
+            } else {
+                char *val = trimmed + 1;
+                while (*val && isspace((unsigned char)*val)) {
+                    ++val;
+                }
+                if (*val == '"') {
+                    ++val;
+                    char *endq = strrchr(val, '"');
+                    if (endq) {
+                        *endq = '\0';
+                    }
+                }
+                uint8_t decoded[LANTERN_VALIDATOR_PUBKEY_SIZE];
+                if (decode_validator_pubkey_hex(val, decoded) != 0) {
+                    fclose(fp);
+                    free(pubkeys);
+                    return -1;
+                }
+                if (pubkeys_count == pubkeys_cap) {
+                    size_t new_cap = pubkeys_cap == 0 ? 4 : pubkeys_cap * 2;
+                    uint8_t *grown = realloc(pubkeys, new_cap * LANTERN_VALIDATOR_PUBKEY_SIZE);
+                    if (!grown) {
+                        fclose(fp);
+                        free(pubkeys);
+                        return -1;
+                    }
+                    pubkeys = grown;
+                    pubkeys_cap = new_cap;
+                }
+                memcpy(pubkeys + (pubkeys_count * LANTERN_VALIDATOR_PUBKEY_SIZE), decoded, LANTERN_VALIDATOR_PUBKEY_SIZE);
+                pubkeys_count++;
+                continue;
+            }
         }
 
         char *sep = strchr(trimmed, ':');
@@ -500,6 +626,7 @@ static int parse_chain_config(const char *path, struct lantern_chain_config *con
             config->genesis_time = parse_u64(value, &ok);
             if (!ok) {
                 fclose(fp);
+                free(pubkeys);
                 return -1;
             }
         } else if (strcmp(key, "VALIDATOR_COUNT") == 0) {
@@ -507,6 +634,7 @@ static int parse_chain_config(const char *path, struct lantern_chain_config *con
             config->validator_count = parse_u64(value, &ok);
             if (!ok) {
                 fclose(fp);
+                free(pubkeys);
                 return -1;
             }
         }
@@ -514,9 +642,100 @@ static int parse_chain_config(const char *path, struct lantern_chain_config *con
 
     fclose(fp);
 
+    if (pubkeys_count > 0) {
+        config->validator_pubkeys = pubkeys;
+        config->validator_pubkeys_count = pubkeys_count;
+    } else {
+        free(pubkeys);
+    }
+
+    if (config->validator_count == 0 && pubkeys_count > 0) {
+        config->validator_count = pubkeys_count;
+    }
+
     if (config->genesis_time == 0 || config->validator_count == 0) {
         return -1;
     }
+    return 0;
+}
+
+/* Lightweight parser for GENESIS_VALIDATORS array used by lean quickstart configs. */
+static int parse_genesis_validator_pubkeys(const char *path, uint8_t **out_pubkeys, size_t *out_count) {
+    if (!path || !out_pubkeys || !out_count) {
+        return -1;
+    }
+    *out_pubkeys = NULL;
+    *out_count = 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return -1;
+    }
+
+    bool in_array = false;
+    size_t count = 0;
+    size_t cap = 0;
+    uint8_t *pubkeys = NULL;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), fp)) {
+        char *trimmed = trim_whitespace(line);
+        if (*trimmed == '#' || *trimmed == '\0') {
+            continue;
+        }
+        if (strncmp(trimmed, "GENESIS_VALIDATORS", strlen("GENESIS_VALIDATORS")) == 0) {
+            in_array = true;
+            continue;
+        }
+        if (!in_array) {
+            continue;
+        }
+        if (*trimmed != '-') {
+            /* end of list */
+            in_array = false;
+            continue;
+        }
+
+        char *val = trimmed + 1;
+        while (*val && isspace((unsigned char)*val)) {
+            ++val;
+        }
+        if (*val == '"') {
+            ++val;
+            char *endq = strrchr(val, '"');
+            if (endq) {
+                *endq = '\0';
+            }
+        }
+        uint8_t decoded[LANTERN_VALIDATOR_PUBKEY_SIZE];
+        if (decode_validator_pubkey_hex(val, decoded) != 0) {
+            free(pubkeys);
+            fclose(fp);
+            return -1;
+        }
+        if (count == cap) {
+            size_t new_cap = cap == 0 ? 4 : cap * 2;
+            uint8_t *grown = realloc(pubkeys, new_cap * LANTERN_VALIDATOR_PUBKEY_SIZE);
+            if (!grown) {
+                free(pubkeys);
+                fclose(fp);
+                return -1;
+            }
+            pubkeys = grown;
+            cap = new_cap;
+        }
+        memcpy(pubkeys + (count * LANTERN_VALIDATOR_PUBKEY_SIZE), decoded, LANTERN_VALIDATOR_PUBKEY_SIZE);
+        count++;
+    }
+
+    fclose(fp);
+    if (count == 0) {
+        free(pubkeys);
+        return 0;
+    }
+
+    *out_pubkeys = pubkeys;
+    *out_count = count;
     return 0;
 }
 
@@ -788,12 +1007,15 @@ static int parse_validator_config(const char *path, struct lantern_validator_con
         }
         entries[i].enr.quic_port = (uint16_t)quic_port;
 
-        entries[i].enr.sequence = parse_u64(seq_val, &ok);
-        if (!ok) {
-            lantern_yaml_free_objects(objects, count);
-            free_validator_config_entry(&entries[i]);
-            free(entries);
-            return -1;
+        entries[i].enr.sequence = 1; // default ENR sequence if unspecified
+        if (seq_val && *seq_val) {
+            entries[i].enr.sequence = parse_u64(seq_val, &ok);
+            if (!ok) {
+                lantern_yaml_free_objects(objects, count);
+                free_validator_config_entry(&entries[i]);
+                free(entries);
+                return -1;
+            }
         }
         entries[i].hash_sig_dir = dup_trimmed(hash_dir_val);
         entries[i].has_range = false;

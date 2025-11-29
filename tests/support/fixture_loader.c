@@ -655,9 +655,39 @@ int lantern_fixture_parse_signed_block(
         return -1;
     }
     lantern_signed_block_with_attestation_init(signed_block);
+
+    /* Try new leanSpec format: { "block": {...}, "proposer_attestation": {...} } */
+    int block_idx = lantern_fixture_object_get_field(doc, object_index, "block");
+    int proposer_idx = lantern_fixture_object_get_field(doc, object_index, "proposer_attestation");
+    if (block_idx >= 0 && proposer_idx >= 0) {
+        if (lantern_fixture_parse_block(doc, block_idx, &signed_block->message.block) != 0) {
+            goto error;
+        }
+        LanternSignedVote proposer_vote;
+        if (lantern_fixture_parse_attestation_message(doc, proposer_idx, &proposer_vote) != 0) {
+            goto error;
+        }
+        signed_block->message.proposer_attestation = proposer_vote.data;
+
+        size_t attestation_count = signed_block->message.block.body.attestations.length;
+        size_t expected_signatures = attestation_count + 1u;
+        if (expected_signatures == 0) {
+            goto error;
+        }
+        /* leanSpec fixtures may not include signatures - generate synthetic ones */
+        if (lantern_block_signatures_resize(&signed_block->signatures, expected_signatures) != 0) {
+            goto error;
+        }
+        for (size_t i = 0; i < signed_block->signatures.length; ++i) {
+            memset(signed_block->signatures.data[i].bytes, 0, LANTERN_SIGNATURE_SIZE);
+        }
+        return 0;
+    }
+
+    /* Try legacy format: { "message": { "block": {...}, "proposer_attestation": {...} }, "signature": [...] } */
     int message_idx = lantern_fixture_object_get_field(doc, object_index, "message");
     if (message_idx >= 0) {
-        int block_idx = lantern_fixture_object_get_field(doc, message_idx, "block");
+        block_idx = lantern_fixture_object_get_field(doc, message_idx, "block");
         if (block_idx < 0) {
             goto error;
         }
@@ -665,7 +695,7 @@ int lantern_fixture_parse_signed_block(
             goto error;
         }
 
-        int proposer_idx = lantern_fixture_object_get_field(doc, message_idx, "proposer_attestation");
+        proposer_idx = lantern_fixture_object_get_field(doc, message_idx, "proposer_attestation");
         if (proposer_idx < 0) {
             goto error;
         }

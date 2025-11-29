@@ -10,6 +10,7 @@
 #include "ssz_merkle.h"
 #include "ssz_utils.h"
 #include "mincrypt/sha256.h"
+#include "lantern/support/log.h"
 #include "lantern/support/strings.h"
 
 static void chunk_from_uint64(uint64_t value, uint8_t out[SSZ_BYTES_PER_CHUNK]) {
@@ -139,13 +140,142 @@ static int hash_empty_bitlist_root(size_t bit_limit, LanternRoot *out_root) {
     return ssz_mix_in_length(zero_root.bytes, 0, out_root->bytes) == SSZ_SUCCESS ? 0 : -1;
 }
 
+/**
+ * Compare two LanternRoot values lexicographically.
+ * Returns negative if a < b, positive if a > b, zero if equal.
+ */
+static int compare_roots(const void *a, const void *b) {
+    return memcmp(((const LanternRoot *)a)->bytes, ((const LanternRoot *)b)->bytes, LANTERN_ROOT_SIZE);
+}
+
+/**
+ * Merkleize justification roots and validators with sorted root ordering.
+ * LeanSpec sorts justification roots before storing, so we must do the same
+ * during hashing to ensure consistent state roots across implementations.
+ */
+static int merkleize_sorted_justifications(
+    const struct lantern_root_list *roots,
+    const struct lantern_bitlist *validators,
+    size_t validator_count,
+    LanternRoot *out_roots_root,
+    LanternRoot *out_validators_root) {
+
+    if (!roots || !validators || !out_roots_root || !out_validators_root) {
+        return -1;
+    }
+
+    size_t root_count = roots->length;
+    size_t bits_per_chunk = SSZ_BYTES_PER_CHUNK * 8u;
+
+    /* Handle empty case */
+    if (root_count == 0) {
+        if (hash_empty_list_root(LANTERN_HISTORICAL_ROOTS_LIMIT, out_roots_root) != 0) {
+            return -1;
+        }
+        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, out_validators_root) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Allocate arrays for sorting */
+    size_t *sort_indices = malloc(root_count * sizeof(size_t));
+    LanternRoot *sorted_roots = malloc(root_count * sizeof(LanternRoot));
+    if (!sort_indices || !sorted_roots) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Initialize indices and copy roots */
+    for (size_t i = 0; i < root_count; ++i) {
+        sort_indices[i] = i;
+        memcpy(&sorted_roots[i], &roots->items[i], sizeof(LanternRoot));
+    }
+
+    /* Sort roots and track original indices using insertion sort (stable, simple) */
+    for (size_t i = 1; i < root_count; ++i) {
+        LanternRoot key_root = sorted_roots[i];
+        size_t key_index = sort_indices[i];
+        size_t j = i;
+        while (j > 0 && compare_roots(&sorted_roots[j - 1], &key_root) > 0) {
+            sorted_roots[j] = sorted_roots[j - 1];
+            sort_indices[j] = sort_indices[j - 1];
+            --j;
+        }
+        sorted_roots[j] = key_root;
+        sort_indices[j] = key_index;
+    }
+
+    /* Create sorted root list for merkleization */
+    struct lantern_root_list sorted_root_list;
+    sorted_root_list.items = sorted_roots;
+    sorted_root_list.length = root_count;
+    sorted_root_list.capacity = root_count;
+
+    if (lantern_merkleize_root_list(&sorted_root_list, LANTERN_HISTORICAL_ROOTS_LIMIT, out_roots_root) != 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Reorder validator bits according to sorted root order */
+    size_t total_bits = validators->bit_length;
+    if (total_bits == 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, out_validators_root) != 0) {
+            return -1;
+        }
+        return 0;
+    }
+
+    /* Create reordered bitlist */
+    struct lantern_bitlist sorted_validators;
+    lantern_bitlist_init(&sorted_validators);
+    if (lantern_bitlist_resize(&sorted_validators, total_bits) != 0) {
+        free(sort_indices);
+        free(sorted_roots);
+        return -1;
+    }
+
+    /* Copy bits in sorted order: for each sorted root position, copy bits from original position */
+    for (size_t sorted_idx = 0; sorted_idx < root_count; ++sorted_idx) {
+        size_t original_idx = sort_indices[sorted_idx];
+        for (size_t v = 0; v < validator_count; ++v) {
+            size_t src_bit = original_idx * validator_count + v;
+            size_t dst_bit = sorted_idx * validator_count + v;
+            if (src_bit < validators->bit_length && bitlist_bit_is_set(validators, src_bit)) {
+                /* Set the bit in sorted_validators */
+                size_t byte_index = dst_bit / 8u;
+                uint8_t mask = (uint8_t)(1u << (dst_bit % 8u));
+                if (byte_index < sorted_validators.capacity) {
+                    sorted_validators.bytes[byte_index] |= mask;
+                }
+            }
+        }
+    }
+
+    size_t justification_validators_chunk_limit =
+        (LANTERN_JUSTIFICATION_VALIDATORS_LIMIT + bits_per_chunk - 1u) / bits_per_chunk;
+    int result = lantern_merkleize_bitlist(&sorted_validators, justification_validators_chunk_limit, out_validators_root);
+
+    lantern_bitlist_reset(&sorted_validators);
+    free(sort_indices);
+    free(sorted_roots);
+
+    return result;
+}
+
 int lantern_hash_tree_root_config(const LanternConfig *config, LanternRoot *out_root) {
     if (!config || !out_root) {
         return -1;
     }
-    uint8_t chunk[SSZ_BYTES_PER_CHUNK];
-    chunk_from_uint64(config->genesis_time, chunk);
-    return merkleize_chunks(chunk, 1, 0, out_root);
+    /* Config only contains genesis_time for SSZ hashing (matches Zeam's BeamStateConfig).
+     * num_validators is stored separately and not part of the SSZ-encoded config. */
+    uint8_t chunks[1][SSZ_BYTES_PER_CHUNK];
+    chunk_from_uint64(config->genesis_time, chunks[0]);
+    return merkleize_chunks(&chunks[0][0], 1, 0, out_root);
 }
 
 int lantern_hash_tree_root_checkpoint(const LanternCheckpoint *checkpoint, LanternRoot *out_root) {
@@ -510,27 +640,15 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
     } else if (lantern_merkleize_bitlist(&state->justified_slots, justified_chunk_limit, &justified_slots_root) != 0) {
         return -1;
     }
-    if (state->justification_roots.length == 0) {
-        if (hash_empty_list_root(LANTERN_HISTORICAL_ROOTS_LIMIT, &justification_roots_root) != 0) {
-            return -1;
-        }
-    } else if (
-        lantern_merkleize_root_list(&state->justification_roots, LANTERN_HISTORICAL_ROOTS_LIMIT, &justification_roots_root)
-        != 0) {
-        return -1;
-    }
-    size_t justification_validators_chunk_limit =
-        (LANTERN_JUSTIFICATION_VALIDATORS_LIMIT + bits_per_chunk - 1u) / bits_per_chunk;
-    if (state->justification_validators.bit_length == 0) {
-        if (hash_empty_bitlist_root(LANTERN_JUSTIFICATION_VALIDATORS_LIMIT, &justification_validators_root) != 0) {
-            return -1;
-        }
-    } else if (
-        lantern_merkleize_bitlist(
+    /* Merkleize justification roots and validators with sorted ordering.
+     * LeanSpec sorts justification roots lexicographically before hashing,
+     * so we must do the same to produce matching state roots. */
+    if (merkleize_sorted_justifications(
+            &state->justification_roots,
             &state->justification_validators,
-            justification_validators_chunk_limit,
-            &justification_validators_root)
-        != 0) {
+            state->validator_count,
+            &justification_roots_root,
+            &justification_validators_root) != 0) {
         return -1;
     }
 
@@ -538,10 +656,10 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
     if (debug_hash && debug_hash[0] != '\0') {
         char debug_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
         if (lantern_bytes_to_hex(config_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu config root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu config root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(header_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu header root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu header root: %s", (unsigned long long)state->slot, debug_hex);
             char header_parent_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
             char header_state_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
             char header_body_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -566,41 +684,43 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
                        sizeof(header_body_hex),
                        1)
                     == 0) {
-                fprintf(
-                    stderr,
-                    "header fields parent=%s state=%s body=%s\n",
+                lantern_log_debug(
+                    "hash",
+                    NULL,
+                    "header fields parent=%s state=%s body=%s",
                     header_parent_hex,
                     header_state_hex,
                     header_body_hex);
             }
         }
         if (lantern_bytes_to_hex(justified_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu justified root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu justified root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(finalized_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu finalized root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu finalized root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(historical_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu historical root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu historical root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(justified_slots_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu justified slots root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu justified slots root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(justification_roots_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu justification roots root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu justification roots root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (lantern_bytes_to_hex(validators_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(stderr, "hash state slot %llu validators root: %s\n", (unsigned long long)state->slot, debug_hex);
+            lantern_log_debug("hash", NULL, "hash state slot %llu validators root: %s", (unsigned long long)state->slot, debug_hex);
         }
         if (
             lantern_bytes_to_hex(justification_validators_root.bytes, LANTERN_ROOT_SIZE, debug_hex, sizeof(debug_hex), 1) == 0) {
-            fprintf(
-                stderr,
-                "hash state slot %llu justification validators root: %s\n",
+            lantern_log_debug(
+                "hash",
+                NULL,
+                "hash state slot %llu justification validators root: %s",
                 (unsigned long long)state->slot,
                 debug_hex);
         }
-        fprintf(stderr, "historical_block_hashes len=%zu\n", state->historical_block_hashes.length);
+        lantern_log_debug("hash", NULL, "historical_block_hashes len=%zu", state->historical_block_hashes.length);
         size_t hist_limit = state->historical_block_hashes.length < 4 ? state->historical_block_hashes.length : 4;
         for (size_t i = 0; i < hist_limit; ++i) {
             char hist_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -611,10 +731,10 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
                     sizeof(hist_hex),
                     1)
                 == 0) {
-                fprintf(stderr, "  historical[%zu]=%s\n", i, hist_hex);
+                lantern_log_debug("hash", NULL, "  historical[%zu]=%s", i, hist_hex);
             }
         }
-        fprintf(stderr, "justification_roots len=%zu\n", state->justification_roots.length);
+        lantern_log_debug("hash", NULL, "justification_roots len=%zu", state->justification_roots.length);
         size_t just_limit = state->justification_roots.length < 4 ? state->justification_roots.length : 4;
         for (size_t i = 0; i < just_limit; ++i) {
             char just_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -625,21 +745,21 @@ int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_roo
                     sizeof(just_hex),
                     1)
                 == 0) {
-                fprintf(stderr, "  justification_roots[%zu]=%s\n", i, just_hex);
+                lantern_log_debug("hash", NULL, "  justification_roots[%zu]=%s", i, just_hex);
             }
         }
-        fprintf(stderr, "justified_slots bits=%zu\n", state->justified_slots.bit_length);
+        lantern_log_debug("hash", NULL, "justified_slots bits=%zu", state->justified_slots.bit_length);
         size_t bit_limit = state->justified_slots.bit_length < 16 ? state->justified_slots.bit_length : 16;
         for (size_t bit = 0; bit < bit_limit; ++bit) {
             if (bitlist_bit_is_set(&state->justified_slots, bit)) {
-                fprintf(stderr, "  justified_slots bit %zu = 1\n", bit);
+                lantern_log_debug("hash", NULL, "  justified_slots bit %zu = 1", bit);
             }
         }
-        fprintf(stderr, "justification_validators bits=%zu\n", state->justification_validators.bit_length);
+        lantern_log_debug("hash", NULL, "justification_validators bits=%zu", state->justification_validators.bit_length);
         bit_limit = state->justification_validators.bit_length < 16 ? state->justification_validators.bit_length : 16;
         for (size_t bit = 0; bit < bit_limit; ++bit) {
             if (bitlist_bit_is_set(&state->justification_validators, bit)) {
-                fprintf(stderr, "  justification_validators bit %zu = 1\n", bit);
+                lantern_log_debug("hash", NULL, "  justification_validators bit %zu = 1", bit);
             }
         }
     }
@@ -690,7 +810,7 @@ int lantern_hash_tree_root_validators(const uint8_t *pubkeys, size_t count, Lant
                         sizeof(validator_hex),
                         1)
                     == 0) {
-                    fprintf(stderr, "validator[0] root: %s\n", validator_hex);
+                    lantern_log_debug("hash", NULL, "validator[0] root: %s", validator_hex);
                 }
             }
             memcpy(chunks + (i * SSZ_BYTES_PER_CHUNK), validator_root.bytes, SSZ_BYTES_PER_CHUNK);
