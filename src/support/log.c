@@ -72,17 +72,17 @@ static const char *level_to_color(enum LanternLogLevel level) {
 static const char *level_to_string(enum LanternLogLevel level) {
     switch (level) {
     case LANTERN_LOG_LEVEL_TRACE:
-        return "TRC";
+        return "TRACE";
     case LANTERN_LOG_LEVEL_DEBUG:
-        return "DBG";
+        return "DEBUG";
     case LANTERN_LOG_LEVEL_INFO:
-        return "INF";
+        return "INFO";
     case LANTERN_LOG_LEVEL_WARN:
-        return "WRN";
+        return "WARN";
     case LANTERN_LOG_LEVEL_ERROR:
-        return "ERR";
+        return "ERROR";
     default:
-        return "INF";
+        return "INFO";
     }
 }
 
@@ -105,14 +105,9 @@ static enum lantern_log_color_mode parse_color_mode(const char *text)
 
 static bool detect_terminal(FILE *stream)
 {
-    if (!stream) {
-        return false;
-    }
-    int fd = lantern_fileno(stream);
-    if (fd < 0) {
-        return false;
-    }
-    return lantern_isatty(fd) != 0;
+    (void)stream;
+    /* Always enable colors by default - modern terminals and log viewers support ANSI colors */
+    return true;
 }
 
 static void ensure_color_configuration(void)
