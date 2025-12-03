@@ -60,9 +60,8 @@ static int write_file(const char *path, const uint8_t *data, size_t len) {
 }
 
 /*
- * Encode raw SSZ bytes into Snappy framed format.
- * This bypasses Lantern's internal structure decoding, allowing fixtures
- * from leanSpec with different signature sizes to be processed.
+ * Encode raw SSZ bytes into raw Snappy format (no framing).
+ * This matches the gossip protocol encoding used by Lantern.
  */
 static int encode_raw_snappy(const char *input_path, const char *output_path) {
     size_t len = 0;
@@ -71,7 +70,7 @@ static int encode_raw_snappy(const char *input_path, const char *output_path) {
         return -1;
     }
     size_t max_compressed = 0;
-    if (lantern_snappy_max_compressed_size(len, &max_compressed) != LANTERN_SNAPPY_OK) {
+    if (lantern_snappy_max_compressed_size_raw(len, &max_compressed) != LANTERN_SNAPPY_OK) {
         free(data);
         return -1;
     }
@@ -81,11 +80,11 @@ static int encode_raw_snappy(const char *input_path, const char *output_path) {
         return -1;
     }
     size_t snappy_len = 0;
-    int encode_rc = lantern_snappy_compress(data, len, snappy, max_compressed, &snappy_len);
+    int encode_rc = lantern_snappy_compress_raw(data, len, snappy, max_compressed, &snappy_len);
     free(data);
     if (encode_rc != LANTERN_SNAPPY_OK) {
         free(snappy);
-        fprintf(stderr, "failed to encode snappy framed (rc=%d)\n", encode_rc);
+        fprintf(stderr, "failed to encode raw snappy (rc=%d)\n", encode_rc);
         return -1;
     }
     int write_rc = write_file(output_path, snappy, snappy_len);
