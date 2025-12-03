@@ -638,7 +638,8 @@ static int send_response_chunk(
     bool include_response_code,
     uint8_t response_code,
     const uint8_t *payload,
-    size_t payload_len) {
+    size_t payload_len,
+    size_t raw_len) {
     if (!stream) {
         return -1;
     }
@@ -652,21 +653,26 @@ static int send_response_chunk(
     lantern_log_debug(
         "reqresp",
         meta,
-        "%s framing include_code=%s code=%u payload_len=%zu",
+        "%s framing include_code=%s code=%u payload_len=%zu raw_len=%zu",
         phase ? phase : "response",
         include_code ? "true" : "false",
         (unsigned)response_code,
-        payload_len);
+        payload_len,
+        raw_len);
 
+    /* The req/resp protocol spec requires the varint prefix to indicate the
+     * UNCOMPRESSED SSZ length (raw_len), not the compressed payload size.
+     * The peer reads this varint, allocates a buffer of that size, then snappy-decodes
+     * the following compressed data into that buffer. */
     uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
     size_t header_len = 0;
-    if (unsigned_varint_encode(payload_len, header, sizeof(header), &header_len) != UNSIGNED_VARINT_OK) {
+    if (unsigned_varint_encode(raw_len, header, sizeof(header), &header_len) != UNSIGNED_VARINT_OK) {
         lantern_log_error(
             "reqresp",
             meta,
             "%s payload header encode failed bytes=%zu",
             phase ? phase : "response",
-            payload_len);
+            raw_len);
         return -1;
     }
 
@@ -950,7 +956,8 @@ static void *status_worker(void *arg) {
             include_response_code,
             LANTERN_REQRESP_RESPONSE_SUCCESS,
             buffer,
-            written)
+            written,
+            response_raw_len)
         != 0) {
         free(buffer);
         log_stream_error("write", protocol_id, peer_text);
@@ -1040,14 +1047,18 @@ static void *status_request_worker(void *arg) {
     snprintf(trace_stage, sizeof(trace_stage), "status[%" PRIu64 "] request snappy", trace_id);
     log_payload_preview(trace_stage, ctx->peer_text, payload, payload_len);
 
+    /* The req/resp protocol spec requires the varint prefix to indicate the
+     * UNCOMPRESSED SSZ length (payload_raw_len), not the compressed payload size.
+     * The peer reads this varint, allocates a buffer of that size, then snappy-decodes
+     * the following compressed data into that buffer. */
     uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
     size_t header_len = 0;
-    if (unsigned_varint_encode(payload_len, header, sizeof(header), &header_len) != UNSIGNED_VARINT_OK) {
+    if (unsigned_varint_encode(payload_raw_len, header, sizeof(header), &header_len) != UNSIGNED_VARINT_OK) {
         lantern_log_error(
             "reqresp",
             &meta,
             "failed to encode status request header bytes=%zu",
-            payload_len);
+            payload_raw_len);
         free(payload);
         goto finish;
     }
@@ -1061,11 +1072,11 @@ static void *status_request_worker(void *arg) {
     lantern_log_debug(
         "reqresp",
         &meta,
-        "status[%" PRIu64 "] request header_len=%zu declared_len=%zu raw_len=%zu header_hex=%s",
+        "status[%" PRIu64 "] request header_len=%zu declared_len=%zu (uncompressed) compressed_len=%zu header_hex=%s",
         trace_id,
         header_len,
-        payload_len,
         payload_raw_len,
+        payload_len,
         header_hex[0] ? header_hex : "-");
 
     lantern_log_debug(
@@ -1103,29 +1114,6 @@ static void *status_request_worker(void *arg) {
         memcpy(frame + header_len, payload, payload_len);
     }
 
-    /* Debug aid: log the outgoing frame structure so we can compare with Zeam's decoder expectations */
-    {
-        const size_t frame_len = header_len + payload_len;
-        char frame_hex[(LANTERN_STATUS_PREVIEW_BYTES * 2u) + 1u];
-        frame_hex[0] = '\0';
-        size_t preview = frame_len < LANTERN_STATUS_PREVIEW_BYTES ? frame_len : LANTERN_STATUS_PREVIEW_BYTES;
-        if (preview > 0
-            && lantern_bytes_to_hex(frame, preview, frame_hex, sizeof(frame_hex), 0) != 0) {
-            frame_hex[0] = '\0';
-        }
-        lantern_log_debug(
-            "reqresp",
-            &meta,
-            "status[%" PRIu64 "] response frame summary code_byte=0x%02x header_len=%zu payload_len=%zu frame_len=%zu%s%s",
-            trace_id,
-            (unsigned)LANTERN_REQRESP_RESPONSE_SUCCESS,
-            header_len,
-            payload_len,
-            frame_len,
-            frame_hex[0] ? " frame_hex=" : "",
-            frame_hex[0] ? frame_hex : "");
-    }
-
     rc = write_stream_all(
         stream,
         frame,
@@ -1145,6 +1133,21 @@ static void *status_request_worker(void *arg) {
         goto finish;
     }
     free(payload);
+
+    /* Half-close the stream (send FIN on write side) to signal we're done sending.
+     * This is required by the libp2p req/resp protocol - the responder waits for FIN
+     * before processing the request and sending the response.
+     * NOTE: We use shutdown_write() not close() - close() would prevent reading the response! */
+    rc = libp2p_stream_shutdown_write(stream);
+    if (rc != 0) {
+        lantern_log_error(
+            "reqresp",
+            &meta,
+            "status[%" PRIu64 "] failed to half-close stream",
+            trace_id);
+        failure_code = rc;
+        goto finish;
+    }
 
     uint8_t *response = NULL;
     size_t response_len = 0;
@@ -1575,6 +1578,7 @@ static void *blocks_worker(void *arg) {
                 response_code_pending,
                 LANTERN_REQRESP_RESPONSE_SUCCESS,
                 NULL,
+                0,
                 0)
             != 0) {
             lantern_blocks_by_root_response_reset(&response);
@@ -1692,7 +1696,8 @@ static void *blocks_worker(void *arg) {
                 include_code,
                 LANTERN_REQRESP_RESPONSE_SUCCESS,
                 snappy_buffer,
-                compressed_len)
+                compressed_len,
+                ssz_written)
             != 0) {
             free(ssz_buffer);
             free(snappy_buffer);

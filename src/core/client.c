@@ -1349,7 +1349,9 @@ static void pending_block_list_remove(struct lantern_pending_block_list *list, s
     }
     list->length -= 1u;
     if (list->length < list->capacity) {
-        lantern_signed_block_with_attestation_reset(&list->items[list->length].block);
+        /* Do NOT call reset here - memmove has moved the dynamic pointers
+           from the last entry to an earlier position. Calling reset would
+           double-free those pointers. Just zero the leftover slot. */
         memset(&list->items[list->length], 0, sizeof(*list->items));
     }
 }
