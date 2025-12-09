@@ -1,3 +1,13 @@
+/**
+ * @file main.c
+ * @brief Lantern client entry point and command-line interface
+ *
+ * Provides the main entry point for the Lantern consensus client, handling:
+ * - Command-line argument parsing
+ * - Signal handling for graceful shutdown
+ * - Client initialization and lifecycle management
+ */
+
 #include "lantern/core/client.h"
 #include "lantern/support/log.h"
 
@@ -5,12 +15,15 @@
 #include <errno.h>
 #include <getopt.h>
 #include <inttypes.h>
-#include <stdbool.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/** Maximum length of a single line when reading bootnode files. */
+static const size_t BOOTNODE_LINE_MAX_LEN = 2048;
 
 enum {
     OPT_GENESIS_CONFIG = 1000,
@@ -36,20 +49,33 @@ enum {
     OPT_HASH_SIG_SECRET_TEMPLATE,
 };
 
+/* Forward declarations */
 static void print_usage(const char *prog);
 static int parse_u16(const char *text, uint16_t *out_value);
 static int add_bootnodes_from_file(struct lantern_client_options *options, const char *path);
 static int add_bootnodes_argument(struct lantern_client_options *options, const char *value);
 static char *trim_line(char *line);
 
+/** Flag indicating whether the main loop should continue running. */
 static volatile sig_atomic_t g_keep_running = 1;
 
-static void lantern_handle_signal(int signo) {
+
+/**
+ * Handle termination signals (SIGINT, SIGTERM).
+ *
+ * Sets the global keep_running flag to false to trigger graceful shutdown.
+ *
+ * @param signo  Signal number (unused)
+ */
+static void lantern_handle_signal(int signo)
+{
     (void)signo;
     g_keep_running = 0;
 }
 
-int main(int argc, char **argv) {
+
+int main(int argc, char **argv)
+{
     struct lantern_client_options options;
     lantern_client_options_init(&options);
 
@@ -60,10 +86,11 @@ int main(int argc, char **argv) {
     signal(SIGTERM, lantern_handle_signal);
 
     bool show_version = false;
-   bool show_help = false;
+    bool show_help = false;
 
     const char *env_log_level = getenv("LANTERN_LOG_LEVEL");
-    if (env_log_level && lantern_log_set_level_from_string(env_log_level, NULL) != 0) {
+    if (env_log_level && lantern_log_set_level_from_string(env_log_level, NULL) != 0)
+    {
         lantern_log_error(
             "cli",
             &(const struct lantern_log_metadata){0},
@@ -102,8 +129,10 @@ int main(int argc, char **argv) {
 
     int opt = 0;
     int option_index = 0;
-    while ((opt = getopt_long(argc, argv, "d:hv", long_options, &option_index)) != -1) {
-        switch (opt) {
+    while ((opt = getopt_long(argc, argv, "d:hv", long_options, &option_index)) != -1)
+    {
+        switch (opt)
+        {
         case 'd':
             options.data_dir = optarg;
             break;
@@ -141,7 +170,8 @@ int main(int argc, char **argv) {
             options.listen_address = optarg;
             break;
         case OPT_HTTP_PORT:
-            if (parse_u16(optarg, &options.http_port) != 0) {
+            if (parse_u16(optarg, &options.http_port) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -151,7 +181,8 @@ int main(int argc, char **argv) {
             }
             break;
         case OPT_METRICS_PORT:
-            if (parse_u16(optarg, &options.metrics_port) != 0) {
+            if (parse_u16(optarg, &options.metrics_port) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -161,7 +192,8 @@ int main(int argc, char **argv) {
             }
             break;
         case OPT_BOOTNODE:
-            if (lantern_client_options_add_bootnode(&options, optarg) != 0) {
+            if (lantern_client_options_add_bootnode(&options, optarg) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -174,7 +206,8 @@ int main(int argc, char **argv) {
             options.devnet = optarg;
             break;
         case OPT_LOG_LEVEL:
-            if (lantern_log_set_level_from_string(optarg, NULL) != 0) {
+            if (lantern_log_set_level_from_string(optarg, NULL) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -199,7 +232,8 @@ int main(int argc, char **argv) {
             options.hash_sig_secret_template = optarg;
             break;
         case OPT_BOOTNODES:
-            if (add_bootnodes_argument(&options, optarg) != 0) {
+            if (add_bootnodes_argument(&options, optarg) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -209,7 +243,8 @@ int main(int argc, char **argv) {
             }
             break;
         case OPT_BOOTNODE_FILE:
-            if (add_bootnodes_from_file(&options, optarg) != 0) {
+            if (add_bootnodes_from_file(&options, optarg) != 0)
+            {
                 lantern_log_error(
                     "cli",
                     &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -223,7 +258,8 @@ int main(int argc, char **argv) {
         }
     }
 
-    if (options.node_key_hex && options.node_key_path) {
+    if (options.node_key_hex && options.node_key_path)
+    {
         lantern_log_error(
             "cli",
             &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -231,17 +267,20 @@ int main(int argc, char **argv) {
         goto error;
     }
 
-    if (show_version) {
+    if (show_version)
+    {
         lantern_log_info("main", NULL, "lantern preview");
         goto cleanup;
     }
 
-    if (show_help) {
+    if (show_help)
+    {
         print_usage(argv[0]);
         goto cleanup;
     }
 
-    if (!options.node_id) {
+    if (!options.node_id)
+    {
         lantern_log_error(
             "cli",
             &(const struct lantern_log_metadata){0},
@@ -249,7 +288,8 @@ int main(int argc, char **argv) {
         goto error;
     }
 
-    if (lantern_init(&client, &options) != 0) {
+    if (lantern_init(&client, &options) != 0)
+    {
         lantern_log_error(
             "cli",
             &(const struct lantern_log_metadata){.validator = options.node_id},
@@ -270,7 +310,8 @@ int main(int argc, char **argv) {
     struct timespec sleep_duration;
     sleep_duration.tv_sec = 1;
     sleep_duration.tv_nsec = 0;
-    while (g_keep_running) {
+    while (g_keep_running)
+    {
         nanosleep(&sleep_duration, NULL);
     }
 
@@ -291,7 +332,17 @@ error:
     return 1;
 }
 
-static void print_usage(const char *prog) {
+
+/**
+ * Print command-line usage information.
+ *
+ * Outputs all available command-line options and their descriptions
+ * to the log.
+ *
+ * @param prog  Program name (typically argv[0])
+ */
+static void print_usage(const char *prog)
+{
     lantern_log_info("main", NULL, "Usage: %s [options]", prog);
     lantern_log_info("main", NULL, "  --data-dir PATH              Data directory (default %s)", LANTERN_DEFAULT_DATA_DIR);
     lantern_log_info("main", NULL, "  --genesis-config PATH        Path to genesis config YAML");
@@ -319,27 +370,56 @@ static void print_usage(const char *prog) {
     lantern_log_info("main", NULL, "  --version                    Print version information");
 }
 
-static int parse_u16(const char *text, uint16_t *out_value) {
-    if (!text || !out_value) {
+
+/**
+ * Parse a string as an unsigned 16-bit integer.
+ *
+ * @param text       String to parse
+ * @param out_value  Output parameter for the parsed value
+ *
+ * @return 0 on success
+ * @return -1 if text is NULL, out_value is NULL, or parsing fails
+ */
+static int parse_u16(const char *text, uint16_t *out_value)
+{
+    if (!text || !out_value)
+    {
         return -1;
     }
     errno = 0;
     char *end = NULL;
     long parsed = strtol(text, &end, 10);
-    if (errno != 0 || end == text || parsed < 0 || parsed > UINT16_MAX) {
+    if (errno != 0 || end == text || parsed < 0 || parsed > UINT16_MAX)
+    {
         return -1;
     }
     *out_value = (uint16_t)parsed;
     return 0;
 }
 
-static int add_bootnodes_from_file(struct lantern_client_options *options, const char *path) {
-    if (!options || !path) {
+
+/**
+ * Load bootnode ENRs from a file.
+ *
+ * Reads a file containing ENR records (one per line) and adds them to the
+ * client options. Supports YAML-style lists, comments (#), and quoted values.
+ *
+ * @param options  Client options to add bootnodes to
+ * @param path     Path to the bootnodes file
+ *
+ * @return 0 on success (at least one ENR added)
+ * @return -1 on error (file not found, parse error, or no ENRs found)
+ */
+static int add_bootnodes_from_file(struct lantern_client_options *options, const char *path)
+{
+    if (!options || !path)
+    {
         return -1;
     }
 
     FILE *fp = fopen(path, "r");
-    if (!fp) {
+    if (!fp)
+    {
         lantern_log_error(
             "cli",
             &(const struct lantern_log_metadata){.validator = options->node_id},
@@ -348,57 +428,70 @@ static int add_bootnodes_from_file(struct lantern_client_options *options, const
         return -1;
     }
 
-    char line[2048];
+    char line[BOOTNODE_LINE_MAX_LEN];
     size_t added = 0;
-    while (fgets(line, sizeof(line), fp)) {
+    while (fgets(line, sizeof(line), fp))
+    {
         char *trimmed = trim_line(line);
-        if (!trimmed || *trimmed == '\0' || *trimmed == '#') {
+        if (!trimmed || *trimmed == '\0' || *trimmed == '#')
+        {
             continue;
         }
 
         char *hash = strchr(trimmed, '#');
-        if (hash) {
+        if (hash)
+        {
             *hash = '\0';
             trimmed = trim_line(trimmed);
-            if (!trimmed || *trimmed == '\0') {
+            if (!trimmed || *trimmed == '\0')
+            {
                 continue;
             }
         }
 
-        if (*trimmed == '-') {
+        if (*trimmed == '-')
+        {
             ++trimmed;
-            while (*trimmed && isspace((unsigned char)*trimmed)) {
+            while (*trimmed && isspace((unsigned char)*trimmed))
+            {
                 ++trimmed;
             }
         }
 
         char *value_start = strstr(trimmed, "enr:");
-        if (!value_start) {
-            if (strncmp(trimmed, "enr:", 4) != 0) {
+        if (!value_start)
+        {
+            if (strncmp(trimmed, "enr:", 4) != 0)
+            {
                 continue;
             }
             value_start = trimmed;
         }
 
         char *end = value_start + strlen(value_start);
-        while (end > value_start && isspace((unsigned char)*(end - 1))) {
+        while (end > value_start && isspace((unsigned char)*(end - 1)))
+        {
             --end;
         }
         *end = '\0';
 
-        if (*value_start == '"' || *value_start == '\'') {
+        if (*value_start == '"' || *value_start == '\'')
+        {
             ++value_start;
             size_t len = strlen(value_start);
-            if (len > 0 && (value_start[len - 1] == '"' || value_start[len - 1] == '\'')) {
+            if (len > 0 && (value_start[len - 1] == '"' || value_start[len - 1] == '\''))
+            {
                 value_start[len - 1] = '\0';
             }
         }
 
-        if (strncmp(value_start, "enr:", 4) != 0) {
+        if (strncmp(value_start, "enr:", 4) != 0)
+        {
             continue;
         }
 
-        if (lantern_client_options_add_bootnode(options, value_start) != 0) {
+        if (lantern_client_options_add_bootnode(options, value_start) != 0)
+        {
             fclose(fp);
             return -1;
         }
@@ -414,7 +507,8 @@ static int add_bootnodes_from_file(struct lantern_client_options *options, const
 
     fclose(fp);
 
-    if (added == 0) {
+    if (added == 0)
+    {
         lantern_log_warn(
             "cli",
             &(const struct lantern_log_metadata){.validator = options->node_id},
@@ -426,25 +520,56 @@ static int add_bootnodes_from_file(struct lantern_client_options *options, const
     return 0;
 }
 
-static int add_bootnodes_argument(struct lantern_client_options *options, const char *value) {
-    if (!options || !value) {
+
+/**
+ * Add bootnodes from a command-line argument.
+ *
+ * If the value starts with "enr:", it is treated as a single ENR record.
+ * Otherwise, it is treated as a path to a file containing ENR records.
+ *
+ * @param options  Client options to add bootnodes to
+ * @param value    Either an ENR string or a file path
+ *
+ * @return 0 on success
+ * @return -1 on error
+ */
+static int add_bootnodes_argument(struct lantern_client_options *options, const char *value)
+{
+    if (!options || !value)
+    {
         return -1;
     }
-    if (strncmp(value, "enr:", 4) == 0) {
+    if (strncmp(value, "enr:", 4) == 0)
+    {
         return lantern_client_options_add_bootnode(options, value);
     }
     return add_bootnodes_from_file(options, value);
 }
 
-static char *trim_line(char *line) {
-    if (!line) {
+
+/**
+ * Trim leading and trailing whitespace from a string.
+ *
+ * Modifies the string in place by advancing the start pointer past leading
+ * whitespace and null-terminating after the last non-whitespace character.
+ *
+ * @param line  String to trim (modified in place)
+ *
+ * @return Pointer to the trimmed string, or NULL if input is NULL
+ */
+static char *trim_line(char *line)
+{
+    if (!line)
+    {
         return NULL;
     }
-    while (*line && isspace((unsigned char)*line)) {
+    while (*line && isspace((unsigned char)*line))
+    {
         ++line;
     }
     char *end = line + strlen(line);
-    while (end > line && isspace((unsigned char)*(end - 1))) {
+    while (end > line && isspace((unsigned char)*(end - 1)))
+    {
         --end;
     }
     *end = '\0';
