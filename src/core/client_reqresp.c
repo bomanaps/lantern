@@ -39,17 +39,6 @@
 
 
 /* ============================================================================
- * External Functions (from client_reqresp_blocks.c)
- * ============================================================================ */
-
-extern int lantern_client_schedule_blocks_request(
-    struct lantern_client *client,
-    const char *peer_id_text,
-    const LanternRoot *root,
-    bool use_legacy);
-
-
-/* ============================================================================
  * Forward Declarations
  * ============================================================================ */
 
