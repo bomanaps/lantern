@@ -84,14 +84,16 @@ FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Install runtime dependencies
+# Install runtime dependencies and profiling tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         gdb \
         libssl3 \
         libstdc++6 \
         zlib1g \
-    && rm -rf /var/lib/apt/lists/*
+        linux-tools-generic \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/lib/linux-tools/*/perf /usr/local/bin/perf || true
 
 COPY --from=builder /opt/lantern /opt/lantern
 COPY docker/entrypoint.sh /usr/local/bin/lantern-entrypoint.sh
