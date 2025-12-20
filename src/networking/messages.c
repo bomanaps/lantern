@@ -401,6 +401,14 @@ int lantern_network_blocks_by_root_request_decode_snappy(
     if (lantern_snappy_uncompressed_length(data, data_len, &raw_len) != LANTERN_SNAPPY_OK) {
         return -1;
     }
+    if (raw_len > LANTERN_REQRESP_MAX_CHUNK_BYTES) {
+        lantern_log_warn(
+            "reqresp",
+            NULL,
+            "blocks_by_root request too large raw_len=%zu",
+            raw_len);
+        return -1;
+    }
     uint8_t *raw = alloc_scratch(raw_len);
     if (!raw) {
         return -1;
@@ -641,6 +649,14 @@ int lantern_network_blocks_by_root_response_decode_snappy(
     }
     size_t raw_len = 0;
     if (lantern_snappy_uncompressed_length(data, data_len, &raw_len) != LANTERN_SNAPPY_OK) {
+        return -1;
+    }
+    if (raw_len > LANTERN_REQRESP_MAX_CHUNK_BYTES) {
+        lantern_log_warn(
+            "reqresp",
+            NULL,
+            "blocks_by_root response too large raw_len=%zu",
+            raw_len);
         return -1;
     }
     uint8_t *raw = alloc_scratch(raw_len);

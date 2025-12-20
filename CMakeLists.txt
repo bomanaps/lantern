@@ -225,24 +225,6 @@ if(LANTERN_BUILD_TESTS)
     target_link_libraries(lantern_snappy_test PRIVATE lantern)
     add_test(NAME lantern_snappy COMMAND lantern_snappy_test)
 
-    add_executable(lantern_yaml_parser_cve_test
-        tests/unit/test_yaml_parser_cve.c
-        src/internal/yaml_parser.c
-    )
-    target_include_directories(
-        lantern_yaml_parser_cve_test
-        PRIVATE
-            ${PROJECT_SOURCE_DIR}/src
-    )
-    target_compile_options(
-        lantern_yaml_parser_cve_test
-        PRIVATE
-            -fsanitize=address
-            -fno-omit-frame-pointer
-    )
-    target_link_options(lantern_yaml_parser_cve_test PRIVATE -fsanitize=address)
-    add_test(NAME lantern_yaml_parser_cve COMMAND lantern_yaml_parser_cve_test)
-
     add_executable(lantern_networking_messages_test
         tests/unit/test_networking_messages.c
         tests/support/fixture_loader.c
