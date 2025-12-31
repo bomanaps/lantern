@@ -17,6 +17,7 @@ from typing import Sequence
 
 from lean_spec.subspecs.networking.config import MAX_REQUEST_BLOCKS
 from lean_spec.subspecs.containers import (
+    AggregatedAttestation,
     Attestation,
     AttestationData,
     Block,
@@ -24,7 +25,7 @@ from lean_spec.subspecs.containers import (
     BlockWithAttestation,
     Checkpoint,
 )
-from lean_spec.subspecs.containers.block.types import Attestations
+from lean_spec.subspecs.containers.block import AggregatedAttestations
 from lean_spec.subspecs.containers.slot import Slot
 from lean_spec.types import Bytes32, Uint64
 from lean_spec.types.byte_arrays import BaseBytes
@@ -173,15 +174,16 @@ def make_signed_block(seed: int, base_slot: int, proposer_index: int, attestatio
         make_attestation(seed + (i * 5), (proposer_index + i + seed) % 16, base_slot + i + 1)
         for i in range(attestation_count)
     ]
+    aggregated_attestations = AggregatedAttestation.aggregate_by_data(attestations)
     block = Block(
         slot=Slot(base_slot),
         proposer_index=Uint64(proposer_index),
         parent_root=Bytes32(repeating_bytes(seed, 32)),
         state_root=Bytes32(repeating_bytes(seed + 0x50, 32)),
-        body=BlockBody(attestations=Attestations(data=attestations)),
+        body=BlockBody(attestations=AggregatedAttestations(data=aggregated_attestations)),
     )
     proposer_att = make_attestation(seed + 0x80, (proposer_index + 3) % 16, base_slot + attestation_count + 4)
-    signatures = make_signatures(seed + 0xA0, attestation_count + 1)
+    signatures = make_signatures(seed + 0xA0, len(aggregated_attestations) + 1)
     return LanternSignedBlockWithAttestation(
         message=LanternBlockWithAttestation(block=block, proposer_attestation=proposer_att),
         signature=signatures,
@@ -198,15 +200,16 @@ def make_gossip_signed_block(
         make_gossip_attestation(seed + (i * 5), (proposer_index + i + seed) % 16, vote_slot)
         for i, vote_slot in enumerate(attestation_vote_slots)
     ]
+    aggregated_attestations = AggregatedAttestation.aggregate_by_data(attestations)
     block = Block(
         slot=Slot(block_slot),
         proposer_index=Uint64(proposer_index),
         parent_root=Bytes32(repeating_bytes(seed, 32)),
         state_root=Bytes32(repeating_bytes(seed + 0x50, 32)),
-        body=BlockBody(attestations=Attestations(data=list(attestations))),
+        body=BlockBody(attestations=AggregatedAttestations(data=aggregated_attestations)),
     )
     proposer_att = make_gossip_attestation(seed + 0x80, (proposer_index + 3) % 16, block_slot + 2)
-    signatures = make_signatures(seed + 0xA0, len(attestations) + 1)
+    signatures = make_signatures(seed + 0xA0, len(aggregated_attestations) + 1)
     return LanternSignedBlockWithAttestation(
         message=LanternBlockWithAttestation(block=block, proposer_attestation=proposer_att),
         signature=signatures,
