@@ -33,6 +33,7 @@ Environment overrides (start):
   DOCKER_NETWORK     Docker network mode (default: host)
   DOCKER_BUILD       1 to build image before start (default: 1)
   DOCKER_BUILD_ARGS  Extra args passed to docker build (optional)
+  DOCKER_LISTEN_IP   Listen IP for docker nodes (default: 127.0.0.1 for host, 0.0.0.0 otherwise)
 
 Example:
   scripts/run_devnet2.sh start 4 /tmp/lantern-devnet2/genesis binary
@@ -108,8 +109,17 @@ LANTERN_IMAGE=${LANTERN_IMAGE:-lantern:local}
 DOCKER_NETWORK=${DOCKER_NETWORK:-host}
 DOCKER_BUILD=${DOCKER_BUILD:-1}
 DOCKER_BUILD_ARGS=${DOCKER_BUILD_ARGS:-}
+DOCKER_LISTEN_IP=${DOCKER_LISTEN_IP:-}
 LANTERN_DEBUG_FINALIZATION=${LANTERN_DEBUG_FINALIZATION:-}
 LANTERN_DEBUG_STATE_HASH=${LANTERN_DEBUG_STATE_HASH:-}
+
+if [[ -z "${DOCKER_LISTEN_IP}" ]]; then
+  if [[ "${DOCKER_NETWORK}" == "host" ]]; then
+    DOCKER_LISTEN_IP="127.0.0.1"
+  else
+    DOCKER_LISTEN_IP="0.0.0.0"
+  fi
+fi
 
 PIDS_FILE="${RUN_DIR}/pids"
 META_FILE="${RUN_DIR}/meta"
@@ -320,11 +330,19 @@ if [[ -f "${PIDS_FILE}" ]]; then
       continue
     fi
     if [[ "${runtime_check}" == "docker" ]]; then
+    if command -v rg >/dev/null 2>&1; then
       if docker ps -a --format '{{.Names}}' | rg -q "^${pid}$"; then
         echo "error: devnet appears to be running (container ${pid})." >&2
         echo "hint: stop it with: ${0} stop ${NODES} docker" >&2
         exit 1
       fi
+    else
+      if docker ps -a --format '{{.Names}}' | grep -Eq "^${pid}$"; then
+        echo "error: devnet appears to be running (container ${pid})." >&2
+        echo "hint: stop it with: ${0} stop ${NODES} docker" >&2
+        exit 1
+      fi
+    fi
     else
       if kill -0 "${pid}" >/dev/null 2>&1; then
         echo "error: devnet appears to be running (pid ${pid})." >&2
@@ -365,9 +383,16 @@ for i in $(seq 0 $((NODES-1))); do
   mkdir -p "${DATA}"
 
   if [[ "${RUNTIME}" == "docker" ]]; then
-    if docker ps -a --format '{{.Names}}' | rg -q "^${NODE_ID}$"; then
-      echo "error: docker container ${NODE_ID} already exists" >&2
-      exit 1
+    if command -v rg >/dev/null 2>&1; then
+      if docker ps -a --format '{{.Names}}' | rg -q "^${NODE_ID}$"; then
+        echo "error: docker container ${NODE_ID} already exists" >&2
+        exit 1
+      fi
+    else
+      if docker ps -a --format '{{.Names}}' | grep -Eq "^${NODE_ID}$"; then
+        echo "error: docker container ${NODE_ID} already exists" >&2
+        exit 1
+      fi
     fi
     docker_args=(
       run -d
@@ -380,7 +405,7 @@ for i in $(seq 0 $((NODES-1))); do
       -e "LANTERN_CONFIG_DIR=/genesis"
       -e "LANTERN_NODE_ID=${NODE_ID}"
       -e "LANTERN_DEVNET=${DEVNET}"
-      -e "LANTERN_LISTEN_ADDRESS=/ip4/0.0.0.0/udp/${PORT}/quic-v1"
+      -e "LANTERN_LISTEN_ADDRESS=/ip4/${DOCKER_LISTEN_IP}/udp/${PORT}/quic-v1"
       -e "LANTERN_HTTP_PORT=${HTTP}"
       -e "LANTERN_METRICS_PORT=${METRICS}"
       -e "LANTERN_NODE_KEY_PATH=/genesis/lantern_${i}.key"
