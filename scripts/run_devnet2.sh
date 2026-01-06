@@ -24,6 +24,12 @@ Environment overrides (start):
   BASE_METRICS       Base metrics port (default: 18200)
   BASE_HTTP          Base HTTP port (default: 5055)
   USE_VALIDATOR_CONFIG_PORTS 1 to read QUIC/metrics ports from validator-config.yaml (default: 1)
+  AUTO_GENESIS       1 to auto-generate validator-config + genesis if missing (default: 1)
+  GENESIS_ENR_IP     ENR IP to embed in validator-config.yaml (default: 127.0.0.1)
+  GENESIS_ACTIVE_EPOCH Active epoch for generated validator-config.yaml (default: 18)
+  GENESIS_KEY_TYPE   Key type for generated validator-config.yaml (default: xmss)
+  GENESIS_SHUFFLE    Shuffle mode for generated validator-config.yaml (default: roundrobin)
+  GENESIS_GENERATOR  Path to generate-genesis.sh (default: tools/lean-quickstart/generate-genesis.sh)
   LOG_LEVEL          Lantern log level (default: info)
   DEVNET             Devnet name (default: devnet2)
   RUN_DIR            Run directory (default: /tmp/lantern-devnet2-run)
@@ -101,6 +107,12 @@ BASE_PORT=${BASE_PORT:-19200}
 BASE_METRICS=${BASE_METRICS:-18200}
 BASE_HTTP=${BASE_HTTP:-5055}
 USE_VALIDATOR_CONFIG_PORTS=${USE_VALIDATOR_CONFIG_PORTS:-1}
+AUTO_GENESIS=${AUTO_GENESIS:-1}
+GENESIS_ENR_IP=${GENESIS_ENR_IP:-127.0.0.1}
+GENESIS_ACTIVE_EPOCH=${GENESIS_ACTIVE_EPOCH:-18}
+GENESIS_KEY_TYPE=${GENESIS_KEY_TYPE:-xmss}
+GENESIS_SHUFFLE=${GENESIS_SHUFFLE:-roundrobin}
+GENESIS_GENERATOR=${GENESIS_GENERATOR:-"${REPO_ROOT}/tools/lean-quickstart/generate-genesis.sh"}
 LOG_LEVEL=${LOG_LEVEL:-info}
 DEVNET=${DEVNET:-devnet2}
 RUN_DIR=${RUN_DIR:-/tmp/lantern-devnet2-run}
@@ -189,6 +201,53 @@ fi
 
 GENESIS_DIR=${GENESIS_DIR_ARG:-${GENESIS_DIR:-/tmp/lantern-devnet2/genesis}}
 
+generate_validator_config() {
+  local output="${GENESIS_DIR}/validator-config.yaml"
+  mkdir -p "${GENESIS_DIR}"
+  local tmp
+  tmp="$(mktemp "${GENESIS_DIR}/validator-config.yaml.tmp.XXXXXX")"
+  cat > "${tmp}" <<EOF
+shuffle: ${GENESIS_SHUFFLE}
+deployment_mode: local
+config:
+  activeEpoch: ${GENESIS_ACTIVE_EPOCH}
+  keyType: "${GENESIS_KEY_TYPE}"
+validators:
+EOF
+  for i in $(seq 0 $((NODES-1))); do
+    local privkey
+    privkey="$(LAN_NODE_INDEX="${i}" python3 - <<'PY'
+import hashlib
+import os
+idx = int(os.environ["LAN_NODE_INDEX"])
+print(hashlib.sha256(f"lantern_{idx}".encode()).hexdigest())
+PY
+)"
+    local quic=$((BASE_PORT + i))
+    local metrics=$((BASE_METRICS + i))
+    cat >> "${tmp}" <<EOF
+  - name: "lantern_${i}"
+    privkey: "${privkey}"
+    enrFields:
+      ip: "${GENESIS_ENR_IP}"
+      quic: ${quic}
+    metricsPort: ${metrics}
+    count: 1
+
+EOF
+  done
+  mv "${tmp}" "${output}"
+}
+
+generate_genesis_artifacts() {
+  if [[ ! -x "${GENESIS_GENERATOR}" ]]; then
+    echo "error: genesis generator not found at ${GENESIS_GENERATOR}" >&2
+    echo "hint: set GENESIS_GENERATOR or generate genesis manually" >&2
+    exit 1
+  fi
+  "${GENESIS_GENERATOR}" "${GENESIS_DIR}" --mode local --forceKeyGen
+}
+
 if [[ "${RUNTIME}" != "docker" ]]; then
   if [[ ! -x "$BIN" ]]; then
     echo "error: lantern_cli not found at $BIN" >&2
@@ -209,12 +268,36 @@ required_files=(
   "validator-config.yaml"
   "genesis.ssz"
 )
+missing=()
 for file in "${required_files[@]}"; do
   if [[ ! -f "${GENESIS_DIR}/${file}" ]]; then
-    echo "error: missing ${GENESIS_DIR}/${file}" >&2
-    exit 1
+    missing+=("${file}")
   fi
 done
+if (( ${#missing[@]} > 0 )); then
+  if [[ "${AUTO_GENESIS}" != "1" ]]; then
+    printf "error: missing genesis artifacts in %s:\n" "${GENESIS_DIR}" >&2
+    printf "  - %s\n" "${missing[@]}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${GENESIS_DIR}/validator-config.yaml" ]]; then
+    echo "validator-config.yaml missing; generating for ${NODES} node(s)..." >&2
+    generate_validator_config
+  fi
+  echo "genesis artifacts missing; generating via ${GENESIS_GENERATOR}..." >&2
+  generate_genesis_artifacts
+  missing=()
+  for file in "${required_files[@]}"; do
+    if [[ ! -f "${GENESIS_DIR}/${file}" ]]; then
+      missing+=("${file}")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    printf "error: genesis generation incomplete, still missing:\n" >&2
+    printf "  - %s\n" "${missing[@]}" >&2
+    exit 1
+  fi
+fi
 
 if [[ ! -d "${GENESIS_DIR}/xmss-keys" ]]; then
   echo "error: missing ${GENESIS_DIR}/xmss-keys" >&2
@@ -429,9 +512,10 @@ for i in $(seq 0 $((NODES-1))); do
       docker_args+=(--network "${DOCKER_NETWORK}")
       docker_args+=(-p "${PORT}:${PORT}/udp" -p "${HTTP}:${HTTP}" -p "${METRICS}:${METRICS}")
     fi
+    docker_args+=(--entrypoint /bin/bash)
     docker_args+=(
       "${LANTERN_IMAGE}"
-      /bin/bash -lc "exec /usr/local/bin/lantern-entrypoint.sh 2>&1 | tee -a /logs/${NODE_ID}.log"
+      -lc "exec /usr/local/bin/lantern-entrypoint.sh 2>&1 | tee -a /logs/${NODE_ID}.log"
     )
     docker "${docker_args[@]}" >/dev/null
     echo "${NODE_ID}" >> "${PIDS_FILE}"
