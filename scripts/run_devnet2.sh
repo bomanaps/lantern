@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage:
+  scripts/run_devnet2.sh start <node_count> [genesis_dir] [binary|docker]
+  scripts/run_devnet2.sh stop <node_count> [binary|docker]
+
+Spins up or stops a local devnet-2 with N Lantern nodes.
+
+Args:
+  mode         start | stop
+  node_count   Number of nodes to start/stop (>=1)
+  genesis_dir  Path to a genesis directory (optional, start only)
+  runtime      binary | docker (optional; default: binary)
+
+Environment overrides (start):
+  BIN                Path to lantern_cli (default: ./build/lantern_cli)
+  GENESIS_DIR        Default genesis directory if arg not provided
+  REGENERATE_GENESIS 1 to refresh GENESIS_TIME + genesis.ssz (default: 1)
+  GENESIS_DELAY      Seconds to add to current time (default: 30)
+  BASE_PORT          Base QUIC port (default: 19200)
+  BASE_METRICS       Base metrics port (default: 18200)
+  BASE_HTTP          Base HTTP port (default: 5055)
+  USE_VALIDATOR_CONFIG_PORTS 1 to read QUIC/metrics ports from validator-config.yaml (default: 1)
+  LOG_LEVEL          Lantern log level (default: info)
+  DEVNET             Devnet name (default: devnet2)
+  RUN_DIR            Run directory (default: /tmp/lantern-devnet2-run)
+  CLEAN_RUN_DIR      1 to delete RUN_DIR data/logs before start (default: 1)
+  LEANSPEC_PY        Path to leanSpec python (default: tools/leanSpec/.venv/bin/python)
+  LANTERN_IMAGE      Docker image to run (default: lantern:local)
+  DOCKER_NETWORK     Docker network mode (default: host)
+  DOCKER_BUILD       1 to build image before start (default: 1)
+  DOCKER_BUILD_ARGS  Extra args passed to docker build (optional)
+
+Example:
+  scripts/run_devnet2.sh start 4 /tmp/lantern-devnet2/genesis binary
+  scripts/run_devnet2.sh start 4 /tmp/lantern-devnet2/genesis docker
+  scripts/run_devnet2.sh stop 2
+USAGE
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -lt 2 ]]; then
+  usage
+  exit 1
+fi
+
+MODE=$1
+shift
+case "${MODE}" in
+  start|stop) ;;
+  *)
+    echo "error: mode must be 'start' or 'stop'" >&2
+    usage
+    exit 1
+    ;;
+esac
+
+NODES=$1
+shift
+if ! [[ "${NODES}" =~ ^[0-9]+$ ]] || (( NODES < 1 )); then
+  echo "error: node_count must be a positive integer" >&2
+  exit 1
+fi
+
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+
+RUNTIME=${RUNTIME:-binary}
+GENESIS_DIR_ARG=""
+for arg in "$@"; do
+  case "${arg}" in
+    docker|binary)
+      RUNTIME="${arg}"
+      ;;
+    *)
+      if [[ -z "${GENESIS_DIR_ARG}" ]]; then
+        GENESIS_DIR_ARG="${arg}"
+      else
+        echo "error: unexpected argument '${arg}'" >&2
+        usage
+        exit 1
+      fi
+      ;;
+  esac
+done
+
+BIN=${BIN:-"${REPO_ROOT}/build/lantern_cli"}
+LEANSPEC_PY=${LEANSPEC_PY:-"${REPO_ROOT}/tools/leanSpec/.venv/bin/python"}
+REGENERATE_GENESIS=${REGENERATE_GENESIS:-1}
+GENESIS_DELAY=${GENESIS_DELAY:-30}
+BASE_PORT=${BASE_PORT:-19200}
+BASE_METRICS=${BASE_METRICS:-18200}
+BASE_HTTP=${BASE_HTTP:-5055}
+USE_VALIDATOR_CONFIG_PORTS=${USE_VALIDATOR_CONFIG_PORTS:-1}
+LOG_LEVEL=${LOG_LEVEL:-info}
+DEVNET=${DEVNET:-devnet2}
+RUN_DIR=${RUN_DIR:-/tmp/lantern-devnet2-run}
+CLEAN_RUN_DIR=${CLEAN_RUN_DIR:-1}
+LANTERN_IMAGE=${LANTERN_IMAGE:-lantern:local}
+DOCKER_NETWORK=${DOCKER_NETWORK:-host}
+DOCKER_BUILD=${DOCKER_BUILD:-1}
+DOCKER_BUILD_ARGS=${DOCKER_BUILD_ARGS:-}
+LANTERN_DEBUG_FINALIZATION=${LANTERN_DEBUG_FINALIZATION:-}
+LANTERN_DEBUG_STATE_HASH=${LANTERN_DEBUG_STATE_HASH:-}
+
+PIDS_FILE="${RUN_DIR}/pids"
+META_FILE="${RUN_DIR}/meta"
+
+read_meta_runtime() {
+  if [[ -f "${META_FILE}" ]]; then
+    while IFS= read -r line; do
+      case "${line}" in
+        RUNTIME=*)
+          echo "${line#RUNTIME=}"
+          return 0
+          ;;
+      esac
+    done < "${META_FILE}"
+  fi
+  return 1
+}
+
+if [[ "${MODE}" == "stop" ]]; then
+  meta_runtime="$(read_meta_runtime || true)"
+  if [[ -n "${meta_runtime}" ]]; then
+    RUNTIME="${meta_runtime}"
+  fi
+  if [[ -n "${GENESIS_DIR_ARG}" ]]; then
+    echo "error: genesis_dir is not used with stop mode" >&2
+    exit 1
+  fi
+  if [[ "${RUNTIME}" == "docker" ]] && ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker not found in PATH" >&2
+    exit 1
+  fi
+  if [[ ! -f "${PIDS_FILE}" ]]; then
+    echo "error: no running devnet found at ${PIDS_FILE}" >&2
+    exit 1
+  fi
+  pids=()
+  while IFS= read -r line; do
+    pids+=("${line}")
+  done < "${PIDS_FILE}"
+  total=${#pids[@]}
+  if (( total == 0 )); then
+    echo "no pids recorded in ${PIDS_FILE}" >&2
+    exit 1
+  fi
+  to_stop=${NODES}
+  if (( to_stop > total )); then
+    to_stop=${total}
+  fi
+  for i in $(seq 0 $((to_stop-1))); do
+    pid="${pids[$i]}"
+    if [[ -n "${pid}" ]]; then
+      if [[ "${RUNTIME}" == "docker" ]]; then
+        docker rm -f "${pid}" >/dev/null 2>&1 || true
+      else
+        kill -9 "${pid}" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+  if (( to_stop < total )); then
+    printf "%s\n" "${pids[@]:$to_stop}" > "${PIDS_FILE}"
+  else
+    : > "${PIDS_FILE}"
+  fi
+  echo "Stopped ${to_stop} node(s). Remaining: $((total - to_stop))"
+  exit 0
+fi
+
+GENESIS_DIR=${GENESIS_DIR_ARG:-${GENESIS_DIR:-/tmp/lantern-devnet2/genesis}}
+
+if [[ "${RUNTIME}" != "docker" ]]; then
+  if [[ ! -x "$BIN" ]]; then
+    echo "error: lantern_cli not found at $BIN" >&2
+    echo "hint: build it with: cmake --build build -j 8" >&2
+    exit 1
+  fi
+else
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "error: docker not found in PATH" >&2
+    exit 1
+  fi
+fi
+
+required_files=(
+  "config.yaml"
+  "validators.yaml"
+  "nodes.yaml"
+  "validator-config.yaml"
+  "genesis.ssz"
+)
+for file in "${required_files[@]}"; do
+  if [[ ! -f "${GENESIS_DIR}/${file}" ]]; then
+    echo "error: missing ${GENESIS_DIR}/${file}" >&2
+    exit 1
+  fi
+done
+
+if [[ ! -d "${GENESIS_DIR}/xmss-keys" ]]; then
+  echo "error: missing ${GENESIS_DIR}/xmss-keys" >&2
+  exit 1
+fi
+
+for i in $(seq 0 $((NODES-1))); do
+  if [[ ! -f "${GENESIS_DIR}/lantern_${i}.key" ]]; then
+    echo "error: missing ${GENESIS_DIR}/lantern_${i}.key" >&2
+    exit 1
+  fi
+  if [[ ! -f "${GENESIS_DIR}/xmss-keys/validator_${i}_pk.ssz" ]]; then
+    echo "error: missing ${GENESIS_DIR}/xmss-keys/validator_${i}_pk.ssz" >&2
+    exit 1
+  fi
+  if [[ ! -f "${GENESIS_DIR}/xmss-keys/validator_${i}_sk.ssz" ]]; then
+    echo "error: missing ${GENESIS_DIR}/xmss-keys/validator_${i}_sk.ssz" >&2
+    exit 1
+  fi
+done
+
+VC_QUIC_PORTS=()
+VC_METRICS_PORTS=()
+if [[ "${USE_VALIDATOR_CONFIG_PORTS}" == "1" ]]; then
+  if command -v rg >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      VC_QUIC_PORTS+=("${line}")
+    done < <(rg -o "quic:\\s*[0-9]+" "${GENESIS_DIR}/validator-config.yaml" | awk '{print $2}')
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      VC_METRICS_PORTS+=("${line}")
+    done < <(rg -o "metricsPort:\\s*[0-9]+" "${GENESIS_DIR}/validator-config.yaml" | awk '{print $2}')
+  else
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      VC_QUIC_PORTS+=("${line}")
+    done < <(grep -Eo "quic:[[:space:]]*[0-9]+" "${GENESIS_DIR}/validator-config.yaml" | awk '{print $2}')
+    while IFS= read -r line; do
+      [[ -z "${line}" ]] && continue
+      VC_METRICS_PORTS+=("${line}")
+    done < <(grep -Eo "metricsPort:[[:space:]]*[0-9]+" "${GENESIS_DIR}/validator-config.yaml" | awk '{print $2}')
+  fi
+  if (( ${#VC_QUIC_PORTS[@]} == 0 )); then
+    echo "warning: validator-config.yaml has no quic ports; falling back to BASE_PORT" >&2
+  fi
+  if (( ${#VC_METRICS_PORTS[@]} == 0 )); then
+    echo "warning: validator-config.yaml has no metricsPort entries; falling back to BASE_METRICS" >&2
+  fi
+fi
+
+if [[ "${REGENERATE_GENESIS}" == "1" ]]; then
+  if [[ ! -x "${LEANSPEC_PY}" ]]; then
+    echo "error: leanSpec python not found at ${LEANSPEC_PY}" >&2
+    echo "hint: create venv in tools/leanSpec or set REGENERATE_GENESIS=0" >&2
+    exit 1
+  fi
+
+  NEW_TIME=$(( $(date -u +%s) + GENESIS_DELAY ))
+  python3 - <<PY
+import pathlib
+path = pathlib.Path("${GENESIS_DIR}/config.yaml")
+lines = path.read_text().splitlines()
+out = []
+for line in lines:
+    if line.startswith("GENESIS_TIME:"):
+        out.append(f"GENESIS_TIME: {int(${NEW_TIME})}")
+    else:
+        out.append(line)
+path.write_text("\n".join(out) + "\n")
+PY
+
+  GENESIS_DIR="${GENESIS_DIR}" PYTHONPATH="${REPO_ROOT}/tools/leanSpec/src" "${LEANSPEC_PY}" - <<'PY'
+import os
+import pathlib
+import yaml
+from lean_spec.subspecs.containers.state import State, Validators
+from lean_spec.subspecs.containers.validator import Validator
+from lean_spec.types import Bytes52, Uint64
+
+genesis_dir = pathlib.Path(os.environ["GENESIS_DIR"])
+config = yaml.safe_load((genesis_dir / "config.yaml").read_text())
+num_validators = int(config.get("VALIDATOR_COUNT", 0))
+validators = []
+for i in range(num_validators):
+    pk = (genesis_dir / "xmss-keys" / f"validator_{i}_pk.ssz").read_bytes()
+    validators.append(Validator(pubkey=Bytes52(pk), index=Uint64(i)))
+state = State.generate_genesis(
+    genesis_time=Uint64(int(config["GENESIS_TIME"])),
+    validators=Validators(data=validators),
+)
+(genesis_dir / "genesis.ssz").write_bytes(state.encode_bytes())
+print(f"GENESIS_TIME set to {config['GENESIS_TIME']}")
+PY
+fi
+
+if [[ "${RUNTIME}" == "docker" && "${DOCKER_BUILD}" == "1" ]]; then
+  echo "Building docker image ${LANTERN_IMAGE}..."
+  if [[ -n "${DOCKER_BUILD_ARGS}" ]]; then
+    # shellcheck disable=SC2206
+    docker_build_args=(${DOCKER_BUILD_ARGS})
+    docker build "${docker_build_args[@]}" -t "${LANTERN_IMAGE}" "${REPO_ROOT}"
+  else
+    docker build -t "${LANTERN_IMAGE}" "${REPO_ROOT}"
+  fi
+fi
+
+if [[ -f "${PIDS_FILE}" ]]; then
+  meta_runtime="$(read_meta_runtime || true)"
+  runtime_check="${meta_runtime:-${RUNTIME}}"
+  while read -r pid; do
+    if [[ -z "${pid}" ]]; then
+      continue
+    fi
+    if [[ "${runtime_check}" == "docker" ]]; then
+      if docker ps -a --format '{{.Names}}' | rg -q "^${pid}$"; then
+        echo "error: devnet appears to be running (container ${pid})." >&2
+        echo "hint: stop it with: ${0} stop ${NODES} docker" >&2
+        exit 1
+      fi
+    else
+      if kill -0 "${pid}" >/dev/null 2>&1; then
+        echo "error: devnet appears to be running (pid ${pid})." >&2
+        echo "hint: stop it with: ${0} stop ${NODES}" >&2
+        exit 1
+      fi
+    fi
+  done < "${PIDS_FILE}"
+fi
+
+if [[ "${CLEAN_RUN_DIR}" == "1" && -d "${RUN_DIR}" ]]; then
+  rm -rf "${RUN_DIR}/data" "${RUN_DIR}/logs" "${RUN_DIR}/pids" "${RUN_DIR}/meta"
+fi
+
+mkdir -p "${RUN_DIR}"
+LOG_DIR="${RUN_DIR}/logs"
+DATA_DIR="${RUN_DIR}/data"
+mkdir -p "${LOG_DIR}" "${DATA_DIR}"
+printf "MODE=start\nNODE_COUNT=%s\nGENESIS_DIR=%s\nRUNTIME=%s\nSTARTED_AT=%s\n" \
+  "${NODES}" "${GENESIS_DIR}" "${RUNTIME}" "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+  > "${META_FILE}"
+truncate -s 0 "${PIDS_FILE}"
+
+for i in $(seq 0 $((NODES-1))); do
+  if (( ${#VC_QUIC_PORTS[@]} > i )); then
+    PORT="${VC_QUIC_PORTS[$i]}"
+  else
+    PORT=$((BASE_PORT + i))
+  fi
+  if (( ${#VC_METRICS_PORTS[@]} > i )); then
+    METRICS="${VC_METRICS_PORTS[$i]}"
+  else
+    METRICS=$((BASE_METRICS + i))
+  fi
+  HTTP=$((BASE_HTTP + i))
+  NODE_ID="lantern_${i}"
+  DATA="${DATA_DIR}/${NODE_ID}"
+  mkdir -p "${DATA}"
+
+  if [[ "${RUNTIME}" == "docker" ]]; then
+    if docker ps -a --format '{{.Names}}' | rg -q "^${NODE_ID}$"; then
+      echo "error: docker container ${NODE_ID} already exists" >&2
+      exit 1
+    fi
+    docker_args=(
+      run -d
+      --name "${NODE_ID}"
+      -v "${GENESIS_DIR}:/genesis:ro"
+      -v "${DATA}:/data"
+      -v "${LOG_DIR}:/logs"
+      -e "LANTERN_DATA_DIR=/data"
+      -e "LANTERN_GENESIS_DIR=/genesis"
+      -e "LANTERN_CONFIG_DIR=/genesis"
+      -e "LANTERN_NODE_ID=${NODE_ID}"
+      -e "LANTERN_DEVNET=${DEVNET}"
+      -e "LANTERN_LISTEN_ADDRESS=/ip4/0.0.0.0/udp/${PORT}/quic-v1"
+      -e "LANTERN_HTTP_PORT=${HTTP}"
+      -e "LANTERN_METRICS_PORT=${METRICS}"
+      -e "LANTERN_NODE_KEY_PATH=/genesis/lantern_${i}.key"
+      -e "LANTERN_GENESIS_CONFIG=/genesis/config.yaml"
+      -e "LANTERN_VALIDATOR_REGISTRY=/genesis/validators.yaml"
+      -e "LANTERN_NODES_FILE=/genesis/nodes.yaml"
+      -e "LANTERN_GENESIS_STATE=/genesis/genesis.ssz"
+      -e "LANTERN_VALIDATOR_CONFIG=/genesis/validator-config.yaml"
+      -e "LANTERN_XMSS_AGG_TEST_MODE=0"
+      -e "LANTERN_EXTRA_ARGS=--xmss-public-template /genesis/xmss-keys/validator_%u_pk.ssz --xmss-secret-template /genesis/xmss-keys/validator_%u_sk.ssz --log-level ${LOG_LEVEL}"
+    )
+    if [[ -n "${LANTERN_DEBUG_FINALIZATION}" ]]; then
+      docker_args+=(-e "LANTERN_DEBUG_FINALIZATION=${LANTERN_DEBUG_FINALIZATION}")
+    fi
+    if [[ -n "${LANTERN_DEBUG_STATE_HASH}" ]]; then
+      docker_args+=(-e "LANTERN_DEBUG_STATE_HASH=${LANTERN_DEBUG_STATE_HASH}")
+    fi
+    if [[ "${DOCKER_NETWORK}" == "host" ]]; then
+      docker_args+=(--network host)
+    else
+      docker_args+=(--network "${DOCKER_NETWORK}")
+      docker_args+=(-p "${PORT}:${PORT}/udp" -p "${HTTP}:${HTTP}" -p "${METRICS}:${METRICS}")
+    fi
+    docker_args+=(
+      "${LANTERN_IMAGE}"
+      /bin/bash -lc "exec /usr/local/bin/lantern-entrypoint.sh 2>&1 | tee -a /logs/${NODE_ID}.log"
+    )
+    docker "${docker_args[@]}" >/dev/null
+    echo "${NODE_ID}" >> "${PIDS_FILE}"
+  else
+    if [[ -n "${LANTERN_DEBUG_FINALIZATION}" ]]; then
+      export LANTERN_DEBUG_FINALIZATION
+    fi
+    if [[ -n "${LANTERN_DEBUG_STATE_HASH}" ]]; then
+      export LANTERN_DEBUG_STATE_HASH
+    fi
+    nohup "${BIN}" \
+      --data-dir "${DATA}" \
+      --genesis-config "${GENESIS_DIR}/config.yaml" \
+      --validator-registry-path "${GENESIS_DIR}/validators.yaml" \
+      --nodes-path "${GENESIS_DIR}/nodes.yaml" \
+      --genesis-state "${GENESIS_DIR}/genesis.ssz" \
+      --validator-config "${GENESIS_DIR}/validator-config.yaml" \
+      --node-id "${NODE_ID}" \
+      --node-key-path "${GENESIS_DIR}/lantern_${i}.key" \
+      --listen-address "/ip4/127.0.0.1/udp/${PORT}/quic-v1" \
+      --http-port "${HTTP}" \
+      --metrics-port "${METRICS}" \
+      --devnet "${DEVNET}" \
+      --xmss-public-template "${GENESIS_DIR}/xmss-keys/validator_%u_pk.ssz" \
+      --xmss-secret-template "${GENESIS_DIR}/xmss-keys/validator_%u_sk.ssz" \
+      --log-level "${LOG_LEVEL}" \
+      >"${LOG_DIR}/${NODE_ID}.log" 2>&1 &
+    echo $! >> "${PIDS_FILE}"
+  fi
+  sleep 0.2
+done
+
+echo "RUN_DIR=${RUN_DIR}"
+echo "Logs: ${LOG_DIR}"
+if (( ${#VC_METRICS_PORTS[@]} >= NODES )); then
+  metrics_list=$(printf "%s " "${VC_METRICS_PORTS[@]:0:${NODES}}")
+  echo "Metrics ports: ${metrics_list% }"
+else
+  echo "Metrics ports: ${BASE_METRICS}..$((BASE_METRICS + NODES - 1))"
+fi
+echo "Stop with: ${0} stop ${NODES} ${RUNTIME}"

@@ -245,6 +245,33 @@ static size_t parent_index_for_block(const LanternForkChoice *store, const Lante
     return parent_index;
 }
 
+static void update_children_parent_index(
+    LanternForkChoice *store,
+    const LanternRoot *parent_root,
+    size_t parent_index) {
+    if (!store || !store->blocks || !parent_root) {
+        return;
+    }
+    if (root_is_zero(parent_root)) {
+        return;
+    }
+    for (size_t i = 0; i < store->block_len; ++i) {
+        if (i == parent_index) {
+            continue;
+        }
+        struct lantern_fork_choice_block_entry *entry = &store->blocks[i];
+        if (entry->parent_index != SIZE_MAX) {
+            continue;
+        }
+        if (root_is_zero(&entry->parent_root)) {
+            continue;
+        }
+        if (root_compare(&entry->parent_root, parent_root) == 0) {
+            entry->parent_index = parent_index;
+        }
+    }
+}
+
 void lantern_fork_choice_init(LanternForkChoice *store) {
     if (!store) {
         return;
@@ -375,6 +402,7 @@ static int register_block(
     if (map_insert(store, root, new_index) != 0) {
         return -1;
     }
+    update_children_parent_index(store, root, new_index);
     return 0;
 }
 
@@ -818,11 +846,14 @@ static int tick_interval(LanternForkChoice *store, bool has_proposal) {
         }
         return 0;
     case 1:
+        /* Interval 1: collect new votes, no store mutation. */
         return 0;
     case 2:
         return lantern_fork_choice_update_safe_target(store);
-    default:
+    case 3:
         return lantern_fork_choice_accept_new_votes(store);
+    default:
+        return 0;
     }
 }
 

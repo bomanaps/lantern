@@ -1109,11 +1109,22 @@ int lantern_state_set_signed_validator_vote(
         return -1;
     }
     struct lantern_vote_record *record = &state->validator_votes[index];
+    LanternVote previous_vote = record->vote;
+    LanternSignature previous_signature = record->signature;
+    bool previous_has_signature = record->has_signature;
     record->vote = vote->data;
     record->vote.validator_id = (uint64_t)index;
     record->has_vote = true;
-    record->signature = vote->signature;
-    record->has_signature = !signature_is_zero(&vote->signature);
+    if (!signature_is_zero(&vote->signature)) {
+        record->signature = vote->signature;
+        record->has_signature = true;
+    } else if (previous_has_signature && lantern_votes_equal(&previous_vote, &record->vote)) {
+        record->signature = previous_signature;
+        record->has_signature = true;
+    } else {
+        memset(&record->signature, 0, sizeof(record->signature));
+        record->has_signature = false;
+    }
     return 0;
 }
 
@@ -1541,8 +1552,8 @@ static int lantern_state_process_attestations_internal(
             record_attestation_validation_metric(att_validation_start, false);
             continue;
         }
-        if (vote->target.slot <= vote->source.slot) {
-            /* LeanSpec: silently skip if target <= source (state.py:406) */
+        if (vote->target.slot < vote->source.slot) {
+            /* LeanSpec: silently skip if target < source (state.py:406) */
             continue;
         }
         if (vote->source.slot > SIZE_MAX || vote->target.slot > SIZE_MAX) {
@@ -1557,15 +1568,39 @@ static int lantern_state_process_attestations_internal(
         }
         if (!lantern_state_slot_in_justified_window(state, vote->source.slot)) {
             /* LeanSpec: silently skip attestations with source outside justified window */
+            if (trace_finalization) {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization trace skip source_outside_window source_slot=%" PRIu64
+                    " window=[%" PRIu64 ",%" PRIu64 ")",
+                    vote->source.slot,
+                    state->justified_slots_offset,
+                    state->justified_slots_offset + state->justified_slots.bit_length);
+            }
             continue;
         }
         bool source_is_justified = false;
         if (lantern_state_get_justified_slot_bit(state, vote->source.slot, &source_is_justified) != 0) {
             /* LeanSpec: silently skip if we can't read source justified status */
+            if (trace_finalization) {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization trace skip source_bit_unreadable source_slot=%" PRIu64,
+                    vote->source.slot);
+            }
             continue;
         }
         if (!source_is_justified) {
             /* LeanSpec: silently skip attestations with unjustified source (state.py:386) */
+            if (trace_finalization) {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization trace skip source_unjustified source_slot=%" PRIu64,
+                    vote->source.slot);
+            }
             continue;
         }
 
@@ -1589,6 +1624,14 @@ static int lantern_state_process_attestations_internal(
         }
 
         if (!source_matches && !target_matches) {
+            if (trace_finalization) {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization trace skip roots_mismatch source_slot=%" PRIu64 " target_slot=%" PRIu64,
+                    vote->source.slot,
+                    vote->target.slot);
+            }
             continue;
         }
 
@@ -1607,6 +1650,13 @@ static int lantern_state_process_attestations_internal(
         if (lantern_state_slot_in_justified_window(state, vote->target.slot)) {
             if (lantern_state_get_justified_slot_bit(state, vote->target.slot, &target_is_justified) != 0) {
                 /* LeanSpec: silently skip if we can't read target justified status */
+                if (trace_finalization) {
+                    lantern_log_debug(
+                        "state",
+                        &meta,
+                        "finalization trace skip target_bit_unreadable target_slot=%" PRIu64,
+                        vote->target.slot);
+                }
                 continue;
             }
         }
@@ -1638,6 +1688,13 @@ static int lantern_state_process_attestations_internal(
 
         /* Skip if target is already justified (leanSpec line 394) */
         if (target_is_justified) {
+            if (trace_finalization) {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "finalization trace skip target_already_justified target_slot=%" PRIu64,
+                    vote->target.slot);
+            }
             record_attestation_validation_metric(att_validation_start, true);
             continue;
         }
@@ -2407,7 +2464,7 @@ int lantern_state_compute_vote_checkpoints(
         if (lantern_fork_choice_block_info(store, &parent_root, &parent_slot, NULL, NULL) != 0) {
             return -1;
         }
-        if (parent_slot <= state->latest_finalized.slot) {
+        if (parent_slot < state->latest_finalized.slot) {
             justifiable_slot_found = false;
             if (trace_finalization) {
                 format_root_hex(&target_root, target_hex, sizeof(target_hex));

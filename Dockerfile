@@ -80,6 +80,11 @@ for path in libdir.glob("*.so.*"):
             pass
 PY
 
+# Preserve leanMultisig sources needed at runtime for XMSS aggregation.
+# The runtime binary expects xmss_aggregate.lean_lang at the build-time cargo checkout path.
+RUN mkdir -p /opt/lantern/share/cargo-git-checkouts \
+    && cp -a /root/.cargo/git/checkouts/leanmultisig-* /opt/lantern/share/cargo-git-checkouts/
+
 FROM ubuntu:22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -100,6 +105,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /opt/lantern /opt/lantern
+RUN mkdir -p /root/.cargo/git/checkouts
+COPY --from=builder /opt/lantern/share/cargo-git-checkouts/ /root/.cargo/git/checkouts/
 COPY docker/entrypoint.sh /usr/local/bin/lantern-entrypoint.sh
 
 ENV PATH="/opt/lantern/bin:${PATH}"
