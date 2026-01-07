@@ -549,18 +549,19 @@ int lantern_hash_tree_root_signed_vote(const LanternSignedVote *vote, LanternRoo
     if (!vote || !out_root) {
         return -1;
     }
-    LanternRoot vote_root;
-    if (lantern_hash_tree_root_vote(&vote->data, &vote_root) != 0) {
+    LanternRoot data_root;
+    if (lantern_hash_tree_root_attestation_data(&vote->data.data, &data_root) != 0) {
         return -1;
     }
     LanternRoot signature_root;
     if (hash_xmss_signature(&vote->signature, &signature_root) != 0) {
         return -1;
     }
-    uint8_t chunks[2][SSZ_BYTES_PER_CHUNK];
-    memcpy(chunks[0], vote_root.bytes, SSZ_BYTES_PER_CHUNK);
-    memcpy(chunks[1], signature_root.bytes, SSZ_BYTES_PER_CHUNK);
-    return merkleize_chunks(&chunks[0][0], 2, 0, out_root);
+    uint8_t chunks[3][SSZ_BYTES_PER_CHUNK];
+    chunk_from_uint64(vote->data.validator_id, chunks[0]);
+    memcpy(chunks[1], data_root.bytes, SSZ_BYTES_PER_CHUNK);
+    memcpy(chunks[2], signature_root.bytes, SSZ_BYTES_PER_CHUNK);
+    return merkleize_chunks(&chunks[0][0], 3, 0, out_root);
 }
 
 int lantern_merkleize_root_list(

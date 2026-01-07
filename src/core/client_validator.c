@@ -52,6 +52,9 @@ struct aggregation_group {
     LanternSignature *signatures;
     size_t count;
     size_t capacity;
+    uint64_t *all_validator_ids;
+    size_t all_count;
+    size_t all_capacity;
 };
 
 static bool attestation_data_equal(const LanternAttestationData *a, const LanternAttestationData *b)
@@ -99,6 +102,7 @@ static void aggregation_group_reset(struct aggregation_group *group)
     }
     free(group->validator_ids);
     free(group->signatures);
+    free(group->all_validator_ids);
     memset(group, 0, sizeof(*group));
 }
 
@@ -107,10 +111,51 @@ static int aggregation_group_append(
     uint64_t validator_id,
     const LanternSignature *signature)
 {
-    if (!group || !signature)
+    if (!group)
     {
         return -1;
     }
+
+    bool in_all = false;
+    for (size_t i = 0; i < group->all_count; ++i)
+    {
+        if (group->all_validator_ids[i] == validator_id)
+        {
+            in_all = true;
+            break;
+        }
+    }
+    if (!in_all)
+    {
+        size_t required_all = group->all_count + 1u;
+        if (group->all_capacity < required_all)
+        {
+            size_t new_capacity = group->all_capacity == 0 ? 4u : group->all_capacity;
+            while (new_capacity < required_all)
+            {
+                if (new_capacity > (SIZE_MAX / 2u))
+                {
+                    return -1;
+                }
+                new_capacity *= 2u;
+            }
+            uint64_t *ids = realloc(group->all_validator_ids, new_capacity * sizeof(*ids));
+            if (!ids)
+            {
+                return -1;
+            }
+            group->all_validator_ids = ids;
+            group->all_capacity = new_capacity;
+        }
+        group->all_validator_ids[group->all_count] = validator_id;
+        group->all_count += 1u;
+    }
+
+    if (!signature || lantern_signature_is_zero(signature))
+    {
+        return 0;
+    }
+
     for (size_t i = 0; i < group->count; ++i)
     {
         if (group->validator_ids[i] == validator_id)
@@ -118,6 +163,7 @@ static int aggregation_group_append(
             return 0;
         }
     }
+
     size_t required = group->count + 1u;
     if (group->capacity < required)
     {
@@ -347,6 +393,182 @@ static lantern_client_error append_group_as_aggregated(
     return LANTERN_CLIENT_OK;
 }
 
+static size_t proof_overlap_count(
+    const LanternAggregatedSignatureProof *proof,
+    const bool *remaining)
+{
+    if (!proof || !remaining || proof->participants.bit_length == 0 || !proof->participants.bytes)
+    {
+        return 0;
+    }
+    size_t count = 0;
+    size_t limit = proof->participants.bit_length;
+    if (limit > LANTERN_VALIDATOR_REGISTRY_LIMIT)
+    {
+        limit = LANTERN_VALIDATOR_REGISTRY_LIMIT;
+    }
+    for (size_t i = 0; i < limit; ++i)
+    {
+        if (lantern_bitlist_get(&proof->participants, i) && remaining[i])
+        {
+            count += 1u;
+        }
+    }
+    return count;
+}
+
+static void proof_clear_remaining(
+    const LanternAggregatedSignatureProof *proof,
+    bool *remaining,
+    size_t *remaining_count)
+{
+    if (!proof || !remaining || !remaining_count || proof->participants.bit_length == 0 || !proof->participants.bytes)
+    {
+        return;
+    }
+    size_t limit = proof->participants.bit_length;
+    if (limit > LANTERN_VALIDATOR_REGISTRY_LIMIT)
+    {
+        limit = LANTERN_VALIDATOR_REGISTRY_LIMIT;
+    }
+    for (size_t i = 0; i < limit; ++i)
+    {
+        if (lantern_bitlist_get(&proof->participants, i) && remaining[i])
+        {
+            remaining[i] = false;
+            if (*remaining_count > 0)
+            {
+                *remaining_count -= 1u;
+            }
+        }
+    }
+}
+
+static lantern_client_error append_cached_proof_as_aggregated(
+    const LanternAttestationData *data,
+    const LanternAggregatedSignatureProof *proof,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures)
+{
+    if (!data || !proof || !out_attestations || !out_signatures)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (proof->participants.bit_length == 0 || !proof->participants.bytes)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    LanternAggregatedAttestation attestation;
+    lantern_aggregated_attestation_init(&attestation);
+    attestation.data = *data;
+    if (lantern_bitlist_resize(&attestation.aggregation_bits, proof->participants.bit_length) != 0)
+    {
+        lantern_aggregated_attestation_reset(&attestation);
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+    size_t byte_len = (proof->participants.bit_length + 7u) / 8u;
+    if (byte_len > 0)
+    {
+        if (!attestation.aggregation_bits.bytes)
+        {
+            lantern_aggregated_attestation_reset(&attestation);
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        memcpy(attestation.aggregation_bits.bytes, proof->participants.bytes, byte_len);
+    }
+
+    if (lantern_aggregated_attestations_append(out_attestations, &attestation) != 0)
+    {
+        lantern_aggregated_attestation_reset(&attestation);
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+    if (lantern_attestation_signatures_append(out_signatures, proof) != 0)
+    {
+        lantern_aggregated_attestation_reset(&attestation);
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+
+    lantern_aggregated_attestation_reset(&attestation);
+    return LANTERN_CLIENT_OK;
+}
+
+static lantern_client_error append_cached_proofs_for_group(
+    const struct lantern_client *client,
+    const LanternAttestationData *data,
+    const LanternRoot *data_root,
+    bool *remaining,
+    size_t *remaining_count,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures)
+{
+    if (!client || !data || !data_root || !remaining || !remaining_count || !out_attestations || !out_signatures)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (*remaining_count == 0)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+    const struct lantern_agg_proof_cache *cache = &client->agg_proof_cache;
+    if (!cache->entries || cache->length == 0)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+
+    bool *used = calloc(cache->length, sizeof(*used));
+    if (!used)
+    {
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+
+    while (*remaining_count > 0)
+    {
+        size_t best_index = SIZE_MAX;
+        size_t best_overlap = 0;
+        for (size_t i = 0; i < cache->length; ++i)
+        {
+            if (used[i])
+            {
+                continue;
+            }
+            if (memcmp(cache->entries[i].data_root.bytes, data_root->bytes, LANTERN_ROOT_SIZE) != 0)
+            {
+                continue;
+            }
+            size_t overlap = proof_overlap_count(&cache->entries[i].proof, remaining);
+            if (overlap > best_overlap)
+            {
+                best_overlap = overlap;
+                best_index = i;
+                if (best_overlap == *remaining_count)
+                {
+                    break;
+                }
+            }
+        }
+        if (best_index == SIZE_MAX || best_overlap == 0)
+        {
+            break;
+        }
+        lantern_client_error rc = append_cached_proof_as_aggregated(
+            data,
+            &cache->entries[best_index].proof,
+            out_attestations,
+            out_signatures);
+        if (rc != LANTERN_CLIENT_OK)
+        {
+            free(used);
+            return rc;
+        }
+        proof_clear_remaining(&cache->entries[best_index].proof, remaining, remaining_count);
+        used[best_index] = true;
+    }
+
+    free(used);
+    return LANTERN_CLIENT_OK;
+}
+
 static lantern_client_error aggregate_attestations_for_block(
     struct lantern_client *client,
     const LanternAttestations *att_list,
@@ -391,14 +613,10 @@ static lantern_client_error aggregate_attestations_for_block(
 
     for (size_t i = 0; i < att_list->length; ++i)
     {
-        if (!att_signatures->data || i >= att_signatures->length)
+        const LanternSignature *signature = NULL;
+        if (att_signatures->data && i < att_signatures->length)
         {
-            continue;
-        }
-        const LanternSignature *signature = &att_signatures->data[i];
-        if (lantern_signature_is_zero(signature))
-        {
-            continue;
+            signature = &att_signatures->data[i];
         }
         LanternAttestationData data = {
             .slot = att_list->data[i].slot,
@@ -428,10 +646,80 @@ static lantern_client_error aggregate_attestations_for_block(
         for (size_t i = 0; i < group_count; ++i)
         {
             aggregation_group_sort(&groups[i]);
-            rc = append_group_as_aggregated(&client->state, &groups[i], out_attestations, out_signatures);
-            if (rc != LANTERN_CLIENT_OK)
+            LanternRoot data_root;
+            if (lantern_hash_tree_root_attestation_data(&groups[i].data, &data_root) != 0)
             {
+                rc = LANTERN_CLIENT_ERR_VALIDATOR;
                 break;
+            }
+            if (groups[i].count > 0)
+            {
+                rc = append_group_as_aggregated(&client->state, &groups[i], out_attestations, out_signatures);
+                if (rc != LANTERN_CLIENT_OK)
+                {
+                    break;
+                }
+            }
+
+            if (groups[i].all_count > 0)
+            {
+                bool *remaining = calloc(LANTERN_VALIDATOR_REGISTRY_LIMIT, sizeof(*remaining));
+                if (!remaining)
+                {
+                    rc = LANTERN_CLIENT_ERR_ALLOC;
+                    break;
+                }
+                size_t remaining_count = 0;
+                for (size_t j = 0; j < groups[i].all_count; ++j)
+                {
+                    uint64_t vid = groups[i].all_validator_ids[j];
+                    if (vid >= LANTERN_VALIDATOR_REGISTRY_LIMIT)
+                    {
+                        rc = LANTERN_CLIENT_ERR_RUNTIME;
+                        break;
+                    }
+                    if (!remaining[vid])
+                    {
+                        remaining[vid] = true;
+                        remaining_count += 1u;
+                    }
+                }
+                if (rc == LANTERN_CLIENT_OK && groups[i].count > 0)
+                {
+                    for (size_t j = 0; j < groups[i].count; ++j)
+                    {
+                        uint64_t vid = groups[i].validator_ids[j];
+                        if (vid >= LANTERN_VALIDATOR_REGISTRY_LIMIT)
+                        {
+                            rc = LANTERN_CLIENT_ERR_RUNTIME;
+                            break;
+                        }
+                        if (remaining[vid])
+                        {
+                            remaining[vid] = false;
+                            if (remaining_count > 0)
+                            {
+                                remaining_count -= 1u;
+                            }
+                        }
+                    }
+                }
+                if (rc == LANTERN_CLIENT_OK && remaining_count > 0)
+                {
+                    rc = append_cached_proofs_for_group(
+                        client,
+                        &groups[i].data,
+                        &data_root,
+                        remaining,
+                        &remaining_count,
+                        out_attestations,
+                        out_signatures);
+                }
+                free(remaining);
+                if (rc != LANTERN_CLIENT_OK)
+                {
+                    break;
+                }
             }
         }
     }

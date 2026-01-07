@@ -221,6 +221,34 @@ static bool signed_block_signatures_are_valid(
         "proposer");
 }
 
+static void cache_block_aggregated_proofs_locked(
+    struct lantern_client *client,
+    const LanternSignedBlock *block)
+{
+    if (!client || !block) {
+        return;
+    }
+    const LanternAggregatedAttestations *attestations = &block->message.block.body.attestations;
+    const LanternAttestationSignatures *proofs = &block->signatures.attestation_signatures;
+    if (!attestations->data || !proofs->data) {
+        return;
+    }
+    size_t count = attestations->length;
+    if (proofs->length < count) {
+        count = proofs->length;
+    }
+    if (count == 0) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        LanternRoot data_root;
+        if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != 0) {
+            continue;
+        }
+        (void)lantern_client_agg_proof_cache_add(client, &data_root, &proofs->data[i]);
+    }
+}
+
 
 /* ============================================================================
  * Block Import Helpers
@@ -795,6 +823,8 @@ bool lantern_client_import_block(
     {
         goto cleanup;
     }
+
+    cache_block_aggregated_proofs_locked(client, block);
 
     if (!apply_state_transition_locked(client, block, meta))
     {

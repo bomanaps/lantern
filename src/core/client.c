@@ -68,6 +68,128 @@
 
 static const size_t NODE_PRIVATE_KEY_SIZE = 32u;
 static const size_t BOOTNODE_LINE_MAX_LEN = 2048u;
+static const size_t LANTERN_AGG_PROOF_CACHE_LIMIT = 4096u;
+
+static void agg_proof_cache_init(struct lantern_agg_proof_cache *cache) {
+    if (!cache) {
+        return;
+    }
+    cache->entries = NULL;
+    cache->length = 0;
+    cache->capacity = 0;
+}
+
+static void agg_proof_cache_reset(struct lantern_agg_proof_cache *cache) {
+    if (!cache) {
+        return;
+    }
+    if (cache->entries) {
+        for (size_t i = 0; i < cache->length; ++i) {
+            lantern_aggregated_signature_proof_reset(&cache->entries[i].proof);
+        }
+    }
+    free(cache->entries);
+    cache->entries = NULL;
+    cache->length = 0;
+    cache->capacity = 0;
+}
+
+static bool agg_proof_cache_entry_equals(
+    const struct lantern_agg_proof_cache_entry *entry,
+    const LanternRoot *data_root,
+    const LanternAggregatedSignatureProof *proof) {
+    if (!entry || !data_root || !proof) {
+        return false;
+    }
+    if (memcmp(entry->data_root.bytes, data_root->bytes, LANTERN_ROOT_SIZE) != 0) {
+        return false;
+    }
+    if (entry->proof.participants.bit_length != proof->participants.bit_length) {
+        return false;
+    }
+    size_t bits = proof->participants.bit_length;
+    size_t bytes = (bits + 7u) / 8u;
+    if (bytes > 0) {
+        if (!entry->proof.participants.bytes || !proof->participants.bytes) {
+            return false;
+        }
+        if (memcmp(entry->proof.participants.bytes, proof->participants.bytes, bytes) != 0) {
+            return false;
+        }
+    }
+    if (entry->proof.proof_data.length != proof->proof_data.length) {
+        return false;
+    }
+    if (proof->proof_data.length > 0) {
+        if (!entry->proof.proof_data.data || !proof->proof_data.data) {
+            return false;
+        }
+        if (memcmp(entry->proof.proof_data.data, proof->proof_data.data, proof->proof_data.length) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void agg_proof_cache_evict_oldest(struct lantern_agg_proof_cache *cache) {
+    if (!cache || cache->length == 0 || !cache->entries) {
+        return;
+    }
+    lantern_aggregated_signature_proof_reset(&cache->entries[0].proof);
+    if (cache->length > 1) {
+        memmove(cache->entries, cache->entries + 1, (cache->length - 1) * sizeof(*cache->entries));
+    }
+    cache->length -= 1u;
+}
+
+int lantern_client_agg_proof_cache_add(
+    struct lantern_client *client,
+    const LanternRoot *data_root,
+    const LanternAggregatedSignatureProof *proof) {
+    if (!client || !data_root || !proof) {
+        return -1;
+    }
+    if (proof->participants.bit_length == 0 || proof->proof_data.length == 0) {
+        return -1;
+    }
+    struct lantern_agg_proof_cache *cache = &client->agg_proof_cache;
+    for (size_t i = 0; i < cache->length; ++i) {
+        if (agg_proof_cache_entry_equals(&cache->entries[i], data_root, proof)) {
+            return 0;
+        }
+    }
+
+    if (cache->length >= LANTERN_AGG_PROOF_CACHE_LIMIT) {
+        agg_proof_cache_evict_oldest(cache);
+    }
+
+    if (cache->length >= cache->capacity) {
+        size_t desired = cache->capacity == 0 ? 8u : cache->capacity * 2u;
+        if (desired > LANTERN_AGG_PROOF_CACHE_LIMIT) {
+            desired = LANTERN_AGG_PROOF_CACHE_LIMIT;
+        }
+        if (desired <= cache->capacity) {
+            return -1;
+        }
+        struct lantern_agg_proof_cache_entry *entries =
+            realloc(cache->entries, desired * sizeof(*entries));
+        if (!entries) {
+            return -1;
+        }
+        cache->entries = entries;
+        cache->capacity = desired;
+    }
+
+    struct lantern_agg_proof_cache_entry *entry = &cache->entries[cache->length];
+    entry->data_root = *data_root;
+    lantern_aggregated_signature_proof_init(&entry->proof);
+    if (lantern_aggregated_signature_proof_copy(&entry->proof, proof) != 0) {
+        lantern_aggregated_signature_proof_reset(&entry->proof);
+        return -1;
+    }
+    cache->length += 1u;
+    return 0;
+}
 
 /* ============================================================================
  * External Functions (from client_init.c)
@@ -423,6 +545,7 @@ static void client_reset_base(struct lantern_client *client)
     lantern_http_server_init(&client->http_server);
     client->http_running = false;
     lantern_state_init(&client->state);
+    agg_proof_cache_init(&client->agg_proof_cache);
     lean_metrics_reset();
     client->state_lock_initialized = false;
     lantern_fork_choice_init(&client->fork_choice);
@@ -1837,6 +1960,7 @@ static void shutdown_state_and_runtime(struct lantern_client *client)
     {
         lantern_state_reset(&client->state);
     }
+    agg_proof_cache_reset(&client->agg_proof_cache);
     if (client->state_lock_initialized)
     {
         pthread_mutex_destroy(&client->state_lock);

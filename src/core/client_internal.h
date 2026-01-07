@@ -187,6 +187,21 @@ void string_list_remove(struct lantern_string_list *list, const char *value);
  */
 const char *connection_reason_text(int reason);
 
+/**
+ * Cache an aggregated signature proof keyed by attestation data root.
+ *
+ * @param client     Client instance (state_lock must be held)
+ * @param data_root  Attestation data root for the proof
+ * @param proof      Aggregated signature proof to cache
+ * @return 0 on success, -1 on error
+ *
+ * @note Thread safety: Caller must hold state_lock.
+ */
+int lantern_client_agg_proof_cache_add(
+    struct lantern_client *client,
+    const LanternRoot *data_root,
+    const LanternAggregatedSignatureProof *proof);
+
 
 /* ============================================================================
  * Lock Functions

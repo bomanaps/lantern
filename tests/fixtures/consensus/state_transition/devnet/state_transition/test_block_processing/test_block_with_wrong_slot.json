@@ -1,17 +1,17 @@
 {
-    "tests/consensus/devnet/state_transition/test_genesis.py::test_genesis_custom_time[fork_Devnet][fork_Devnet-state_transition_test]": {
+    "tests/consensus/devnet/state_transition/test_block_processing.py::test_block_with_wrong_slot[fork_Devnet][fork_Devnet-state_transition_test]": {
         "network": "Devnet",
         "leanEnv": "test",
         "pre": {
             "config": {
-                "genesisTime": 1234567890
+                "genesisTime": 0
             },
-            "slot": 0,
+            "slot": 1,
             "latestBlockHeader": {
                 "slot": 0,
                 "proposerIndex": 0,
                 "parentRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-                "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "stateRoot": "0xe964061dcf66d2772fea43f77cdbf563b6642b7d13130b42890618b16e67c1f2",
                 "bodyRoot": "0xdba9671bac9513c9482f1416a53aabd2c6ce90d5a5f865ce5a55c775325c9136"
             },
             "latestJustified": {
@@ -55,38 +55,26 @@
                 "data": []
             }
         },
-        "blocks": [],
-        "post": {
-            "slot": 0,
-            "latestJustifiedSlot": 0,
-            "latestJustifiedRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "latestFinalizedSlot": 0,
-            "latestFinalizedRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "validatorCount": 4,
-            "configGenesisTime": 1234567890,
-            "latestBlockHeaderSlot": 0,
-            "latestBlockHeaderProposerIndex": 0,
-            "latestBlockHeaderParentRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "latestBlockHeaderStateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
-            "latestBlockHeaderBodyRoot": "0xdba9671bac9513c9482f1416a53aabd2c6ce90d5a5f865ce5a55c775325c9136",
-            "historicalBlockHashes": {
-                "data": []
-            },
-            "justifiedSlots": {
-                "data": []
-            },
-            "justificationsRoots": {
-                "data": []
-            },
-            "justificationsValidators": {
-                "data": []
+        "blocks": [
+            {
+                "slot": 2,
+                "proposerIndex": 2,
+                "parentRoot": "0xee3755ec636c6cabd4fbec9791efd12fb38fbad6989e09258a286dcdfa84ca0f",
+                "stateRoot": "0x0000000000000000000000000000000000000000000000000000000000000000",
+                "body": {
+                    "attestations": {
+                        "data": []
+                    }
+                }
             }
-        },
+        ],
+        "expectException": "AssertionError",
+        "expectExceptionMessage": "Block slot mismatch",
         "_info": {
-            "hash": "0x1676cd789fda952b19f0592c94b020bf7a43523aab0951e65d17c13ec5241f12",
+            "hash": "0x3e9a6c55ea851ac9514f3db8a433d571552638e884a3cbc64b10c2966f14fa24",
             "comment": "`leanSpec` generated test",
-            "testId": "tests/consensus/devnet/state_transition/test_genesis.py::test_genesis_custom_time[fork_Devnet]",
-            "description": "Test genesis state with custom genesis time.\n\n    Scenario\n    --------\n    Generate a genesis state with:\n    - genesis_time = 1234567890\n    - Default 4 validators\n\n    Expected Behavior\n    -----------------\n    Genesis state should respect the custom genesis time while\n    maintaining all other genesis properties.",
+            "testId": "tests/consensus/devnet/state_transition/test_block_processing.py::test_block_with_wrong_slot[fork_Devnet]",
+            "description": "Test that blocks with mismatched slot are rejected.\n\n    Scenario\n    --------\n    Attempt to process a block at slot 1, but the block claims to be\n    at slot 2.\n\n    Expected Behavior\n    -----------------\n    Block processing fails with AssertionError: \"Block slot mismatch\"\n\n    Why This Matters\n    ----------------\n    Ensures temporal consistency:\n    - Blocks can't lie about their slot\n    - Prevents time manipulation attacks\n    - Maintains protocol timing integrity\n    - Essential for slot-based consensus",
             "fixtureFormat": "state_transition_test"
         }
     }

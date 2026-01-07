@@ -1,6 +1,7 @@
 {
-    "tests/consensus/devnet/state_transition/test_genesis.py::test_genesis_default_configuration[fork_Devnet][fork_devnet-state_transition_test]": {
+    "tests/consensus/devnet/state_transition/test_genesis.py::test_genesis_default_configuration[fork_Devnet][fork_Devnet-state_transition_test]": {
         "network": "Devnet",
+        "leanEnv": "test",
         "pre": {
             "config": {
                 "genesisTime": 0
@@ -30,19 +31,19 @@
             "validators": {
                 "data": [
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x8fa00001b5b22a073d21cb60c9465b379f80e74fee9baf1d137eb651ed162900a6f3ec32da74ff09265ea62fc9a5055b2e9b7c7b",
                         "index": 0
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0xbc56037ab0485c00441e3205d908e55a016d5450a335144f50ccb034cb253c05a1cbc047b5695a5672697d584656e96a4b94f173",
                         "index": 1
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x79422d64ecdc3b0bf7c6cc31bbfb9f4eab7950107fe23c6f4f9c94465c81f80d85a1931f1003c50531147f350357805f22fdd70b",
                         "index": 2
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x575bb17b0f673d76689c9527a21fac68eb5ebd571703a245deb2a8384baea4747be00d5b469ff30f830e234f74453f6e2c20cb26",
                         "index": 3
                     }
                 ]
@@ -82,7 +83,7 @@
             }
         },
         "_info": {
-            "hash": "0x256e9217484ebc59567ca40c327c7d11c7216964c1ecd69987e81d37e8844028",
+            "hash": "0xdaef5b4f74195028f564a2f9d827ed277fff97c5127c208440b06640008b522e",
             "comment": "`leanSpec` generated test",
             "testId": "tests/consensus/devnet/state_transition/test_genesis.py::test_genesis_default_configuration[fork_Devnet]",
             "description": "Test genesis state with default configuration.\n\n    Scenario\n    --------\n    Generate a genesis state with default parameters:\n    - genesis_time = 0\n    - 4 validators with zero pubkeys",

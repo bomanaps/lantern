@@ -1,6 +1,7 @@
 {
-    "tests/consensus/devnet/state_transition/test_block_processing.py::test_process_first_block_after_genesis[fork_Devnet][fork_devnet-state_transition_test]": {
+    "tests/consensus/devnet/state_transition/test_block_processing.py::test_process_first_block_after_genesis[fork_Devnet][fork_Devnet-state_transition_test]": {
         "network": "Devnet",
+        "leanEnv": "test",
         "pre": {
             "config": {
                 "genesisTime": 0
@@ -30,19 +31,19 @@
             "validators": {
                 "data": [
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x8fa00001b5b22a073d21cb60c9465b379f80e74fee9baf1d137eb651ed162900a6f3ec32da74ff09265ea62fc9a5055b2e9b7c7b",
                         "index": 0
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0xbc56037ab0485c00441e3205d908e55a016d5450a335144f50ccb034cb253c05a1cbc047b5695a5672697d584656e96a4b94f173",
                         "index": 1
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x79422d64ecdc3b0bf7c6cc31bbfb9f4eab7950107fe23c6f4f9c94465c81f80d85a1931f1003c50531147f350357805f22fdd70b",
                         "index": 2
                     },
                     {
-                        "pubkey": "0x00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+                        "pubkey": "0x575bb17b0f673d76689c9527a21fac68eb5ebd571703a245deb2a8384baea4747be00d5b469ff30f830e234f74453f6e2c20cb26",
                         "index": 3
                     }
                 ]
@@ -58,8 +59,8 @@
             {
                 "slot": 1,
                 "proposerIndex": 1,
-                "parentRoot": "0xe3c1f53019f7fac3d402915e5171449ab0f9aa9aa89857e87dcdcc16983781b4",
-                "stateRoot": "0xfd96931fa716488eefacfc4e4dbb0d0543700084f1724a2244eccab0773639a0",
+                "parentRoot": "0xee3755ec636c6cabd4fbec9791efd12fb38fbad6989e09258a286dcdfa84ca0f",
+                "stateRoot": "0x4c0f2177a7a2e2870324c8fa58d50b51d998c7b8cb58f364eacecc473e0228b0",
                 "body": {
                     "attestations": {
                         "data": []
@@ -74,7 +75,7 @@
             "historicalBlockHashesCount": 1
         },
         "_info": {
-            "hash": "0x5342b4241bcd52b88c06155a36b52cc1218fb475cb2f674af1ca55bb87af9fbe",
+            "hash": "0x465bcc1f3e7d601b89c0edfde8b9f885e40931cd619af869aa6ecb166f6cb317",
             "comment": "`leanSpec` generated test",
             "testId": "tests/consensus/devnet/state_transition/test_block_processing.py::test_process_first_block_after_genesis[fork_Devnet]",
             "description": "Test processing the first block after genesis.\n\n    Scenario\n    --------\n    Process a single block at slot 1 immediately after genesis.\n\n    Expected Behavior\n    -----------------\n    1. State advances from slot 0 to slot 1\n    2. Block header is validated and processed\n    3. Latest block header updated to new block\n    4. Historical roots updated with genesis\n    5. Post-state at slot 1\n\n    This is the foundation for all subsequent blocks.",

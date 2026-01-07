@@ -286,6 +286,25 @@ if(LANTERN_BUILD_TESTS)
     # Consensus fixtures iterate over dozens of LeanSpec transitions and need a longer timeout.
     set_tests_properties(lantern_consensus_vectors PROPERTIES TIMEOUT 300)
 
+    add_executable(lantern_verify_signatures_vectors_test
+        tests/integration/test_verify_signatures_vectors.c
+        tests/support/fixture_loader.c
+    )
+    target_link_libraries(lantern_verify_signatures_vectors_test PRIVATE lantern)
+    target_include_directories(
+        lantern_verify_signatures_vectors_test
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/external/jsmn
+    )
+    target_compile_definitions(
+        lantern_verify_signatures_vectors_test
+        PRIVATE
+            LANTERN_TEST_FIXTURE_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures"
+    )
+    add_test(NAME lantern_verify_signatures_vectors COMMAND lantern_verify_signatures_vectors_test)
+    set_tests_properties(lantern_verify_signatures_vectors PROPERTIES TIMEOUT 120 DISABLED TRUE)
+
     add_executable(lantern_genesis_vectors_test
         tests/integration/test_genesis_vectors.c
         tests/integration/consensus_fixture_runner.c

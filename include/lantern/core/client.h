@@ -88,6 +88,17 @@ struct lantern_pending_block_list {
     size_t capacity;
 };
 
+struct lantern_agg_proof_cache_entry {
+    LanternRoot data_root;
+    LanternAggregatedSignatureProof proof;
+};
+
+struct lantern_agg_proof_cache {
+    struct lantern_agg_proof_cache_entry *entries;
+    size_t length;
+    size_t capacity;
+};
+
 struct lantern_validator_duty_state {
     uint64_t last_slot;
     uint32_t last_interval;
@@ -148,6 +159,7 @@ struct lantern_client {
     bool has_fork_choice;
     LanternState state;
     bool has_state;
+    struct lantern_agg_proof_cache agg_proof_cache;
     pthread_mutex_t state_lock;
     bool state_lock_initialized;
     bool *validator_enabled;
