@@ -1,7 +1,11 @@
 # Git metadata and build outputs
+.git
 build
 cmake-build*
 lean-quickstart-logs
+target
+**/target
+**/target/
 
 # Editor/project artifacts
 .vscode
@@ -18,3 +22,7 @@ __pycache__/
 # Large devnet fixtures not required for docker build
 tools/lean-quickstart/local-devnet/clients/
 tools/lean-quickstart/deserialization_dumps/
+external-clients/qlean-mini/example/1-network/genesis/
+
+# Local docs/artifacts not needed in container build context
+internal-docs/

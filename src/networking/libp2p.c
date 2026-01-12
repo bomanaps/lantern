@@ -289,7 +289,7 @@ int lantern_libp2p_host_start(struct lantern_libp2p_host *state, const struct la
         }
     }
     if (rc == 0) {
-        b_rc = libp2p_host_builder_multistream(builder, 5000, true);
+        b_rc = libp2p_host_builder_multistream(builder, 15000, true);
         if (b_rc != 0) {
             lantern_log_error(
                 "network",
