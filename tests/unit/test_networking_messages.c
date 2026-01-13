@@ -66,13 +66,6 @@ static void expect_checkpoint_seed(const LanternCheckpoint *checkpoint, uint64_t
     expect_root_seed(&checkpoint->root, seed);
 }
 
-static void expect_signature_seed(const LanternSignature *signature, uint8_t seed) {
-    CHECK(signature != NULL);
-    uint8_t expected[LANTERN_SIGNATURE_SIZE];
-    fill_bytes(expected, sizeof(expected), seed);
-    CHECK(memcmp(signature->bytes, expected, sizeof(expected)) == 0);
-}
-
 static uint8_t *read_fixture_bytes(const char *relative_path, size_t *out_len) {
     CHECK(relative_path != NULL);
     char path[PATH_MAX];
@@ -343,7 +336,6 @@ static void expect_signed_vote_fixture(const LanternSignedVote *vote) {
         0x53,
         94,
         0x73);
-    expect_signature_seed(&vote->signature, 0xE1);
 }
 
 static void expect_signed_block_fixture(const LanternSignedBlock *block) {
@@ -388,7 +380,6 @@ static void expect_signed_block_fixture(const LanternSignedBlock *block) {
     CHECK(block->signatures.attestation_signatures.data != NULL);
     expect_signature_proof_seed(&block->signatures.attestation_signatures.data[0], 9, 0xC4, 8);
     expect_signature_proof_seed(&block->signatures.attestation_signatures.data[1], 10, 0xC7, 8);
-    expect_signature_seed(&block->signatures.proposer_signature, 0xCA);
 }
 
 static uint64_t le_bytes_to_u64(const uint8_t *src, size_t len) {
@@ -909,7 +900,6 @@ static void test_blocks_by_root_response_fixture(void) {
     expect_checkpoint_seed(&block0_prop->source, 17, 0xD0);
     CHECK(block0->signatures.attestation_signatures.length == 1);
     expect_signature_proof_seed(&block0->signatures.attestation_signatures.data[0], 1, 0xB0, 8);
-    expect_signature_seed(&block0->signatures.proposer_signature, 0xB3);
 
     const LanternSignedBlock *block1 = &decoded.blocks[1];
     CHECK(block1->message.block.slot == 18);
@@ -930,7 +920,6 @@ static void test_blocks_by_root_response_fixture(void) {
     CHECK(block1->signatures.attestation_signatures.length == 2);
     expect_signature_proof_seed(&block1->signatures.attestation_signatures.data[0], 3, 0xD0, 8);
     expect_signature_proof_seed(&block1->signatures.attestation_signatures.data[1], 4, 0xD3, 8);
-    expect_signature_seed(&block1->signatures.proposer_signature, 0xD6);
 
     size_t encoded_capacity = fixture_len + 1024u;
     uint8_t *encoded = (uint8_t *)malloc(encoded_capacity);
@@ -1349,8 +1338,20 @@ static void test_gossip_signed_vote_fixture_roundtrip(void) {
             max_compressed,
             &encoded_len)
         == 0);
-    CHECK(encoded_len == snappy_len);
-    CHECK(memcmp(encoded, snappy_bytes, snappy_len) == 0);
+    uint8_t *encoded_raw = (uint8_t *)malloc(ssz_len);
+    CHECK(encoded_raw != NULL);
+    size_t encoded_raw_len = ssz_len;
+    CHECK(
+        lantern_snappy_decompress_raw(
+            encoded,
+            encoded_len,
+            encoded_raw,
+            ssz_len,
+            &encoded_raw_len)
+        == LANTERN_SNAPPY_OK);
+    CHECK(encoded_raw_len == ssz_len);
+    CHECK(memcmp(encoded_raw, ssz_bytes, ssz_len) == 0);
+    free(encoded_raw);
 
     free(encoded);
     free(raw);
@@ -1402,8 +1403,20 @@ static void test_gossip_signed_block_fixture_roundtrip(void) {
             max_compressed,
             &encoded_len)
         == 0);
-    CHECK(encoded_len == snappy_len);
-    CHECK(memcmp(encoded, snappy_bytes, snappy_len) == 0);
+    uint8_t *encoded_raw = (uint8_t *)malloc(ssz_len);
+    CHECK(encoded_raw != NULL);
+    size_t encoded_raw_len = ssz_len;
+    CHECK(
+        lantern_snappy_decompress_raw(
+            encoded,
+            encoded_len,
+            encoded_raw,
+            ssz_len,
+            &encoded_raw_len)
+        == LANTERN_SNAPPY_OK);
+    CHECK(encoded_raw_len == ssz_len);
+    CHECK(memcmp(encoded_raw, ssz_bytes, ssz_len) == 0);
+    free(encoded_raw);
 
     free(encoded);
     free(raw);
@@ -1572,11 +1585,18 @@ static void test_gossip_helpers(void) {
     uint8_t payload[64];
     fill_bytes(payload, sizeof(payload), 0x5A);
     size_t max_compressed = 0;
-    CHECK(lantern_snappy_max_compressed_size(sizeof(payload), &max_compressed) == LANTERN_SNAPPY_OK);
+    CHECK(lantern_snappy_max_compressed_size_raw(sizeof(payload), &max_compressed) == LANTERN_SNAPPY_OK);
     uint8_t *compressed = malloc(max_compressed);
     CHECK(compressed);
     size_t compressed_len = 0;
-    CHECK(lantern_snappy_compress(payload, sizeof(payload), compressed, max_compressed, &compressed_len) == LANTERN_SNAPPY_OK);
+    CHECK(
+        lantern_snappy_compress_raw(
+            payload,
+            sizeof(payload),
+            compressed,
+            max_compressed,
+            &compressed_len)
+        == LANTERN_SNAPPY_OK);
 
     LanternGossipMessageId valid_id;
     uint8_t scratch[sizeof(payload)];

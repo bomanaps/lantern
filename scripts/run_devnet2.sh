@@ -41,9 +41,6 @@ Environment overrides (start):
   DOCKER_BUILD_ARGS  Extra args passed to docker build (optional)
   DOCKER_LISTEN_IP   Listen IP for docker nodes (default: 127.0.0.1 for host, 0.0.0.0 otherwise)
   ENABLE_COREDUMP    1 to enable core dumps for crashes (default: 0)
-  LANTERN_QUIC_SOCKET_BUFFER QUIC socket buffer size in bytes (default: 4194304)
-  LANTERN_SYSCTL_TUNE 1 to tune host net.core rmem/wmem via privileged container when using docker (default: 1)
-  LANTERN_SYSCTL_IMAGE Docker image used for sysctl tuning (default: alpine:3.19)
 
 Example:
   scripts/run_devnet2.sh start 4 /tmp/lantern-devnet2/genesis binary
@@ -129,17 +126,6 @@ DOCKER_LISTEN_IP=${DOCKER_LISTEN_IP:-}
 LANTERN_DEBUG_FINALIZATION=${LANTERN_DEBUG_FINALIZATION:-}
 LANTERN_DEBUG_STATE_HASH=${LANTERN_DEBUG_STATE_HASH:-}
 ENABLE_COREDUMP=${ENABLE_COREDUMP:-0}
-LANTERN_QUIC_SOCKET_BUFFER=${LANTERN_QUIC_SOCKET_BUFFER:-}
-LANTERN_SYSCTL_TUNE=${LANTERN_SYSCTL_TUNE:-1}
-LANTERN_SYSCTL_IMAGE=${LANTERN_SYSCTL_IMAGE:-alpine:3.19}
-
-QUIC_SOCKET_BUFFER=${LANTERN_QUIC_SOCKET_BUFFER:-4194304}
-if [[ -n "${LANTERN_QUIC_SOCKET_BUFFER}" ]]; then
-  if ! [[ "${QUIC_SOCKET_BUFFER}" =~ ^[0-9]+$ ]] || (( QUIC_SOCKET_BUFFER < 16384 )); then
-    echo "warning: invalid LANTERN_QUIC_SOCKET_BUFFER='${LANTERN_QUIC_SOCKET_BUFFER}', using 4194304" >&2
-    QUIC_SOCKET_BUFFER=4194304
-  fi
-fi
 
 if [[ -z "${DOCKER_LISTEN_IP}" ]]; then
   if [[ "${DOCKER_NETWORK}" == "host" ]]; then
@@ -166,24 +152,6 @@ read_meta_runtime() {
   return 1
 }
 
-tune_udp_sysctls() {
-  local value=$1
-  if [[ "${RUNTIME}" != "docker" ]]; then
-    return 0
-  fi
-  if [[ "${LANTERN_SYSCTL_TUNE}" != "1" ]]; then
-    return 0
-  fi
-  if ! command -v docker >/dev/null 2>&1; then
-    return 0
-  fi
-  echo "tuning host UDP buffer sysctls to ${value} bytes..." >&2
-  if ! docker run --rm --privileged --net=host "${LANTERN_SYSCTL_IMAGE}" \
-    sh -c "sysctl -w net.core.rmem_max=${value} net.core.wmem_max=${value} net.core.rmem_default=${value} net.core.wmem_default=${value}" \
-    >/dev/null 2>&1; then
-    echo "warning: failed to tune net.core rmem/wmem sysctls (QUIC may still drop packets)." >&2
-  fi
-}
 
 if [[ "${MODE}" == "stop" ]]; then
   meta_runtime="$(read_meta_runtime || true)"
@@ -510,8 +478,6 @@ if [[ -f "${PIDS_FILE}" ]]; then
   done < "${PIDS_FILE}"
 fi
 
-tune_udp_sysctls "${QUIC_SOCKET_BUFFER}"
-
 if [[ "${CLEAN_RUN_DIR}" == "1" && -d "${RUN_DIR}" ]]; then
   rm -rf "${RUN_DIR}/data" "${RUN_DIR}/logs" "${RUN_DIR}/pids" "${RUN_DIR}/meta"
 fi
@@ -568,7 +534,6 @@ for i in $(seq 0 $((NODES-1))); do
       -e "LANTERN_CONFIG_DIR=/genesis"
       -e "LANTERN_NODE_ID=${NODE_ID}"
       -e "LANTERN_DEVNET=${DEVNET}"
-      -e "LANTERN_QUIC_SOCKET_BUFFER=${QUIC_SOCKET_BUFFER}"
       -e "LANTERN_LISTEN_ADDRESS=/ip4/${DOCKER_LISTEN_IP}/udp/${PORT}/quic-v1"
       -e "LANTERN_HTTP_PORT=${HTTP}"
       -e "LANTERN_METRICS_PORT=${METRICS}"

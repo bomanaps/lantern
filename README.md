@@ -42,7 +42,7 @@ Consensus fixtures:
 Networking fixtures:
 
 ```sh
-PYTHONPATH=tools/leanSpec/src python3 tools/fixtures/generate_networking_ssz.py
+uv run --directory tools/leanSpec python ../../tools/fixtures/generate_networking_ssz.py
 ```
 
 ## License

@@ -678,6 +678,10 @@ int lantern_snappy_uncompressed_length_raw(const uint8_t *input, size_t input_le
     {
         return LANTERN_SNAPPY_ERROR_INVALID_INPUT;
     }
+    if (lantern_snappy_is_framed(input, input_len))
+    {
+        return LANTERN_SNAPPY_ERROR_INVALID_INPUT;
+    }
 
     size_t raw_length = 0;
     if (!snappy_uncompressed_length((const char *)input, input_len, &raw_length))
