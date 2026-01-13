@@ -36,14 +36,13 @@ Test fixtures are generated from LeanSpec. Use these scripts to refresh them.
 Consensus fixtures:
 
 ```sh
-./scripts/fixtures/fill_consensus_fixtures.sh
+./tools/fixtures/fill_consensus_fixtures.sh
 ```
 
 Networking fixtures:
 
 ```sh
-cmake --build build --target lantern_generate_gossip_snappy
-PYTHONPATH=tools/leanSpec/src python3 scripts/fixtures/generate_networking_ssz.py
+PYTHONPATH=tools/leanSpec/src python3 tools/fixtures/generate_networking_ssz.py
 ```
 
 ## License

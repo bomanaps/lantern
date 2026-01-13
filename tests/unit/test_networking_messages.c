@@ -1093,6 +1093,217 @@ static void test_status_reqresp_snappy_fixture(void) {
     free(fixture);
 }
 
+static uint8_t *build_reqresp_frame(
+    uint8_t response_code,
+    const uint8_t *payload,
+    size_t payload_len,
+    size_t raw_len,
+    size_t *out_len) {
+    uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
+    size_t header_len = 0;
+    CHECK(unsigned_varint_encode(raw_len, header, sizeof(header), &header_len) == UNSIGNED_VARINT_OK);
+
+    size_t frame_len = 1u + header_len + payload_len;
+    uint8_t *frame = (uint8_t *)malloc(frame_len);
+    CHECK(frame != NULL);
+    frame[0] = response_code;
+    memcpy(frame + 1u, header, header_len);
+    if (payload_len > 0) {
+        memcpy(frame + 1u + header_len, payload, payload_len);
+    }
+    if (out_len) {
+        *out_len = frame_len;
+    }
+    return frame;
+}
+
+static void test_reqresp_response_code_mapping(void) {
+    size_t fixture_len = 0;
+    uint8_t *fixture = read_fixture_bytes("networking/status_leanspec.snappy", &fixture_len);
+    CHECK(fixture_len > 0);
+
+    size_t raw_len = 0;
+    CHECK(lantern_snappy_uncompressed_length(fixture, fixture_len, &raw_len) == LANTERN_SNAPPY_OK);
+
+    struct {
+        uint8_t wire_code;
+        uint8_t expected_code;
+    } cases[] = {
+        {LANTERN_REQRESP_RESPONSE_RESOURCE_UNAVAILABLE, LANTERN_REQRESP_RESPONSE_RESOURCE_UNAVAILABLE},
+        {4u, LANTERN_REQRESP_RESPONSE_SERVER_ERROR},
+        {127u, LANTERN_REQRESP_RESPONSE_SERVER_ERROR},
+        {128u, LANTERN_REQRESP_RESPONSE_INVALID_REQUEST},
+        {200u, LANTERN_REQRESP_RESPONSE_INVALID_REQUEST},
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        size_t frame_len = 0;
+        uint8_t *frame = build_reqresp_frame(
+            cases[i].wire_code,
+            fixture,
+            fixture_len,
+            raw_len,
+            &frame_len);
+
+        struct mock_stream_ctx *ctx = (struct mock_stream_ctx *)malloc(sizeof(*ctx));
+        CHECK(ctx != NULL);
+        ctx->data = frame;
+        ctx->length = frame_len;
+        ctx->position = 0;
+
+        libp2p_stream_backend_ops_t ops = {
+            .read = mock_stream_read,
+            .write = mock_stream_write,
+            .close = mock_stream_close,
+            .reset = mock_stream_reset,
+            .set_deadline = mock_stream_set_deadline,
+            .free_ctx = mock_stream_free_ctx,
+        };
+        libp2p_stream_t *stream = libp2p_stream_from_ops(NULL, ctx, &ops, LANTERN_STATUS_PROTOCOL_ID, 0, NULL);
+        CHECK(stream != NULL);
+
+        uint8_t *response = NULL;
+        size_t response_len = 0;
+        ssize_t read_err = 0;
+        uint8_t response_code = 0;
+        check_zero(
+            lantern_reqresp_read_response_chunk(
+                NULL,
+                stream,
+                LANTERN_REQRESP_PROTOCOL_STATUS,
+                &response,
+                &response_len,
+                &read_err,
+                &response_code,
+                NULL),
+            "reqresp read response (mapping)");
+        CHECK(response_code == cases[i].expected_code);
+        CHECK(response_len == fixture_len);
+        CHECK(memcmp(response, fixture, fixture_len) == 0);
+
+        free(response);
+        libp2p_stream_free(stream);
+    }
+
+    free(fixture);
+}
+
+static void test_blocks_by_root_per_chunk_framing(void) {
+    const uint8_t raw_one[] = {0x01, 0x02, 0x03, 0x04};
+    const uint8_t raw_two[] = {0x10, 0x20, 0x30, 0x40, 0x50};
+
+    size_t max_one = 0;
+    CHECK(lantern_snappy_max_compressed_size(sizeof(raw_one), &max_one) == LANTERN_SNAPPY_OK);
+    uint8_t *snappy_one = (uint8_t *)malloc(max_one);
+    CHECK(snappy_one != NULL);
+    size_t snappy_one_len = 0;
+    CHECK(
+        lantern_snappy_compress(
+            raw_one,
+            sizeof(raw_one),
+            snappy_one,
+            max_one,
+            &snappy_one_len)
+        == LANTERN_SNAPPY_OK);
+
+    size_t max_two = 0;
+    CHECK(lantern_snappy_max_compressed_size(sizeof(raw_two), &max_two) == LANTERN_SNAPPY_OK);
+    uint8_t *snappy_two = (uint8_t *)malloc(max_two);
+    CHECK(snappy_two != NULL);
+    size_t snappy_two_len = 0;
+    CHECK(
+        lantern_snappy_compress(
+            raw_two,
+            sizeof(raw_two),
+            snappy_two,
+            max_two,
+            &snappy_two_len)
+        == LANTERN_SNAPPY_OK);
+
+    size_t frame_one_len = 0;
+    uint8_t *frame_one = build_reqresp_frame(
+        LANTERN_REQRESP_RESPONSE_SUCCESS,
+        snappy_one,
+        snappy_one_len,
+        sizeof(raw_one),
+        &frame_one_len);
+    size_t frame_two_len = 0;
+    uint8_t *frame_two = build_reqresp_frame(
+        LANTERN_REQRESP_RESPONSE_SUCCESS,
+        snappy_two,
+        snappy_two_len,
+        sizeof(raw_two),
+        &frame_two_len);
+
+    size_t stream_len = frame_one_len + frame_two_len;
+    uint8_t *stream_bytes = (uint8_t *)malloc(stream_len);
+    CHECK(stream_bytes != NULL);
+    memcpy(stream_bytes, frame_one, frame_one_len);
+    memcpy(stream_bytes + frame_one_len, frame_two, frame_two_len);
+    free(frame_one);
+    free(frame_two);
+
+    struct mock_stream_ctx *ctx = (struct mock_stream_ctx *)malloc(sizeof(*ctx));
+    CHECK(ctx != NULL);
+    ctx->data = stream_bytes;
+    ctx->length = stream_len;
+    ctx->position = 0;
+
+    libp2p_stream_backend_ops_t ops = {
+        .read = mock_stream_read,
+        .write = mock_stream_write,
+        .close = mock_stream_close,
+        .reset = mock_stream_reset,
+        .set_deadline = mock_stream_set_deadline,
+        .free_ctx = mock_stream_free_ctx,
+    };
+    libp2p_stream_t *stream = libp2p_stream_from_ops(NULL, ctx, &ops, LANTERN_BLOCKS_BY_ROOT_PROTOCOL_ID, 0, NULL);
+    CHECK(stream != NULL);
+
+    uint8_t *response = NULL;
+    size_t response_len = 0;
+    ssize_t read_err = 0;
+    uint8_t response_code = 0;
+    check_zero(
+        lantern_reqresp_read_response_chunk(
+            NULL,
+            stream,
+            LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT,
+            &response,
+            &response_len,
+            &read_err,
+            &response_code,
+            NULL),
+        "reqresp read blocks_by_root chunk 1");
+    CHECK(response_code == LANTERN_REQRESP_RESPONSE_SUCCESS);
+    CHECK(response_len == snappy_one_len);
+    CHECK(memcmp(response, snappy_one, snappy_one_len) == 0);
+    free(response);
+
+    response = NULL;
+    response_len = 0;
+    response_code = 0;
+    check_zero(
+        lantern_reqresp_read_response_chunk(
+            NULL,
+            stream,
+            LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT,
+            &response,
+            &response_len,
+            &read_err,
+            &response_code,
+            NULL),
+        "reqresp read blocks_by_root chunk 2");
+    CHECK(response_code == LANTERN_REQRESP_RESPONSE_SUCCESS);
+    CHECK(response_len == snappy_two_len);
+    CHECK(memcmp(response, snappy_two, snappy_two_len) == 0);
+    free(response);
+
+    libp2p_stream_free(stream);
+    free(snappy_one);
+    free(snappy_two);
+}
+
 static void test_gossip_signed_vote_fixture_roundtrip(void) {
     size_t ssz_len = 0;
     uint8_t *ssz_bytes = read_fixture_bytes("networking/gossip_signed_vote_leanspec.ssz", &ssz_len);
@@ -1664,6 +1875,8 @@ int main(void) {
     test_status_decode_rejects_truncated_payloads();
     test_status_snappy_rejects_truncated_frames();
     test_status_reqresp_snappy_fixture();
+    test_reqresp_response_code_mapping();
+    test_blocks_by_root_per_chunk_framing();
     test_gossip_signed_vote_fixture_roundtrip();
     test_gossip_signed_block_fixture_roundtrip();
     test_blocks_by_root_request();

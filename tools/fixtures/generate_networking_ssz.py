@@ -10,12 +10,10 @@ variable-length offsets in parent containers.
 
 from __future__ import annotations
 
-import subprocess
-import os
-import shutil
 from pathlib import Path
 from typing import Sequence
 
+from lean_spec.snappy import compress as raw_snappy_compress
 from lean_spec.types import Boolean, Bytes32, Uint64
 from lean_spec.types.byte_arrays import BaseByteList, ByteListMiB
 from lean_spec.types.bitfields import BaseBitlist
@@ -338,70 +336,9 @@ def describe_fixture(name: str, values: Sequence[str]) -> None:
     print(f"wrote {name}: {summary}")
 
 
-GOSSIP_SNAPPY_ENV = "LANTERN_GOSSIP_SNAPPY"
-GOSSIP_BUILD_SUBDIR = "gossip_snappy"
-
-
-def _maybe_build_gossip_tool(repo_root: Path, build_dir: Path, target_name: str) -> None:
-    cmake = shutil.which("cmake")
-    if not cmake:
-        raise FileNotFoundError("cmake is required to build lantern_generate_gossip_snappy")
-    cache = build_dir / "CMakeCache.txt"
-    cmake_cmd = [cmake, "-S", str(repo_root), "-B", str(build_dir)]
-    generator = os.environ.get("CMAKE_GENERATOR")
-    if generator:
-        cmake_cmd.extend(["-G", generator])
-    if not cache.exists():
-        build_dir.mkdir(parents=True, exist_ok=True)
-        subprocess.run(cmake_cmd, check=True)
-    subprocess.run([cmake, "--build", str(build_dir), "--target", target_name], check=True)
-
-
-def _resolve_gossip_tool(repo_root: Path) -> Path:
-    env_path = os.environ.get(GOSSIP_SNAPPY_ENV)
-    candidates: list[Path] = []
-    if env_path:
-        candidates.append(Path(env_path))
-    build_dir = repo_root / "build"
-    alt_build_dir = build_dir / GOSSIP_BUILD_SUBDIR
-    candidates.extend(
-        [
-            build_dir / "lantern_generate_gossip_snappy",
-            build_dir / "lantern_generate_gossip_snappy.exe",
-            alt_build_dir / "lantern_generate_gossip_snappy",
-            alt_build_dir / "lantern_generate_gossip_snappy.exe",
-        ]
-    )
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    _maybe_build_gossip_tool(repo_root, alt_build_dir, "lantern_generate_gossip_snappy")
-
-    for candidate in candidates:
-        if candidate.exists():
-            return candidate
-
-    pretty_candidates = ", ".join(str(path) for path in candidates)
-    raise FileNotFoundError(
-        f"Unable to locate lantern_generate_gossip_snappy. Checked: {pretty_candidates}. "
-        f"Set {GOSSIP_SNAPPY_ENV} to the executable path or let the script build it by ensuring "
-        "CMake is available."
-    )
-
-
-def encode_gossip_fixture(
-    repo_root: Path,
-    kind: str,
-    ssz_path: Path,
-    snappy_path: Path,
-) -> None:
-    tool = _resolve_gossip_tool(repo_root)
-    snappy_path.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [str(tool), kind, str(ssz_path), str(snappy_path)],
-        check=True,
-    )
+def encode_gossip_fixture(ssz_path: Path, snappy_path: Path) -> None:
+    snappy = raw_snappy_compress(ssz_path.read_bytes())
+    write_fixture(snappy_path, snappy)
 
 
 def main() -> None:
@@ -466,10 +403,10 @@ def main() -> None:
         ],
     )
     vote_snappy_path = fixture_dir / "gossip_signed_vote_leanspec.snappy"
-    encode_gossip_fixture(repo_root, "vote", vote_path, vote_snappy_path)
+    encode_gossip_fixture(vote_path, vote_snappy_path)
     describe_fixture(
         "Gossip signed vote Snappy",
-        ["encoder=lantern_generate_gossip_snappy"],
+        ["encoder=lean_spec.snappy"],
     )
 
     block_fixture = make_gossip_signed_block(
@@ -490,10 +427,10 @@ def main() -> None:
         ],
     )
     block_snappy_path = fixture_dir / "gossip_signed_block_leanspec.snappy"
-    encode_gossip_fixture(repo_root, "block", block_path, block_snappy_path)
+    encode_gossip_fixture(block_path, block_snappy_path)
     describe_fixture(
         "Gossip signed block Snappy",
-        ["encoder=lantern_generate_gossip_snappy"],
+        ["encoder=lean_spec.snappy"],
     )
 
 
