@@ -35,6 +35,7 @@ extern "C" {
 #define LANTERN_DEFAULT_HTTP_PORT 5052
 #define LANTERN_DEFAULT_METRICS_PORT 8080
 #define LANTERN_DEFAULT_DEVNET "devnet0"
+#define LANTERN_PENDING_BLOCK_LIMIT 1024u
 
 typedef enum
 {
@@ -46,8 +47,16 @@ typedef enum
     LANTERN_CLIENT_ERR_GENESIS = -5,
     LANTERN_CLIENT_ERR_VALIDATOR = -6,
     LANTERN_CLIENT_ERR_RUNTIME = -7,
-    LANTERN_CLIENT_ERR_NETWORK = -8
+    LANTERN_CLIENT_ERR_NETWORK = -8,
+    LANTERN_CLIENT_ERR_IGNORED = -9
 } lantern_client_error;
+
+typedef enum
+{
+    LANTERN_SYNC_STATE_IDLE = 0,
+    LANTERN_SYNC_STATE_SYNCING = 1,
+    LANTERN_SYNC_STATE_SYNCED = 2
+} LanternSyncState;
 
 struct lantern_client_options {
     const char *data_dir;
@@ -80,12 +89,28 @@ struct lantern_pending_block {
     LanternRoot parent_root;
     char peer_text[128];
     bool parent_requested;
+    uint64_t received_ms;
+    uint32_t backfill_depth;
+};
+
+struct lantern_pending_parent_index_entry {
+    LanternRoot parent_root;
+    LanternRoot *child_roots;
+    size_t length;
+    size_t capacity;
+};
+
+struct lantern_pending_parent_index {
+    struct lantern_pending_parent_index_entry *entries;
+    size_t length;
+    size_t capacity;
 };
 
 struct lantern_pending_block_list {
     struct lantern_pending_block *items;
     size_t length;
     size_t capacity;
+    struct lantern_pending_parent_index parent_index;
 };
 
 struct lantern_agg_proof_cache_entry {
@@ -197,6 +222,7 @@ struct lantern_client {
     uint64_t sync_last_imported_blocks;
     uint64_t sync_imported_blocks;
     uint64_t sync_target_slot;
+    LanternSyncState sync_state;
     bool sync_in_progress;
     size_t status_requests_inflight_total;
     size_t status_requests_peak;

@@ -424,6 +424,26 @@ int reqresp_collect_blocks(
  *
  * @param client        Client instance
  * @param peer_id       Peer ID string
+ * @param request_roots Roots that were requested
+ * @param root_count    Number of requested roots
+ * @param outcome       Request outcome
+ *
+ * @note Thread safety: This function acquires status_lock and pending_lock
+ */
+void lantern_client_on_blocks_request_complete_batch(
+    struct lantern_client *client,
+    const char *peer_id,
+    const LanternRoot *request_roots,
+    size_t root_count,
+    enum lantern_blocks_request_outcome outcome);
+
+/**
+ * Handle completion of a blocks request (single root).
+ *
+ * @spec subspecs/networking/reqresp.py - blocks by root
+ *
+ * @param client        Client instance
+ * @param peer_id       Peer ID string
  * @param request_root  Root that was requested
  * @param outcome       Request outcome
  *
@@ -475,11 +495,36 @@ int lantern_reqresp_read_response_chunk(
  *
  * @spec subspecs/networking/reqresp/message.py - BlocksByRoot protocol
  *
- * @param client        Client instance
- * @param peer_id_text  Peer ID string
- * @param root          Block root to request
+ * @param client         Client instance
+ * @param peer_id_text   Peer ID string
+ * @param roots          Block roots to request
+ * @param depths         Backfill depth per root (may be NULL for zeros)
+ * @param root_count     Number of roots
  * @return 0 on success
- * @return LANTERN_CLIENT_ERR_INVALID_PARAM if any parameter is NULL, the peer ID is invalid, or the root is zero
+ * @return LANTERN_CLIENT_ERR_INVALID_PARAM if parameters are invalid, the peer ID is invalid, or any root is zero
+ * @return LANTERN_CLIENT_ERR_ALLOC if allocation fails
+ * @return LANTERN_CLIENT_ERR_NETWORK if stream dialing fails or networking is unavailable
+ *
+ * @note Thread safety: This function is thread-safe
+ */
+int lantern_client_schedule_blocks_request_batch(
+    struct lantern_client *client,
+    const char *peer_id_text,
+    const LanternRoot *roots,
+    const uint32_t *depths,
+    size_t root_count);
+
+/**
+ * Schedule a single-root blocks_by_root request to a peer.
+ *
+ * @spec subspecs/networking/reqresp/message.py - BlocksByRoot protocol
+ *
+ * @param client         Client instance
+ * @param peer_id_text   Peer ID string
+ * @param root           Block root to request
+ * @param backfill_depth Backfill depth for the requested root
+ * @return 0 on success
+ * @return LANTERN_CLIENT_ERR_INVALID_PARAM if parameters are invalid, the peer ID is invalid, or the root is zero
  * @return LANTERN_CLIENT_ERR_ALLOC if allocation fails
  * @return LANTERN_CLIENT_ERR_NETWORK if stream dialing fails or networking is unavailable
  *
@@ -488,7 +533,8 @@ int lantern_reqresp_read_response_chunk(
 int lantern_client_schedule_blocks_request(
     struct lantern_client *client,
     const char *peer_id_text,
-    const LanternRoot *root);
+    const LanternRoot *root,
+    uint32_t backfill_depth);
 
 
 /**

@@ -230,6 +230,13 @@ void connection_counter_update(
     {
         return;
     }
+
+    if (total == 0 && client->status_lock_initialized
+        && pthread_mutex_lock(&client->status_lock) == 0)
+    {
+        client->sync_state = LANTERN_SYNC_STATE_IDLE;
+        pthread_mutex_unlock(&client->status_lock);
+    }
     lantern_log_trace(
         "network",
         &(const struct lantern_log_metadata){
@@ -1074,6 +1081,41 @@ static void ping_on_stream_open(libp2p_stream_t *s, void *user_data, int err)
     free(ctx);
 }
 
+static bool peer_status_needs_refresh(
+    struct lantern_client *client,
+    const char *peer_id,
+    uint64_t now_ms)
+{
+    if (!client || !peer_id || peer_id[0] == '\0')
+    {
+        return false;
+    }
+    if (!client->status_lock_initialized)
+    {
+        return true;
+    }
+    if (pthread_mutex_lock(&client->status_lock) != 0)
+    {
+        return true;
+    }
+    struct lantern_peer_status_entry *entry =
+        lantern_client_find_status_entry_locked(client, peer_id);
+    bool needs_refresh = true;
+    if (entry)
+    {
+        if (entry->status_request_inflight)
+        {
+            needs_refresh = false;
+        }
+        else if (entry->has_status && entry->last_status_ms != 0 && now_ms >= entry->last_status_ms)
+        {
+            needs_refresh = (now_ms - entry->last_status_ms) > LANTERN_PEER_STATUS_STALE_MS;
+        }
+    }
+    pthread_mutex_unlock(&client->status_lock);
+    return needs_refresh;
+}
+
 
 /**
  * Ping all connected peers.
@@ -1104,6 +1146,7 @@ static void ping_all_peers(struct lantern_client *client)
     }
     pthread_mutex_unlock(&client->connection_lock);
 
+    uint64_t now_ms = monotonic_millis();
     for (size_t i = 0; i < peers.len; i++)
     {
         const char *peer_str = peers.items[i];
@@ -1115,6 +1158,10 @@ static void ping_all_peers(struct lantern_client *client)
         if (peer_id_create_from_string(peer_str, &peer) != 0)
         {
             continue;
+        }
+        if (peer_status_needs_refresh(client, peer_str, now_ms))
+        {
+            request_status_now(client, &peer, peer_str);
         }
         struct ping_dial_ctx *ctx = (struct ping_dial_ctx *)calloc(1, sizeof(*ctx));
         if (!ctx)

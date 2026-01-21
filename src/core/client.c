@@ -559,6 +559,7 @@ static void client_reset_base(struct lantern_client *client)
     client->ping_stop_flag = 1;
     pending_block_list_init(&client->pending_blocks);
     client->pending_lock_initialized = false;
+    client->sync_state = LANTERN_SYNC_STATE_IDLE;
 }
 
 

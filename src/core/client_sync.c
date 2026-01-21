@@ -170,6 +170,16 @@ static const char *peer_id_to_text(const peer_id_t *from, char *out, size_t out_
 }
 
 
+static bool client_accepts_gossip(const struct lantern_client *client)
+{
+    if (!client)
+    {
+        return false;
+    }
+    return client->sync_state != LANTERN_SYNC_STATE_IDLE;
+}
+
+
 /**
  * Handle a block received via gossip.
  *
@@ -184,6 +194,7 @@ static const char *peer_id_to_text(const peer_id_t *from, char *out, size_t out_
  * @param context  Client instance
  * @return 0 on success
  * @return LANTERN_CLIENT_ERR_INVALID_PARAM if block or context is NULL
+ * @return LANTERN_CLIENT_ERR_IGNORED if gossip is ignored due to IDLE sync state
  *
  * @note Thread safety: This function is thread-safe
  */
@@ -201,7 +212,19 @@ int gossip_block_handler(
     char peer_text[PEER_TEXT_BUFFER_LEN];
     const char *peer_id_text = peer_id_to_text(from, peer_text, sizeof(peer_text));
 
-    lantern_client_record_block(client, block, NULL, peer_id_text, "gossip", false);
+    if (!client_accepts_gossip(client))
+    {
+        lantern_log_debug(
+            "gossip",
+            &(const struct lantern_log_metadata){
+                .validator = client->node_id,
+                .peer = peer_id_text && *peer_id_text ? peer_id_text : NULL,
+            },
+            "ignored block gossip in IDLE sync state");
+        return LANTERN_CLIENT_ERR_IGNORED;
+    }
+
+    lantern_client_record_block(client, block, NULL, peer_id_text, "gossip", 0, false);
     return LANTERN_CLIENT_OK;
 }
 
@@ -220,6 +243,7 @@ int gossip_block_handler(
  * @param context  Client instance
  * @return 0 on success
  * @return LANTERN_CLIENT_ERR_INVALID_PARAM if vote or context is NULL
+ * @return LANTERN_CLIENT_ERR_IGNORED if gossip is ignored due to IDLE sync state
  *
  * @note Thread safety: This function is thread-safe
  */
@@ -236,6 +260,18 @@ int gossip_vote_handler(
 
     char peer_text[PEER_TEXT_BUFFER_LEN];
     const char *peer_id_text = peer_id_to_text(from, peer_text, sizeof(peer_text));
+
+    if (!client_accepts_gossip(client))
+    {
+        lantern_log_debug(
+            "gossip",
+            &(const struct lantern_log_metadata){
+                .validator = client->node_id,
+                .peer = peer_id_text && *peer_id_text ? peer_id_text : NULL,
+            },
+            "ignored vote gossip in IDLE sync state");
+        return LANTERN_CLIENT_ERR_IGNORED;
+    }
 
     lantern_client_note_vote_delivery(client, peer_id_text, vote);
     lantern_client_record_vote(client, vote, peer_id_text);
@@ -1002,9 +1038,9 @@ void lantern_client_pending_remove_by_root(struct lantern_client *client, const 
  * @spec subspecs/forkchoice/store.py - Orphan block handling
  *
  * Queues a block whose parent is not yet known. The block will be
- * imported once its parent arrives via gossip. Does NOT immediately
- * request the parent via reqresp - relies on gossip for normal block
- * propagation.
+ * imported once its parent arrives. When the client is syncing or
+ * synced, it requests the missing parent via reqresp. In IDLE, it
+ * relies on gossip for normal block propagation.
  *
  * @param client       Client instance
  * @param block        Block to enqueue
@@ -1014,17 +1050,249 @@ void lantern_client_pending_remove_by_root(struct lantern_client *client, const 
  *
  * @note Thread safety: Acquires pending_lock
  */
-static bool try_schedule_blocks_request(
+static bool try_schedule_blocks_request_batch(
     struct lantern_client *client,
     const char *peer_text,
-    const LanternRoot *root,
+    const LanternRoot *roots,
+    const uint32_t *depths,
+    size_t root_count,
     bool ignore_backoff)
 {
-    if (!client || !peer_text || !peer_text[0] || !root || lantern_root_is_zero(root))
+    if (!client || !roots || root_count == 0)
+    {
+        return false;
+    }
+    if (root_count > LANTERN_MAX_BLOCKS_PER_REQUEST)
     {
         return false;
     }
     if (client->debug_disable_block_requests)
+    {
+        return false;
+    }
+
+    for (size_t i = 0; i < root_count; ++i)
+    {
+        if (lantern_root_is_zero(&roots[i]))
+        {
+            return false;
+        }
+        if (depths && depths[i] > LANTERN_MAX_BACKFILL_DEPTH)
+        {
+            return false;
+        }
+    }
+
+    if (pthread_mutex_lock(&client->status_lock) != 0)
+    {
+        return false;
+    }
+
+    uint64_t now_ms = monotonic_millis();
+    struct lantern_peer_status_entry *entry = NULL;
+    const size_t peer_cap = sizeof(((struct lantern_peer_status_entry *)0)->peer_id);
+    char selected_peer[PEER_TEXT_BUFFER_LEN];
+    selected_peer[0] = '\0';
+
+    if (peer_text && peer_text[0])
+    {
+        entry = lantern_client_ensure_status_entry_locked(client, peer_text);
+        if (entry)
+        {
+            if (!lantern_client_is_peer_connected(client, peer_text))
+            {
+                entry = NULL;
+            }
+            else
+            {
+                bool ready =
+                    entry->blocks_requests_inflight < LANTERN_MAX_BLOCKS_REQUESTS_PER_PEER;
+                if (ready && !ignore_backoff)
+                {
+                    uint64_t backoff_ms = blocks_request_backoff_ms(
+                        entry->consecutive_blocks_failures);
+                    if (entry->consecutive_blocks_failures == 0
+                        && backoff_ms < LANTERN_BLOCKS_REQUEST_MIN_POLL_MS)
+                    {
+                        backoff_ms = LANTERN_BLOCKS_REQUEST_MIN_POLL_MS;
+                    }
+                    if (entry->last_blocks_request_ms != 0
+                        && now_ms < entry->last_blocks_request_ms + backoff_ms)
+                    {
+                        ready = false;
+                    }
+                }
+                if (!ready)
+                {
+                    entry = NULL;
+                }
+            }
+        }
+    }
+
+    struct lantern_peer_status_entry *best_entry = entry;
+    bool best_fresh = false;
+    uint32_t best_inflight = entry ? entry->blocks_requests_inflight : 0;
+    uint32_t best_failures = entry ? entry->consecutive_blocks_failures : 0;
+    uint64_t best_status_ms = entry ? entry->last_status_ms : 0;
+    if (entry && entry->has_status
+        && entry->last_status_ms != 0
+        && now_ms >= entry->last_status_ms)
+    {
+        uint64_t age_ms = now_ms - entry->last_status_ms;
+        if (age_ms <= LANTERN_PEER_STATUS_STALE_MS)
+        {
+            best_fresh = true;
+        }
+    }
+
+    for (size_t i = 0; i < client->peer_status_count; ++i)
+    {
+        struct lantern_peer_status_entry *candidate = &client->peer_status_entries[i];
+        if (!candidate->peer_id[0])
+        {
+            continue;
+        }
+        if (best_entry && candidate == best_entry)
+        {
+            continue;
+        }
+        if (candidate->blocks_requests_inflight >= LANTERN_MAX_BLOCKS_REQUESTS_PER_PEER)
+        {
+            continue;
+        }
+        if (!lantern_client_is_peer_connected(client, candidate->peer_id))
+        {
+            continue;
+        }
+        if (!ignore_backoff)
+        {
+            uint64_t backoff_ms = blocks_request_backoff_ms(
+                candidate->consecutive_blocks_failures);
+            if (candidate->consecutive_blocks_failures == 0
+                && backoff_ms < LANTERN_BLOCKS_REQUEST_MIN_POLL_MS)
+            {
+                backoff_ms = LANTERN_BLOCKS_REQUEST_MIN_POLL_MS;
+            }
+            if (candidate->last_blocks_request_ms != 0
+                && now_ms < candidate->last_blocks_request_ms + backoff_ms)
+            {
+                continue;
+            }
+        }
+
+        bool fresh = false;
+        if (candidate->has_status
+            && candidate->last_status_ms != 0
+            && now_ms >= candidate->last_status_ms)
+        {
+            uint64_t age_ms = now_ms - candidate->last_status_ms;
+            if (age_ms <= LANTERN_PEER_STATUS_STALE_MS)
+            {
+                fresh = true;
+            }
+        }
+
+        if (!best_entry)
+        {
+            best_entry = candidate;
+            best_fresh = fresh;
+            best_inflight = candidate->blocks_requests_inflight;
+            best_failures = candidate->consecutive_blocks_failures;
+            best_status_ms = candidate->last_status_ms;
+            continue;
+        }
+
+        if (fresh && !best_fresh)
+        {
+            best_entry = candidate;
+            best_fresh = true;
+            best_inflight = candidate->blocks_requests_inflight;
+            best_failures = candidate->consecutive_blocks_failures;
+            best_status_ms = candidate->last_status_ms;
+            continue;
+        }
+        if (fresh == best_fresh)
+        {
+            if (candidate->blocks_requests_inflight < best_inflight)
+            {
+                best_entry = candidate;
+                best_inflight = candidate->blocks_requests_inflight;
+                best_failures = candidate->consecutive_blocks_failures;
+                best_status_ms = candidate->last_status_ms;
+                continue;
+            }
+            if (candidate->blocks_requests_inflight == best_inflight)
+            {
+                if (candidate->consecutive_blocks_failures < best_failures)
+                {
+                    best_entry = candidate;
+                    best_failures = candidate->consecutive_blocks_failures;
+                    best_status_ms = candidate->last_status_ms;
+                    continue;
+                }
+                if (candidate->consecutive_blocks_failures == best_failures
+                    && candidate->last_status_ms > best_status_ms)
+                {
+                    best_entry = candidate;
+                    best_status_ms = candidate->last_status_ms;
+                    continue;
+                }
+            }
+        }
+    }
+
+    entry = best_entry;
+    if (!entry)
+    {
+        pthread_mutex_unlock(&client->status_lock);
+        return false;
+    }
+
+    size_t copy_cap = sizeof(selected_peer);
+    if (peer_cap < copy_cap)
+    {
+        copy_cap = peer_cap;
+    }
+    strncpy(selected_peer, entry->peer_id, copy_cap - 1u);
+    selected_peer[copy_cap - 1u] = '\0';
+
+    entry->blocks_requests_inflight += 1u;
+    entry->last_blocks_request_ms = now_ms;
+    pthread_mutex_unlock(&client->status_lock);
+
+    if (lantern_client_schedule_blocks_request_batch(
+            client,
+            selected_peer,
+            roots,
+            depths,
+            root_count)
+        != 0)
+    {
+        lantern_client_on_blocks_request_complete_batch(
+            client,
+            selected_peer,
+            roots,
+            root_count,
+            LANTERN_BLOCKS_REQUEST_ABORTED);
+        return false;
+    }
+
+    return true;
+}
+
+static bool try_schedule_blocks_request(
+    struct lantern_client *client,
+    const char *peer_text,
+    const LanternRoot *root,
+    uint32_t backfill_depth,
+    bool ignore_backoff)
+{
+    if (!client || !root || lantern_root_is_zero(root))
+    {
+        return false;
+    }
+    if (backfill_depth > LANTERN_MAX_BACKFILL_DEPTH)
     {
         return false;
     }
@@ -1041,66 +1309,26 @@ static bool try_schedule_blocks_request(
         return false;
     }
 
-    if (pthread_mutex_lock(&client->status_lock) != 0)
+    const char *preferred_peer = NULL;
+    if (peer_text && peer_text[0])
     {
-        return false;
+        preferred_peer = peer_text;
     }
-
-    struct lantern_peer_status_entry *entry =
-        lantern_client_ensure_status_entry_locked(client, peer_text);
-    if (!entry)
-    {
-        pthread_mutex_unlock(&client->status_lock);
-        return false;
-    }
-
-    if (entry->requested_head)
-    {
-        pthread_mutex_unlock(&client->status_lock);
-        return false;
-    }
-
-    uint64_t now_ms = monotonic_millis();
-    if (!ignore_backoff)
-    {
-        uint64_t backoff_ms = blocks_request_backoff_ms(entry->consecutive_blocks_failures);
-        if (entry->consecutive_blocks_failures == 0
-            && backoff_ms < LANTERN_BLOCKS_REQUEST_MIN_POLL_MS)
-        {
-            backoff_ms = LANTERN_BLOCKS_REQUEST_MIN_POLL_MS;
-        }
-
-        if (entry->last_blocks_request_ms != 0
-            && now_ms < entry->last_blocks_request_ms + backoff_ms)
-        {
-            pthread_mutex_unlock(&client->status_lock);
-            return false;
-        }
-    }
-
-    entry->requested_head = true;
-    entry->last_blocks_request_ms = now_ms;
-    pthread_mutex_unlock(&client->status_lock);
-
-    if (lantern_client_schedule_blocks_request(client, peer_text, root) != 0)
-    {
-        lantern_client_on_blocks_request_complete(
-            client,
-            peer_text,
-            root,
-            LANTERN_BLOCKS_REQUEST_ABORTED);
-        return false;
-    }
-
-    return true;
+    return try_schedule_blocks_request_batch(
+        client,
+        preferred_peer,
+        root,
+        &backfill_depth,
+        1u,
+        ignore_backoff);
 }
 
 static void mark_pending_parent_requested(
     struct lantern_client *client,
-    const LanternRoot *child_root,
+    const LanternRoot *parent_root,
     bool requested)
 {
-    if (!client || !child_root)
+    if (!client || !parent_root)
     {
         return;
     }
@@ -1114,10 +1342,9 @@ static void mark_pending_parent_requested(
     for (size_t i = 0; i < client->pending_blocks.length; ++i)
     {
         struct lantern_pending_block *entry = &client->pending_blocks.items[i];
-        if (memcmp(entry->root.bytes, child_root->bytes, LANTERN_ROOT_SIZE) == 0)
+        if (memcmp(entry->parent_root.bytes, parent_root->bytes, LANTERN_ROOT_SIZE) == 0)
         {
             entry->parent_requested = requested;
-            break;
         }
     }
 
@@ -1128,14 +1355,40 @@ struct pending_parent_candidate
 {
     LanternRoot child_root;
     LanternRoot parent_root;
+    uint32_t request_depth;
+    bool parent_cached;
 };
+
+struct pending_child_replay
+{
+    LanternSignedBlock block;
+    LanternRoot root;
+    char peer_text[PEER_TEXT_BUFFER_LEN];
+    uint64_t slot;
+    uint32_t backfill_depth;
+};
+
+static int pending_child_replay_compare(const void *left, const void *right)
+{
+    const struct pending_child_replay *left_entry = left;
+    const struct pending_child_replay *right_entry = right;
+    if (left_entry->slot < right_entry->slot)
+    {
+        return -1;
+    }
+    if (left_entry->slot > right_entry->slot)
+    {
+        return 1;
+    }
+    return memcmp(left_entry->root.bytes, right_entry->root.bytes, LANTERN_ROOT_SIZE);
+}
 
 void lantern_client_request_pending_parent_after_blocks(
     struct lantern_client *client,
     const char *peer_text,
     const LanternRoot *request_root)
 {
-    if (!client || !peer_text || !peer_text[0])
+    if (!client)
     {
         return;
     }
@@ -1145,6 +1398,7 @@ void lantern_client_request_pending_parent_after_blocks(
     LanternRoot requested_root = {0};
     bool has_requested_root = false;
     bool prefer_requested_root = false;
+    bool requested_parent_requested = false;
     struct pending_parent_candidate requested_candidate = {0};
     if (request_root && !lantern_root_is_zero(request_root))
     {
@@ -1171,9 +1425,22 @@ void lantern_client_request_pending_parent_after_blocks(
             {
                 break;
             }
+            if (entry->backfill_depth >= LANTERN_MAX_BACKFILL_DEPTH)
+            {
+                break;
+            }
             requested_candidate.child_root = entry->root;
             requested_candidate.parent_root = entry->parent_root;
-            prefer_requested_root = true;
+            requested_candidate.request_depth = entry->backfill_depth + 1u;
+            requested_candidate.parent_cached = pending_block_list_find(
+                &client->pending_blocks,
+                &entry->parent_root)
+                != NULL;
+            requested_parent_requested = entry->parent_requested;
+            if (!requested_candidate.parent_cached && !requested_parent_requested)
+            {
+                prefer_requested_root = true;
+            }
             break;
         }
     }
@@ -1189,8 +1456,15 @@ void lantern_client_request_pending_parent_after_blocks(
         {
             continue;
         }
-        if (peer_text && *peer_text && entry->peer_text[0] != '\0'
-            && strcmp(entry->peer_text, peer_text) != 0)
+        if (entry->backfill_depth >= LANTERN_MAX_BACKFILL_DEPTH)
+        {
+            continue;
+        }
+        bool parent_cached = pending_block_list_find(
+            &client->pending_blocks,
+            &entry->parent_root)
+            != NULL;
+        if (parent_cached)
         {
             continue;
         }
@@ -1205,6 +1479,8 @@ void lantern_client_request_pending_parent_after_blocks(
         }
         candidates[candidate_count].child_root = entry->root;
         candidates[candidate_count].parent_root = entry->parent_root;
+        candidates[candidate_count].request_depth = entry->backfill_depth + 1u;
+        candidates[candidate_count].parent_cached = parent_cached;
         candidate_count += 1u;
     }
 
@@ -1228,6 +1504,18 @@ void lantern_client_request_pending_parent_after_blocks(
             {
                 continue;
             }
+            if (entry->backfill_depth >= LANTERN_MAX_BACKFILL_DEPTH)
+            {
+                continue;
+            }
+            bool parent_cached = pending_block_list_find(
+                &client->pending_blocks,
+                &entry->parent_root)
+                != NULL;
+            if (parent_cached)
+            {
+                continue;
+            }
             if (has_requested_root
                 && memcmp(entry->parent_root.bytes, requested_root.bytes, LANTERN_ROOT_SIZE) == 0)
             {
@@ -1239,42 +1527,101 @@ void lantern_client_request_pending_parent_after_blocks(
             }
             candidates[candidate_count].child_root = entry->root;
             candidates[candidate_count].parent_root = entry->parent_root;
+            candidates[candidate_count].request_depth = entry->backfill_depth + 1u;
+            candidates[candidate_count].parent_cached = parent_cached;
             candidate_count += 1u;
         }
         lantern_client_unlock_pending(client, locked);
     }
 
+    LanternRoot request_roots[LANTERN_MAX_BLOCKS_PER_REQUEST];
+    uint32_t request_depths[LANTERN_MAX_BLOCKS_PER_REQUEST];
+    size_t request_count = 0;
+
+    bool state_locked = lantern_client_lock_state(client);
     if (prefer_requested_root)
     {
-        if (try_schedule_blocks_request(
-                client,
-                peer_text,
-                &requested_candidate.parent_root,
-                true))
+        bool requested_known = false;
+        if (state_locked)
         {
-            char parent_hex[ROOT_HEX_BUFFER_LEN];
-            char child_hex[ROOT_HEX_BUFFER_LEN];
-            format_root_hex(&requested_candidate.parent_root, parent_hex, sizeof(parent_hex));
-            format_root_hex(&requested_candidate.child_root, child_hex, sizeof(child_hex));
-            mark_pending_parent_requested(client, &requested_candidate.child_root, true);
+            requested_known = lantern_client_block_known_locked(
+                client,
+                &requested_candidate.parent_root,
+                NULL);
         }
-        return;
+        if (!requested_candidate.parent_cached
+            && !requested_parent_requested
+            && !requested_known
+            && !lantern_root_is_zero(&requested_candidate.parent_root))
+        {
+            request_roots[request_count] = requested_candidate.parent_root;
+            request_depths[request_count] = requested_candidate.request_depth;
+            request_count += 1u;
+        }
     }
 
     for (size_t i = 0; i < candidate_count; ++i)
     {
-        if (try_schedule_blocks_request(
-                client,
-                peer_text,
-                &candidates[i].parent_root,
-                true))
+        if (request_count >= LANTERN_MAX_BLOCKS_PER_REQUEST)
         {
-            char parent_hex[ROOT_HEX_BUFFER_LEN];
-            char child_hex[ROOT_HEX_BUFFER_LEN];
-            format_root_hex(&candidates[i].parent_root, parent_hex, sizeof(parent_hex));
-            format_root_hex(&candidates[i].child_root, child_hex, sizeof(child_hex));
-            mark_pending_parent_requested(client, &candidates[i].child_root, true);
             break;
+        }
+        bool duplicate = false;
+        for (size_t j = 0; j < request_count; ++j)
+        {
+            if (memcmp(
+                    request_roots[j].bytes,
+                    candidates[i].parent_root.bytes,
+                    LANTERN_ROOT_SIZE)
+                == 0)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate)
+        {
+            continue;
+        }
+        if (candidates[i].parent_cached)
+        {
+            continue;
+        }
+        bool known = false;
+        if (state_locked)
+        {
+            known = lantern_client_block_known_locked(
+                client,
+                &candidates[i].parent_root,
+                NULL);
+        }
+        if (known)
+        {
+            continue;
+        }
+        request_roots[request_count] = candidates[i].parent_root;
+        request_depths[request_count] = candidates[i].request_depth;
+        request_count += 1u;
+    }
+
+    lantern_client_unlock_state(client, state_locked);
+
+    if (request_count == 0)
+    {
+        return;
+    }
+
+    if (try_schedule_blocks_request_batch(
+            client,
+            NULL,
+            request_roots,
+            request_depths,
+            request_count,
+            true))
+    {
+        for (size_t i = 0; i < request_count; ++i)
+        {
+            mark_pending_parent_requested(client, &request_roots[i], true);
         }
     }
 }
@@ -1285,6 +1632,7 @@ void lantern_client_enqueue_pending_block(
     const LanternRoot *block_root,
     const LanternRoot *parent_root,
     const char *peer_text,
+    uint32_t backfill_depth,
     bool request_parent)
 {
     if (!client || !block || !block_root || !parent_root)
@@ -1302,20 +1650,29 @@ void lantern_client_enqueue_pending_block(
     }
 
     struct lantern_pending_block_list *list = &client->pending_blocks;
+    bool request_parent_now =
+        request_parent || client->sync_state != LANTERN_SYNC_STATE_IDLE;
+    if (backfill_depth > LANTERN_MAX_BACKFILL_DEPTH)
+    {
+        backfill_depth = LANTERN_MAX_BACKFILL_DEPTH;
+    }
     struct lantern_pending_block *existing = pending_block_list_find(list, &block_root_local);
 
     if (existing)
     {
-        bool should_request = request_parent && !existing->parent_requested
-            && peer_text && *peer_text;
+        bool should_request = request_parent_now && !existing->parent_requested;
         LanternRoot request_root = existing->parent_root;
-        LanternRoot child_root = existing->root;
+        bool parent_cached = pending_block_list_find(list, &request_root) != NULL;
         char peer_copy[PEER_TEXT_BUFFER_LEN];
         peer_copy[0] = '\0';
-        if (should_request)
+        if (peer_text && *peer_text)
         {
             strncpy(peer_copy, peer_text, sizeof(peer_copy) - 1u);
             peer_copy[sizeof(peer_copy) - 1u] = '\0';
+        }
+        if (backfill_depth < existing->backfill_depth)
+        {
+            existing->backfill_depth = backfill_depth;
         }
         if (peer_text && *peer_text)
         {
@@ -1325,12 +1682,20 @@ void lantern_client_enqueue_pending_block(
                 existing->peer_text[sizeof(existing->peer_text) - 1u] = '\0';
             }
         }
+        existing->received_ms = monotonic_millis();
         lantern_client_unlock_pending(client, locked);
-        if (should_request)
+        if (should_request && !parent_cached
+            && existing->backfill_depth < LANTERN_MAX_BACKFILL_DEPTH)
         {
-            if (try_schedule_blocks_request(client, peer_copy, &request_root, false))
+            uint32_t request_depth = existing->backfill_depth + 1u;
+            if (try_schedule_blocks_request(
+                    client,
+                    peer_copy[0] ? peer_copy : NULL,
+                    &request_root,
+                    request_depth,
+                    false))
             {
-                mark_pending_parent_requested(client, &child_root, true);
+                mark_pending_parent_requested(client, &request_root, true);
             }
         }
         return;
@@ -1348,8 +1713,13 @@ void lantern_client_enqueue_pending_block(
         pending_block_list_remove(list, 0);
     }
 
-    struct lantern_pending_block *entry =
-        pending_block_list_append(list, block, &block_root_local, &parent_root_local, peer_text);
+    struct lantern_pending_block *entry = pending_block_list_append(
+        list,
+        block,
+        &block_root_local,
+        &parent_root_local,
+        peer_text,
+        backfill_depth);
     if (!entry)
     {
         lantern_client_unlock_pending(client, locked);
@@ -1372,6 +1742,7 @@ void lantern_client_enqueue_pending_block(
     };
 
     entry->parent_requested = false;
+    bool parent_cached = pending_block_list_find(list, &parent_root_local) != NULL;
 
     lantern_client_unlock_pending(client, locked);
 
@@ -1396,14 +1767,25 @@ void lantern_client_enqueue_pending_block(
             parent_hex[0] ? parent_hex : "0x0");
     }
 
-    if (request_parent && peer_text && *peer_text)
+    if (request_parent_now && !parent_cached
+        && entry->backfill_depth < LANTERN_MAX_BACKFILL_DEPTH)
     {
         char peer_copy[PEER_TEXT_BUFFER_LEN];
-        strncpy(peer_copy, peer_text, sizeof(peer_copy) - 1u);
-        peer_copy[sizeof(peer_copy) - 1u] = '\0';
-        if (try_schedule_blocks_request(client, peer_copy, &parent_root_local, false))
+        peer_copy[0] = '\0';
+        if (peer_text && *peer_text)
         {
-            mark_pending_parent_requested(client, &block_root_local, true);
+            strncpy(peer_copy, peer_text, sizeof(peer_copy) - 1u);
+            peer_copy[sizeof(peer_copy) - 1u] = '\0';
+        }
+        uint32_t request_depth = entry->backfill_depth + 1u;
+        if (try_schedule_blocks_request(
+                client,
+                peer_copy[0] ? peer_copy : NULL,
+                &parent_root_local,
+                request_depth,
+                false))
+        {
+            mark_pending_parent_requested(client, &parent_root_local, true);
         }
     }
 }
@@ -1433,25 +1815,45 @@ void lantern_client_process_pending_children(
     }
     while (true)
     {
-        LanternSignedBlock replay;
-        LanternRoot child_root;
-        char peer_copy[PEER_TEXT_BUFFER_LEN];
-        bool have_replay = false;
-
         bool locked = lantern_client_lock_pending(client);
         if (!locked)
         {
             return;
         }
 
+        size_t pending_count = 0;
         for (size_t i = 0; i < client->pending_blocks.length; ++i)
+        {
+            struct lantern_pending_block *entry = &client->pending_blocks.items[i];
+            if (memcmp(entry->parent_root.bytes, parent_root->bytes, LANTERN_ROOT_SIZE) == 0)
+            {
+                pending_count += 1u;
+            }
+        }
+
+        if (pending_count == 0)
+        {
+            lantern_client_unlock_pending(client, locked);
+            break;
+        }
+
+        struct pending_child_replay *replays =
+            calloc(pending_count, sizeof(*replays));
+        if (!replays)
+        {
+            lantern_client_unlock_pending(client, locked);
+            return;
+        }
+
+        size_t replay_count = 0;
+        for (size_t i = client->pending_blocks.length; i-- > 0;)
         {
             struct lantern_pending_block *entry = &client->pending_blocks.items[i];
             if (memcmp(entry->parent_root.bytes, parent_root->bytes, LANTERN_ROOT_SIZE) != 0)
             {
                 continue;
             }
-            if (clone_signed_block(&entry->block, &replay) != 0)
+            if (clone_signed_block(&entry->block, &replays[replay_count].block) != 0)
             {
                 lantern_log_warn(
                     "state",
@@ -1460,31 +1862,58 @@ void lantern_client_process_pending_children(
             }
             else
             {
-                child_root = entry->root;
-                peer_copy[0] = '\0';
+                replays[replay_count].root = entry->root;
+                replays[replay_count].slot = entry->block.message.block.slot;
+                replays[replay_count].backfill_depth = entry->backfill_depth;
+                replays[replay_count].peer_text[0] = '\0';
                 if (entry->peer_text[0])
                 {
-                    strncpy(peer_copy, entry->peer_text, sizeof(peer_copy) - 1u);
-                    peer_copy[sizeof(peer_copy) - 1u] = '\0';
+                    strncpy(
+                        replays[replay_count].peer_text,
+                        entry->peer_text,
+                        sizeof(replays[replay_count].peer_text) - 1u);
+                    replays[replay_count]
+                        .peer_text[sizeof(replays[replay_count].peer_text) - 1u] = '\0';
                 }
-                have_replay = true;
+                replay_count += 1u;
             }
-            pending_block_list_remove(&client->pending_blocks, i);
-            break;
         }
 
         lantern_client_unlock_pending(client, locked);
 
-        if (!have_replay)
+        if (replay_count == 0)
+        {
+            free(replays);
+            continue;
+        }
+
+        qsort(replays, replay_count, sizeof(*replays), pending_child_replay_compare);
+
+        size_t imported_count = 0;
+        for (size_t i = 0; i < replay_count; ++i)
+        {
+            struct lantern_log_metadata meta = {
+                .validator = client->node_id,
+                .peer = replays[i].peer_text[0] ? replays[i].peer_text : NULL,
+            };
+            bool imported = lantern_client_import_block(
+                client,
+                &replays[i].block,
+                &replays[i].root,
+                &meta,
+                replays[i].backfill_depth,
+                true);
+            if (imported)
+            {
+                imported_count += 1u;
+            }
+            lantern_signed_block_with_attestation_reset(&replays[i].block);
+        }
+        free(replays);
+
+        if (imported_count == 0)
         {
             break;
         }
-
-        struct lantern_log_metadata meta = {
-            .validator = client->node_id,
-            .peer = peer_copy[0] ? peer_copy : NULL,
-        };
-        (void)lantern_client_import_block(client, &replay, &child_root, &meta, true);
-        lantern_signed_block_with_attestation_reset(&replay);
     }
 }
