@@ -948,6 +948,55 @@ int lantern_storage_store_state_for_root(
     return meta_rc;
 }
 
+int lantern_storage_load_state_bytes_for_root(
+    const char *data_dir,
+    const LanternRoot *root,
+    uint8_t **out_data,
+    size_t *out_len) {
+    if (!data_dir || !root || !out_data || !out_len) {
+        return -1;
+    }
+    *out_data = NULL;
+    *out_len = 0;
+
+    char *states_dir = NULL;
+    if (build_states_dir(data_dir, &states_dir) != 0) {
+        return -1;
+    }
+
+    char root_hex[2u * LANTERN_ROOT_SIZE + 1u];
+    if (lantern_bytes_to_hex(root->bytes, LANTERN_ROOT_SIZE, root_hex, sizeof(root_hex), 0) != 0) {
+        free_path(states_dir);
+        return -1;
+    }
+    char filename[sizeof(root_hex) + 4];
+    int name_written = snprintf(filename, sizeof(filename), "%s.ssz", root_hex);
+    if (name_written < 0 || (size_t)name_written >= sizeof(filename)) {
+        free_path(states_dir);
+        return -1;
+    }
+    char *state_path = NULL;
+    if (join_path(states_dir, filename, &state_path) != 0) {
+        free_path(states_dir);
+        return -1;
+    }
+    free_path(states_dir);
+
+    uint8_t *data = NULL;
+    size_t len = 0;
+    int read_rc = read_file_buffer(state_path, &data, &len);
+    free_path(state_path);
+    if (read_rc != 0) {
+        if (data) {
+            free(data);
+        }
+        return read_rc > 0 ? 1 : -1;
+    }
+    *out_data = data;
+    *out_len = len;
+    return 0;
+}
+
 int lantern_storage_store_slot_root(
     const char *data_dir,
     uint64_t slot,

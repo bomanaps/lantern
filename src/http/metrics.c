@@ -37,7 +37,6 @@ static const size_t LANTERN_METRICS_BODY_DEFAULT_CAP = 1024;
 static const size_t LANTERN_METRICS_BODY_INITIAL_CAP = 2048;
 static const int LANTERN_METRICS_LISTEN_BACKLOG = 16;
 static const char LANTERN_METRICS_ENDPOINT_PATH[] = "/metrics";
-static const char LANTERN_METRICS_TEXT_CONTENT_TYPE[] = "text/plain; version=0.0.4";
 static const char *const kLeanDirectionLabels[LEAN_METRICS_DIR_COUNT] = {"inbound", "outbound"};
 static const char *const kLeanConnectionResultLabels[LEAN_METRICS_CONN_RESULT_COUNT] = {"success", "timeout", "error"};
 static const char *const kLeanDisconnectionReasonLabels[LEAN_METRICS_DISCONNECT_REASON_COUNT] =
@@ -957,6 +956,23 @@ cleanup:
     return result;
 }
 
+int lantern_metrics_format_prometheus(
+    const struct lantern_metrics_snapshot *snapshot,
+    char **out_body,
+    size_t *out_len)
+{
+    if (!snapshot || !out_body || !out_len)
+    {
+        return LANTERN_METRICS_SERVER_ERR_INVALID_PARAM;
+    }
+    int result = format_metrics_body(snapshot, out_body, out_len);
+    if (result != 0)
+    {
+        return result;
+    }
+    return 0;
+}
+
 
 /**
  * Convert a peer address to a printable string.
@@ -1279,7 +1295,7 @@ static void handle_client_connection(
         client_fd,
         200,
         "OK",
-        LANTERN_METRICS_TEXT_CONTENT_TYPE,
+        LANTERN_METRICS_CONTENT_TYPE,
         body,
         body_len);
     free(body);

@@ -27,6 +27,11 @@ int lantern_storage_store_state_for_root(
     const char *data_dir,
     const LanternRoot *root,
     const LanternState *state);
+int lantern_storage_load_state_bytes_for_root(
+    const char *data_dir,
+    const LanternRoot *root,
+    uint8_t **out_data,
+    size_t *out_len);
 int lantern_storage_store_slot_root(
     const char *data_dir,
     uint64_t slot,

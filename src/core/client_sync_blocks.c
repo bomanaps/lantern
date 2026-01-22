@@ -1548,11 +1548,29 @@ bool lantern_client_import_block(
 
     if (!signed_block_signatures_are_valid(client, block, meta))
     {
+        char root_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(&block_root_local, root_hex, sizeof(root_hex));
+        lantern_log_warn(
+            "state",
+            meta,
+            "signature verification failed slot=%" PRIu64 " root=%s depth=%" PRIu32,
+            block->message.block.slot,
+            root_hex[0] ? root_hex : "0x0",
+            backfill_depth);
         goto cleanup;
     }
 
     if (!validate_block_vote_constraints_locked(client, block, meta))
     {
+        char root_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(&block_root_local, root_hex, sizeof(root_hex));
+        lantern_log_warn(
+            "state",
+            meta,
+            "vote constraints failed slot=%" PRIu64 " root=%s depth=%" PRIu32,
+            block->message.block.slot,
+            root_hex[0] ? root_hex : "0x0",
+            backfill_depth);
         goto cleanup;
     }
 

@@ -45,17 +45,6 @@ extern "C" {
 /** Peer dial interval in seconds */
 #define LANTERN_PEER_DIAL_INTERVAL_SECONDS 5u
 
-/** Base backoff for blocks request in milliseconds */
-#define LANTERN_BLOCKS_REQUEST_BACKOFF_BASE_MS 5000u
-
-/** Maximum backoff for blocks request in milliseconds */
-#define LANTERN_BLOCKS_REQUEST_BACKOFF_MAX_MS 300000u
-
-/** Maximum consecutive failures before max backoff */
-#define LANTERN_BLOCKS_REQUEST_BACKOFF_MAX_FAILURES 8u
-
-/** Minimum poll interval for blocks requests in milliseconds */
-#define LANTERN_BLOCKS_REQUEST_MIN_POLL_MS 2000u
 /** Maximum concurrent blocks requests per peer */
 #define LANTERN_MAX_BLOCKS_REQUESTS_PER_PEER 2u
 
@@ -73,8 +62,9 @@ extern "C" {
 enum lantern_blocks_request_outcome
 {
     LANTERN_BLOCKS_REQUEST_SUCCESS = 0,
-    LANTERN_BLOCKS_REQUEST_FAILED,
-    LANTERN_BLOCKS_REQUEST_ABORTED
+    LANTERN_BLOCKS_REQUEST_FAILED = 1,
+    LANTERN_BLOCKS_REQUEST_ABORTED = 2,
+    LANTERN_BLOCKS_REQUEST_EMPTY = 3
 };
 
 /** Peer status considered stale after this many milliseconds. */

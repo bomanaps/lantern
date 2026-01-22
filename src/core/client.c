@@ -566,8 +566,7 @@ static void client_reset_base(struct lantern_client *client)
 /**
  * @brief Apply user-provided options to the client instance.
  *
- * Copies configurable strings and ports into the client, and respects the
- * optional environment override for disabling the status guard.
+ * Copies configurable strings and ports into the client.
  *
  * @param client   Client being configured
  * @param options  Source options (must not be NULL)
@@ -597,19 +596,6 @@ static lantern_client_error client_apply_options(
     if (set_owned_string(&client->devnet, options->devnet) != 0)
     {
         return LANTERN_CLIENT_ERR_ALLOC;
-    }
-
-    const char *disable_guard_env = getenv("LANTERN_DEBUG_DISABLE_STATUS_GUARD");
-    if (disable_guard_env
-        && disable_guard_env[0] != '\0'
-        && !(disable_guard_env[0] == '0' && disable_guard_env[1] == '\0'))
-    {
-        client->status_guard_disabled = true;
-        lantern_log_warn(
-            "reqresp",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "status guard disabled via LANTERN_DEBUG_DISABLE_STATUS_GUARD=\"%s\"",
-            disable_guard_env);
     }
 
     client->http_port = options->http_port;
@@ -2000,14 +1986,6 @@ static void shutdown_state_and_runtime(struct lantern_client *client)
  */
 static lantern_client_error client_start_apis(struct lantern_client *client)
 {
-    if (client->http_port != 0)
-    {
-        lantern_log_warn(
-            "client",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "HTTP API disabled; ignoring --http-port %" PRIu16,
-            client->http_port);
-    }
     client->http_running = false;
 
     struct lantern_metrics_callbacks metrics_callbacks;
@@ -2030,6 +2008,30 @@ static lantern_client_error client_start_apis(struct lantern_client *client)
             return LANTERN_CLIENT_ERR_NETWORK;
         }
         client->metrics_running = true;
+    }
+
+    struct lantern_http_server_config http_config;
+    memset(&http_config, 0, sizeof(http_config));
+    http_config.port = client->http_port;
+    http_config.callbacks.context = client;
+    http_config.callbacks.snapshot_head = http_snapshot_head;
+    http_config.callbacks.validator_count = http_validator_count_cb;
+    http_config.callbacks.validator_info = http_validator_info_cb;
+    http_config.callbacks.set_validator_status = http_set_validator_status_cb;
+    http_config.callbacks.metrics_snapshot = metrics_snapshot_cb;
+    http_config.callbacks.finalized_state_ssz = http_finalized_state_ssz_cb;
+    if (client->http_port != 0)
+    {
+        if (lantern_http_server_start(&client->http_server, &http_config) != 0)
+        {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to start HTTP server on port %" PRIu16,
+                client->http_port);
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
+        client->http_running = true;
     }
 
     return LANTERN_CLIENT_OK;

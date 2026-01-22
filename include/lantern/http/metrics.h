@@ -12,6 +12,7 @@ extern "C" {
 #endif
 
 #define LANTERN_METRICS_MAX_PEER_VOTE_STATS 64u
+#define LANTERN_METRICS_CONTENT_TYPE "text/plain; version=0.0.4; charset=utf-8"
 
 struct lantern_peer_vote_metric {
     char peer_id[128];
@@ -57,6 +58,10 @@ int lantern_metrics_server_start(
     uint16_t port,
     const struct lantern_metrics_callbacks *callbacks);
 void lantern_metrics_server_stop(struct lantern_metrics_server *server);
+int lantern_metrics_format_prometheus(
+    const struct lantern_metrics_snapshot *snapshot,
+    char **out_body,
+    size_t *out_len);
 
 #ifdef __cplusplus
 }

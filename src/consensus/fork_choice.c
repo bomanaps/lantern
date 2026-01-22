@@ -52,14 +52,7 @@ static uint64_t root_hash(const LanternRoot *root) {
 }
 
 static bool finalization_trace_enabled(void) {
-    static bool initialized = false;
-    static bool enabled = false;
-    if (!initialized) {
-        const char *env = getenv("LANTERN_DEBUG_FINALIZATION");
-        enabled = env && env[0] != '\0';
-        initialized = true;
-    }
-    return enabled;
+    return false;
 }
 
 static void format_root_hex(const LanternRoot *root, char *out, size_t out_len) {
@@ -473,10 +466,14 @@ static int update_global_checkpoints(
     if (!store) {
         return -1;
     }
-    if (post_justified && post_justified->slot >= store->latest_justified.slot) {
+    if (post_justified
+        && !root_is_zero(&post_justified->root)
+        && post_justified->slot >= store->latest_justified.slot) {
         store->latest_justified = *post_justified;
     }
-    if (post_finalized && post_finalized->slot >= store->latest_finalized.slot) {
+    if (post_finalized
+        && !root_is_zero(&post_finalized->root)
+        && post_finalized->slot >= store->latest_finalized.slot) {
         store->latest_finalized = *post_finalized;
     }
     return 0;

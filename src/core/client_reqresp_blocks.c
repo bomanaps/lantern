@@ -218,11 +218,13 @@ static bool lantern_client_process_stream_block_chunk(
         lantern_log_debug(
             "reqresp",
             meta,
-            "streamed block slot=%" PRIu64 " proposer=%" PRIu64 " root=%s match=%s attestations=%zu",
+            "streamed block slot=%" PRIu64 " proposer=%" PRIu64 " root=%s match=%s depth=%" PRIu32
+            " attestations=%zu",
             streamed_block.message.block.slot,
             streamed_block.message.block.proposer_index,
             computed_hex[0] ? computed_hex : "0x0",
             matches ? "true" : "false",
+            backfill_depth,
             streamed_block.message.block.body.attestations.length);
     }
     else
@@ -230,11 +232,13 @@ static bool lantern_client_process_stream_block_chunk(
         lantern_log_info(
             "reqresp",
             meta,
-            "streamed block slot=%" PRIu64 " proposer=%" PRIu64 " root=%s match=%s attestations=%zu",
+            "streamed block slot=%" PRIu64 " proposer=%" PRIu64 " root=%s match=%s depth=%" PRIu32
+            " attestations=%zu",
             streamed_block.message.block.slot,
             streamed_block.message.block.proposer_index,
             computed_hex[0] ? computed_hex : "0x0",
             matches ? "true" : "false",
+            backfill_depth,
             streamed_block.message.block.body.attestations.length);
     }
 
@@ -316,7 +320,8 @@ static void *block_request_worker(void *arg)
 
     uint8_t *raw_request = NULL;
     uint8_t *payload = NULL;
-    bool request_success = false;
+    enum lantern_blocks_request_outcome outcome = LANTERN_BLOCKS_REQUEST_FAILED;
+    bool completed = false;
 
     if (lantern_root_list_resize(&request.roots, ctx->root_count) != 0)
     {
@@ -520,7 +525,8 @@ static void *block_request_worker(void *arg)
             goto cleanup;
         }
     }
-    request_success = saw_block;
+    completed = true;
+    outcome = saw_block ? LANTERN_BLOCKS_REQUEST_SUCCESS : LANTERN_BLOCKS_REQUEST_EMPTY;
 
 cleanup:
     free(payload);
@@ -534,7 +540,7 @@ cleanup:
             ctx->peer_text,
             ctx->roots,
             ctx->root_count,
-            request_success ? LANTERN_BLOCKS_REQUEST_SUCCESS : LANTERN_BLOCKS_REQUEST_FAILED);
+            completed ? outcome : LANTERN_BLOCKS_REQUEST_FAILED);
     }
 
     block_request_ctx_free(ctx);

@@ -320,9 +320,9 @@ int lantern_client_debug_import_block(
     const char *peer_id_text);
 size_t lantern_client_pending_block_count(const struct lantern_client *client);
 
-#define LANTERN_DEBUG_BLOCKS_REQUEST_SUCCESS 0
-#define LANTERN_DEBUG_BLOCKS_REQUEST_FAILED 1
-#define LANTERN_DEBUG_BLOCKS_REQUEST_ABORTED 2
+#define LANTERN_TEST_BLOCKS_REQUEST_SUCCESS 0
+#define LANTERN_TEST_BLOCKS_REQUEST_FAILED 1
+#define LANTERN_TEST_BLOCKS_REQUEST_ABORTED 2
 
 int lantern_client_debug_enqueue_pending_block(
     struct lantern_client *client,

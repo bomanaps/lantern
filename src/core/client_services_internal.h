@@ -348,6 +348,18 @@ int http_set_validator_status_cb(void *context, uint64_t global_index, bool enab
  */
 int metrics_snapshot_cb(void *context, struct lantern_metrics_snapshot *out_snapshot);
 
+/**
+ * Get finalized state SSZ bytes for checkpoint sync.
+ *
+ * @param context    Client instance
+ * @param out_bytes  Output buffer pointer (caller owns and must free)
+ * @param out_len    Output byte length
+ * @return 0 on success, negative on failure
+ *
+ * @note Thread safety: This function may acquire state_lock
+ */
+int http_finalized_state_ssz_cb(void *context, uint8_t **out_bytes, size_t *out_len);
+
 
 /* ============================================================================
  * Reqresp Callback Functions

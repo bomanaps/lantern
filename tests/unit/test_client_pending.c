@@ -161,7 +161,7 @@ static int test_pending_block_queue(void) {
             &client,
             peer_b,
             &parent_root,
-            LANTERN_DEBUG_BLOCKS_REQUEST_SUCCESS)
+            LANTERN_TEST_BLOCKS_REQUEST_SUCCESS)
         != 0) {
         fprintf(stderr, "blocks_request_complete debug wrapper failed\n");
         rc = 1;
