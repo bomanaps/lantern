@@ -527,8 +527,9 @@ static int lantern_bitlist_drop_front(struct lantern_bitlist *list, size_t bits)
         for (size_t i = byte_len; i > 0; --i) {
             size_t idx = i - 1;
             uint8_t current = list->bytes[idx];
-            uint8_t next_carry = (uint8_t)(current >> (8u - bit_shift));
-            list->bytes[idx] = (uint8_t)((current << bit_shift) | carry);
+            /* Shift right to drop low-order bits, carry in from higher byte. */
+            uint8_t next_carry = (uint8_t)(current << (8u - bit_shift));
+            list->bytes[idx] = (uint8_t)((current >> bit_shift) | carry);
             carry = next_carry;
         }
     }
@@ -541,8 +542,7 @@ bool lantern_state_slot_in_justified_window(const LanternState *state, uint64_t 
         return false;
     }
     uint64_t offset = state->justified_slots_offset;
-    uint64_t implicit_finalized = offset > 0 ? (offset - 1u) : 0u;
-    if (slot <= implicit_finalized) {
+    if (slot < offset) {
         return true;
     }
     uint64_t bit_length = state->justified_slots.bit_length;
@@ -599,10 +599,8 @@ int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slo
     if (!state || !out_value) {
         return -1;
     }
-    uint64_t implicit_finalized = state->justified_slots_offset > 0
-        ? (state->justified_slots_offset - 1u)
-        : 0u;
-    if (slot <= implicit_finalized) {
+    uint64_t offset = state->justified_slots_offset;
+    if (slot < offset) {
         *out_value = true;
         return 0;
     }
@@ -618,7 +616,7 @@ int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slo
         }
         return 0;
     }
-    uint64_t relative = slot - state->justified_slots_offset;
+    uint64_t relative = slot - offset;
     if (relative > SIZE_MAX) {
         return -1;
     }
@@ -679,10 +677,7 @@ static int lantern_state_set_justified_slot_bit(LanternState *state, uint64_t sl
     if (!state) {
         return -1;
     }
-    uint64_t implicit_finalized = state->justified_slots_offset > 0
-        ? (state->justified_slots_offset - 1u)
-        : 0u;
-    if (slot <= implicit_finalized) {
+    if (slot < state->justified_slots_offset) {
         return 0;
     }
     if (slot > SIZE_MAX) {
@@ -1352,6 +1347,10 @@ int lantern_state_generate_genesis(LanternState *state, uint64_t genesis_time, u
     lantern_root_zero(&state->latest_finalized.root);
     state->latest_finalized.slot = 0;
     if (state->latest_finalized.slot != UINT64_MAX) {
+        if (state->latest_finalized.slot > UINT64_MAX - 1u) {
+            lantern_state_reset(state);
+            return -1;
+        }
         state->justified_slots_offset = state->latest_finalized.slot + 1u;
     }
 
