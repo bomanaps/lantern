@@ -1084,7 +1084,7 @@ static void test_status_reqresp_snappy_fixture(void) {
         .head = build_checkpoint(0x41, 96),
     };
 
-    /* Encode to raw SSZ then compress with raw snappy */
+    /* Encode to raw SSZ then compress with framed snappy */
     uint8_t raw_ssz[2u * LANTERN_CHECKPOINT_SSZ_SIZE];
     size_t raw_ssz_len = 0;
     check_zero(
@@ -1101,10 +1101,10 @@ static void test_status_reqresp_snappy_fixture(void) {
         lantern_snappy_compress(raw_ssz, raw_ssz_len, snappy_payload, max_compressed, &snappy_len)
         == LANTERN_SNAPPY_OK);
 
-    /* Build reqresp frame - varint encodes the compressed payload size */
+    /* Build reqresp frame - varint encodes the uncompressed SSZ payload size */
     uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
     size_t header_len = 0;
-    CHECK(unsigned_varint_encode(snappy_len, header, sizeof(header), &header_len) == UNSIGNED_VARINT_OK);
+    CHECK(unsigned_varint_encode(raw_ssz_len, header, sizeof(header), &header_len) == UNSIGNED_VARINT_OK);
 
     size_t framed_len = 1u + header_len + snappy_len;
     uint8_t *framed = (uint8_t *)malloc(framed_len);
@@ -1167,10 +1167,10 @@ static uint8_t *build_reqresp_frame(
     size_t payload_len,
     size_t raw_len,
     size_t *out_len) {
-    (void)raw_len; /* Unused - varint encodes compressed payload size */
+    /* Varint encodes the uncompressed payload size (SSZ length). */
     uint8_t header[LANTERN_REQRESP_HEADER_MAX_BYTES];
     size_t header_len = 0;
-    CHECK(unsigned_varint_encode(payload_len, header, sizeof(header), &header_len) == UNSIGNED_VARINT_OK);
+    CHECK(unsigned_varint_encode(raw_len, header, sizeof(header), &header_len) == UNSIGNED_VARINT_OK);
 
     size_t frame_len = 1u + header_len + payload_len;
     uint8_t *frame = (uint8_t *)malloc(frame_len);
