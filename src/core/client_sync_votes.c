@@ -433,16 +433,10 @@ static bool process_vote_locked(
         lantern_log_debug(
             "gossip",
             meta,
-            "dropping vote validator=%" PRIu64 " slot=%" PRIu64 " (missing target state root=%s)",
+            "missing target state root=%s for validator=%" PRIu64 " slot=%" PRIu64 " (using current state)",
+            target_hex[0] ? target_hex : "0x0",
             vote->data.validator_id,
-            vote->data.slot,
-            target_hex[0] ? target_hex : "0x0");
-        lantern_vote_rejection_set(
-            rejection,
-            "missing target state root=%s",
-            target_hex[0] ? target_hex : "0x0");
-        lantern_state_reset(&target_state);
-        return false;
+            vote->data.slot);
     }
 
     if (!lantern_client_verify_vote_signature(
