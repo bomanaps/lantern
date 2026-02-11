@@ -127,6 +127,7 @@ struct lantern_active_blocks_request {
 struct lantern_agg_proof_cache_entry {
     LanternRoot data_root;
     LanternAggregatedSignatureProof proof;
+    uint64_t target_slot;
 };
 
 struct lantern_agg_proof_cache {

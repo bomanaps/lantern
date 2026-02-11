@@ -199,7 +199,33 @@ const char *connection_reason_text(int reason);
 int lantern_client_agg_proof_cache_add(
     struct lantern_client *client,
     const LanternRoot *data_root,
-    const LanternAggregatedSignatureProof *proof);
+    const LanternAggregatedSignatureProof *proof,
+    uint64_t target_slot);
+
+/**
+ * Prune cached aggregated proofs whose attestation target slot is finalized.
+ *
+ * @param client          Client instance (state_lock must be held)
+ * @param finalized_slot  Latest finalized slot boundary
+ * @return Number of entries removed
+ *
+ * @note Thread safety: Caller must hold state_lock.
+ */
+size_t lantern_client_agg_proof_cache_prune_finalized(
+    struct lantern_client *client,
+    uint64_t finalized_slot);
+
+/**
+ * Aggregate block/subnet attestations into grouped proofs with cache reuse.
+ *
+ * @note Thread safety: Acquires state_lock internally.
+ */
+lantern_client_error lantern_client_aggregate_attestations_for_block(
+    struct lantern_client *client,
+    const LanternAttestations *att_list,
+    const LanternSignatureList *att_signatures,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures);
 
 
 /* ============================================================================

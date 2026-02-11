@@ -132,21 +132,29 @@ static bool agg_proof_cache_entry_equals(
     return true;
 }
 
-static void agg_proof_cache_evict_oldest(struct lantern_agg_proof_cache *cache) {
-    if (!cache || cache->length == 0 || !cache->entries) {
+static void agg_proof_cache_remove_index(struct lantern_agg_proof_cache *cache, size_t index) {
+    if (!cache || !cache->entries || index >= cache->length) {
         return;
     }
-    lantern_aggregated_signature_proof_reset(&cache->entries[0].proof);
-    if (cache->length > 1) {
-        memmove(cache->entries, cache->entries + 1, (cache->length - 1) * sizeof(*cache->entries));
+    lantern_aggregated_signature_proof_reset(&cache->entries[index].proof);
+    if (index + 1u < cache->length) {
+        memmove(
+            &cache->entries[index],
+            &cache->entries[index + 1u],
+            (cache->length - index - 1u) * sizeof(*cache->entries));
     }
     cache->length -= 1u;
+}
+
+static void agg_proof_cache_evict_oldest(struct lantern_agg_proof_cache *cache) {
+    agg_proof_cache_remove_index(cache, 0u);
 }
 
 int lantern_client_agg_proof_cache_add(
     struct lantern_client *client,
     const LanternRoot *data_root,
-    const LanternAggregatedSignatureProof *proof) {
+    const LanternAggregatedSignatureProof *proof,
+    uint64_t target_slot) {
     if (!client || !data_root || !proof) {
         return -1;
     }
@@ -156,6 +164,7 @@ int lantern_client_agg_proof_cache_add(
     struct lantern_agg_proof_cache *cache = &client->agg_proof_cache;
     for (size_t i = 0; i < cache->length; ++i) {
         if (agg_proof_cache_entry_equals(&cache->entries[i], data_root, proof)) {
+            cache->entries[i].target_slot = target_slot;
             return 0;
         }
     }
@@ -188,8 +197,32 @@ int lantern_client_agg_proof_cache_add(
         lantern_aggregated_signature_proof_reset(&entry->proof);
         return -1;
     }
+    entry->target_slot = target_slot;
     cache->length += 1u;
     return 0;
+}
+
+size_t lantern_client_agg_proof_cache_prune_finalized(
+    struct lantern_client *client,
+    uint64_t finalized_slot) {
+    if (!client) {
+        return 0u;
+    }
+    struct lantern_agg_proof_cache *cache = &client->agg_proof_cache;
+    if (!cache->entries || cache->length == 0) {
+        return 0u;
+    }
+    size_t removed = 0u;
+    size_t index = 0u;
+    while (index < cache->length) {
+        if (cache->entries[index].target_slot <= finalized_slot) {
+            agg_proof_cache_remove_index(cache, index);
+            removed += 1u;
+            continue;
+        }
+        index += 1u;
+    }
+    return removed;
 }
 
 /* ============================================================================

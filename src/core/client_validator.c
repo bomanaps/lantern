@@ -653,6 +653,103 @@ static lantern_client_error append_cached_proof_as_aggregated(
     return LANTERN_CLIENT_OK;
 }
 
+static bool proof_matches_validator_ids(
+    const LanternAggregatedSignatureProof *proof,
+    const LanternValidatorIndex *validator_ids,
+    size_t validator_count)
+{
+    if (!proof || !validator_ids || validator_count == 0)
+    {
+        return false;
+    }
+    if (proof->participants.bit_length == 0 || !proof->participants.bytes)
+    {
+        return false;
+    }
+
+    size_t limit = proof->participants.bit_length;
+    if (limit > LANTERN_VALIDATOR_REGISTRY_LIMIT)
+    {
+        limit = LANTERN_VALIDATOR_REGISTRY_LIMIT;
+    }
+
+    for (size_t i = 0; i < validator_count; ++i)
+    {
+        uint64_t validator_id = validator_ids[i];
+        if (validator_id >= limit)
+        {
+            return false;
+        }
+        if (!lantern_bitlist_get(&proof->participants, (size_t)validator_id))
+        {
+            return false;
+        }
+    }
+
+    size_t proof_count = 0;
+    for (size_t i = 0; i < limit; ++i)
+    {
+        if (lantern_bitlist_get(&proof->participants, i))
+        {
+            proof_count += 1u;
+        }
+    }
+    return proof_count == validator_count;
+}
+
+static lantern_client_error append_cached_exact_group_proof(
+    const struct lantern_client *client,
+    const LanternAttestationData *data,
+    const LanternRoot *data_root,
+    const LanternValidatorIndex *validator_ids,
+    size_t validator_count,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures,
+    bool *out_used_cached)
+{
+    if (!client || !data || !data_root || !out_attestations || !out_signatures || !out_used_cached)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    *out_used_cached = false;
+    if (!validator_ids || validator_count == 0)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+
+    const struct lantern_agg_proof_cache *cache = &client->agg_proof_cache;
+    if (!cache->entries || cache->length == 0)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+
+    for (size_t i = 0; i < cache->length; ++i)
+    {
+        if (memcmp(cache->entries[i].data_root.bytes, data_root->bytes, LANTERN_ROOT_SIZE) != 0)
+        {
+            continue;
+        }
+        if (!proof_matches_validator_ids(&cache->entries[i].proof, validator_ids, validator_count))
+        {
+            continue;
+        }
+
+        lantern_client_error rc = append_cached_proof_as_aggregated(
+            data,
+            &cache->entries[i].proof,
+            out_attestations,
+            out_signatures);
+        if (rc != LANTERN_CLIENT_OK)
+        {
+            return rc;
+        }
+        *out_used_cached = true;
+        return LANTERN_CLIENT_OK;
+    }
+
+    return LANTERN_CLIENT_OK;
+}
+
 static lantern_client_error append_cached_proofs_for_group(
     const struct lantern_client *client,
     const LanternAttestationData *data,
@@ -814,10 +911,27 @@ static lantern_client_error aggregate_attestations_for_block(
             }
             if (groups[i].count > 0)
             {
-                rc = append_group_as_aggregated(&client->state, &groups[i], out_attestations, out_signatures);
+                bool used_cached_group_proof = false;
+                rc = append_cached_exact_group_proof(
+                    client,
+                    &groups[i].data,
+                    &data_root,
+                    groups[i].validator_ids,
+                    groups[i].count,
+                    out_attestations,
+                    out_signatures,
+                    &used_cached_group_proof);
                 if (rc != LANTERN_CLIENT_OK)
                 {
                     break;
+                }
+                if (!used_cached_group_proof)
+                {
+                    rc = append_group_as_aggregated(&client->state, &groups[i], out_attestations, out_signatures);
+                    if (rc != LANTERN_CLIENT_OK)
+                    {
+                        break;
+                    }
                 }
             }
 
@@ -898,6 +1012,21 @@ static lantern_client_error aggregate_attestations_for_block(
         (void)lantern_attestation_signatures_resize(out_signatures, 0);
     }
     return rc;
+}
+
+lantern_client_error lantern_client_aggregate_attestations_for_block(
+    struct lantern_client *client,
+    const LanternAttestations *att_list,
+    const LanternSignatureList *att_signatures,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures)
+{
+    return aggregate_attestations_for_block(
+        client,
+        att_list,
+        att_signatures,
+        out_attestations,
+        out_signatures);
 }
 
 
@@ -2052,7 +2181,11 @@ static int validator_publish_aggregated_attestations(struct lantern_client *clie
         if (lantern_hash_tree_root_attestation_data(&signed_attestation.data, &data_root) == 0) {
             bool locked = lantern_client_lock_state(client);
             if (locked) {
-                (void)lantern_client_agg_proof_cache_add(client, &data_root, &signed_attestation.proof);
+                (void)lantern_client_agg_proof_cache_add(
+                    client,
+                    &data_root,
+                    &signed_attestation.proof,
+                    signed_attestation.data.target.slot);
             }
             lantern_client_unlock_state(client, locked);
         }

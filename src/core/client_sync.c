@@ -358,7 +358,12 @@ static bool verify_and_cache_aggregated_attestation_locked(
     if (!verified) {
         return false;
     }
-    if (lantern_client_agg_proof_cache_add(client, &data_root, &attestation->proof) != 0) {
+    if (lantern_client_agg_proof_cache_add(
+            client,
+            &data_root,
+            &attestation->proof,
+            attestation->data.target.slot)
+        != 0) {
         lantern_log_debug(
             "gossip",
             meta,

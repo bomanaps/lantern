@@ -394,7 +394,11 @@ static void cache_block_aggregated_proofs_locked(
         if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != 0) {
             continue;
         }
-        (void)lantern_client_agg_proof_cache_add(client, &data_root, &proofs->data[i]);
+        (void)lantern_client_agg_proof_cache_add(
+            client,
+            &data_root,
+            &proofs->data[i],
+            attestations->data[i].data.target.slot);
     }
 }
 
@@ -1751,6 +1755,7 @@ bool lantern_client_import_block(
     }
 
     uint64_t local_slot = client->state.slot;
+    uint64_t initial_finalized_slot = client->state.latest_finalized.slot;
     LanternRoot block_root_local = {0};
     LanternRoot head_root = {0};
     uint64_t head_slot = 0;
@@ -1945,6 +1950,12 @@ bool lantern_client_import_block(
 
         if (adopted_state)
         {
+            if (client->state.latest_finalized.slot > initial_finalized_slot)
+            {
+                (void)lantern_client_agg_proof_cache_prune_finalized(
+                    client,
+                    client->state.latest_finalized.slot);
+            }
             persist_state_locked(client, meta);
         }
 
@@ -1986,6 +1997,12 @@ bool lantern_client_import_block(
         goto cleanup;
     }
 
+    if (client->state.latest_finalized.slot > initial_finalized_slot)
+    {
+        (void)lantern_client_agg_proof_cache_prune_finalized(
+            client,
+            client->state.latest_finalized.slot);
+    }
     advance_fork_choice_time_locked(client, block, meta);
     get_head_info_locked(client, &head_root, &head_slot);
     persist_state_locked(client, meta);
