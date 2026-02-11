@@ -34,7 +34,7 @@ int lantern_consensus_runtime_init(
     const struct lantern_validator_assignment *assignment);
 void lantern_consensus_runtime_reset(struct lantern_consensus_runtime *runtime);
 
-int lantern_consensus_runtime_update_time(struct lantern_consensus_runtime *runtime, uint64_t now);
+int lantern_consensus_runtime_update_time(struct lantern_consensus_runtime *runtime, uint64_t now_milliseconds);
 const struct lantern_slot_timepoint *lantern_consensus_runtime_current_timepoint(const struct lantern_consensus_runtime *runtime);
 
 int lantern_consensus_runtime_schedule_slot(

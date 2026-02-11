@@ -96,6 +96,34 @@ static int test_schedule_helpers(void) {
     return 0;
 }
 
+static int test_subsecond_precision(void) {
+    struct lantern_slot_clock clock;
+    if (init_clock(&clock, 1) != 0) {
+        fprintf(stderr, "clock init failed\n");
+        return 1;
+    }
+
+    struct lantern_slot_timepoint info;
+
+    CHECK_ZERO(lantern_slot_clock_compute(&clock, 1750, &info), "compute 750ms");
+    CHECK_EQ(info.slot, 0, "slot@750ms");
+    CHECK_EQ(info.interval_index, 0, "interval@750ms");
+
+    CHECK_ZERO(lantern_slot_clock_compute(&clock, 1850, &info), "compute 850ms");
+    CHECK_EQ(info.slot, 0, "slot@850ms");
+    CHECK_EQ(info.interval_index, 1, "interval@850ms");
+
+    CHECK_ZERO(lantern_slot_clock_compute(&clock, 4900, &info), "compute 3900ms");
+    CHECK_EQ(info.slot, 0, "slot@3900ms");
+    CHECK_EQ(info.interval_index, 4, "interval@3900ms");
+
+    CHECK_ZERO(lantern_slot_clock_compute(&clock, 15400, &info), "compute 14.4s");
+    CHECK_EQ(info.slot, 3, "slot@14.4s");
+    CHECK_EQ(info.interval_index, 3, "interval@14.4s");
+
+    return 0;
+}
+
 static int test_invalid_config(void) {
     struct lantern_slot_clock clock;
     struct lantern_slot_clock_config cfg = {
@@ -123,6 +151,9 @@ static int test_invalid_config(void) {
 
 int main(void) {
     if (test_slot_progression() != 0) {
+        return 1;
+    }
+    if (test_subsecond_precision() != 0) {
         return 1;
     }
     if (test_schedule_helpers() != 0) {

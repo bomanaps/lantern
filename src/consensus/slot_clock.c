@@ -90,6 +90,24 @@ static int add_u64(uint64_t a, uint64_t b, uint64_t *out) {
     return 0;
 }
 
+static int milliseconds_since_genesis(
+    const struct lantern_slot_clock *clock,
+    uint64_t now_milliseconds,
+    uint64_t *out_elapsed) {
+    if (!clock || !out_elapsed) {
+        return -1;
+    }
+    uint64_t genesis_millis = 0;
+    if (multiply_u64_u32(clock->genesis_time, LANTERN_MILLISECONDS_PER_SECOND, &genesis_millis) != 0) {
+        return -1;
+    }
+    if (now_milliseconds < genesis_millis) {
+        return -1;
+    }
+    *out_elapsed = now_milliseconds - genesis_millis;
+    return 0;
+}
+
 static int validate_config(const struct lantern_slot_clock_config *config) {
     if (!config) {
         return -1;
@@ -235,19 +253,15 @@ int lantern_slot_clock_schedule_slot(
 
 int lantern_slot_clock_compute(
     const struct lantern_slot_clock *clock,
-    uint64_t now,
+    uint64_t now_milliseconds,
     struct lantern_slot_timepoint *out_timepoint) {
     if (!clock || !out_timepoint) {
         return -1;
     }
-    uint64_t genesis_millis = 0;
-    if (multiply_u64_u32(clock->genesis_time, LANTERN_MILLISECONDS_PER_SECOND, &genesis_millis) != 0) {
+    uint64_t elapsed = 0;
+    if (milliseconds_since_genesis(clock, now_milliseconds, &elapsed) != 0) {
         return -1;
     }
-    if (now < genesis_millis) {
-        return -1;
-    }
-    uint64_t elapsed = now - genesis_millis;
     if (clock->milliseconds_per_interval == 0) {
         return -1;
     }

@@ -62,11 +62,13 @@ void lantern_consensus_runtime_reset(struct lantern_consensus_runtime *runtime) 
     memset(runtime, 0, sizeof(*runtime));
 }
 
-int lantern_consensus_runtime_update_time(struct lantern_consensus_runtime *runtime, uint64_t now) {
+int lantern_consensus_runtime_update_time(
+    struct lantern_consensus_runtime *runtime,
+    uint64_t now_milliseconds) {
     if (!runtime || !runtime->initialized) {
         return -1;
     }
-    if (lantern_slot_clock_compute(&runtime->clock, now, &runtime->timepoint) != 0) {
+    if (lantern_slot_clock_compute(&runtime->clock, now_milliseconds, &runtime->timepoint) != 0) {
         return -1;
     }
     runtime->has_timepoint = true;

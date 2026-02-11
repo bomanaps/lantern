@@ -51,7 +51,7 @@ void lantern_slot_clock_config_init(struct lantern_slot_clock_config *config);
 int lantern_slot_clock_init(struct lantern_slot_clock *clock, const struct lantern_slot_clock_config *config);
 int lantern_slot_clock_compute(
     const struct lantern_slot_clock *clock,
-    uint64_t now,
+    uint64_t now_milliseconds,
     struct lantern_slot_timepoint *out_timepoint);
 int lantern_slot_clock_slot_start_time(
     const struct lantern_slot_clock *clock,
