@@ -384,6 +384,8 @@ void lantern_client_update_sync_progress(
  * @param meta        Logging metadata
  * @param backfill_depth Backfill depth of the block
  * @param allow_historical True to allow importing blocks older than local slot
+ * @param raw_block_ssz Optional raw SSZ bytes for the block
+ * @param raw_block_ssz_len Length of `raw_block_ssz`
  * @return true if block was imported successfully
  *
  * @note Thread safety: Acquires state_lock and pending_lock
@@ -394,7 +396,9 @@ bool lantern_client_import_block(
     const LanternRoot *block_root,
     const struct lantern_log_metadata *meta,
     uint32_t backfill_depth,
-    bool allow_historical);
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len);
 
 
 /**
@@ -409,6 +413,8 @@ bool lantern_client_import_block(
  * @param context   Description of source for logging
  * @param backfill_depth Backfill depth of the block
  * @param allow_historical True to allow importing blocks older than local slot
+ * @param raw_block_ssz Optional raw SSZ bytes for the block
+ * @param raw_block_ssz_len Length of `raw_block_ssz`
  *
  * @note Thread safety: Acquires state_lock via lantern_client_import_block
  */
@@ -419,7 +425,9 @@ void lantern_client_record_block(
     const char *peer_text,
     const char *context,
     uint32_t backfill_depth,
-    bool allow_historical);
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len);
 
 
 /**
@@ -446,12 +454,16 @@ void lantern_client_record_vote(
  *
  * @param block    Received block
  * @param from     Peer ID of sender
+ * @param raw_block_ssz Raw SSZ bytes for the received block (may be NULL)
+ * @param raw_block_ssz_len Length of `raw_block_ssz`
  * @param context  Client instance
  * @return 0 on success
  */
 int gossip_block_handler(
     const LanternSignedBlock *block,
     const peer_id_t *from,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
     void *context);
 
 

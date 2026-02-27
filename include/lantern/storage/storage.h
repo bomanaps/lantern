@@ -27,6 +27,11 @@ int lantern_storage_store_block_for_root(
     const char *data_dir,
     const LanternRoot *root,
     const LanternSignedBlock *block);
+int lantern_storage_store_invalid_block_bytes_for_root(
+    const char *data_dir,
+    const LanternRoot *root,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len);
 int lantern_storage_store_state_for_root(
     const char *data_dir,
     const LanternRoot *root,

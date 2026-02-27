@@ -279,9 +279,21 @@ int lantern_gossip_encode_signed_block_snappy(
 int lantern_gossip_decode_signed_block_snappy(
     LanternSignedBlock *block,
     const uint8_t *data,
-    size_t data_len) {
+    size_t data_len,
+    uint8_t **out_raw_block_ssz,
+    size_t *out_raw_block_ssz_len) {
     if (!block || !data) {
         return -1;
+    }
+    if ((out_raw_block_ssz && !out_raw_block_ssz_len)
+        || (!out_raw_block_ssz && out_raw_block_ssz_len)) {
+        return -1;
+    }
+    if (out_raw_block_ssz) {
+        *out_raw_block_ssz = NULL;
+    }
+    if (out_raw_block_ssz_len) {
+        *out_raw_block_ssz_len = 0;
     }
     size_t raw_len = 0;
     int raw_len_rc = lantern_snappy_uncompressed_length_raw(data, data_len, &raw_len);
@@ -328,13 +340,20 @@ int lantern_gossip_decode_signed_block_snappy(
         return -1;
     }
     int decode_rc = lantern_ssz_decode_signed_block(block, raw, written);
-    free(raw);
     if (decode_rc != 0) {
+        free(raw);
         return -1;
     }
     if (basic_block_sanity(block) != 0) {
+        free(raw);
         return -1;
     }
+    if (out_raw_block_ssz) {
+        *out_raw_block_ssz = raw;
+        *out_raw_block_ssz_len = written;
+        raw = NULL;
+    }
+    free(raw);
     return 0;
 }
 

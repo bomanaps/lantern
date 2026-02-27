@@ -234,6 +234,8 @@ static bool state_has_genesis_shape(const LanternState *state)
 int gossip_block_handler(
     const LanternSignedBlock *block,
     const peer_id_t *from,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
     void *context)
 {
     if (!block || !context)
@@ -245,7 +247,16 @@ int gossip_block_handler(
     char peer_text[PEER_TEXT_BUFFER_LEN];
     const char *peer_id_text = peer_id_to_text(from, peer_text, sizeof(peer_text));
 
-    lantern_client_record_block(client, block, NULL, peer_id_text, "gossip", 0, false);
+    lantern_client_record_block(
+        client,
+        block,
+        NULL,
+        peer_id_text,
+        "gossip",
+        0,
+        false,
+        raw_block_ssz,
+        raw_block_ssz_len);
     return LANTERN_CLIENT_OK;
 }
 
@@ -2530,7 +2541,9 @@ void lantern_client_process_pending_children(
                 &replays[i].root,
                 &meta,
                 replays[i].backfill_depth,
-                true);
+                true,
+                NULL,
+                0);
             if (imported)
             {
                 imported_count += 1u;

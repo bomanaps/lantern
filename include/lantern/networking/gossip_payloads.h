@@ -15,7 +15,9 @@ int lantern_gossip_encode_signed_block_snappy(
 int lantern_gossip_decode_signed_block_snappy(
     LanternSignedBlock *block,
     const uint8_t *data,
-    size_t data_len);
+    size_t data_len,
+    uint8_t **out_raw_block_ssz,
+    size_t *out_raw_block_ssz_len);
 
 int lantern_gossip_encode_signed_vote_snappy(
     const LanternSignedVote *vote,

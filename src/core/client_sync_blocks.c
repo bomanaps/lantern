@@ -34,6 +34,7 @@
 #include "lantern/storage/storage.h"
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
+#include "ssz_constants.h"
 
 
 /* ============================================================================
@@ -565,6 +566,144 @@ static void persist_block_after_import(
             "failed to persist block slot=%" PRIu64,
             block->message.block.slot);
     }
+}
+
+static size_t bitlist_encoded_size_bits(size_t bit_length)
+{
+    if (bit_length == 0)
+    {
+        return 1;
+    }
+    size_t byte_len = (bit_length + 7u) / 8u;
+    if ((bit_length % 8u) == 0)
+    {
+        return byte_len + 1u;
+    }
+    return byte_len;
+}
+
+static size_t signed_block_base_ssz_size(void)
+{
+    size_t block_fixed = (SSZ_BYTE_SIZE_OF_UINT64 * 2u)
+        + (LANTERN_ROOT_SIZE * 2u)
+        + SSZ_BYTE_SIZE_OF_UINT32;
+    size_t body_header = SSZ_BYTE_SIZE_OF_UINT32;
+    size_t message_base = SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_VOTE_SSZ_SIZE + block_fixed + body_header;
+    size_t offsets = SSZ_BYTE_SIZE_OF_UINT32 * 2u;
+    return offsets + message_base;
+}
+
+static size_t signed_block_max_ssz_size(void)
+{
+    size_t base = signed_block_base_ssz_size();
+    size_t att_bits_max = bitlist_encoded_size_bits(LANTERN_VALIDATOR_REGISTRY_LIMIT);
+    size_t att_entry_max = SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_ATTESTATION_DATA_SSZ_SIZE + att_bits_max;
+    size_t attestations_max = (size_t)LANTERN_MAX_ATTESTATIONS * (SSZ_BYTE_SIZE_OF_UINT32 + att_entry_max);
+    if (attestations_max > SIZE_MAX - base)
+    {
+        return SIZE_MAX;
+    }
+    size_t total = base + attestations_max;
+    size_t proof_entry_max = (SSZ_BYTE_SIZE_OF_UINT32 * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
+    size_t signatures_max = (SSZ_BYTE_SIZE_OF_UINT32 * 2u) + LANTERN_SIGNATURE_SIZE
+        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTE_SIZE_OF_UINT32 + proof_entry_max));
+    if (signatures_max > SIZE_MAX - total)
+    {
+        return SIZE_MAX;
+    }
+    return total + signatures_max;
+}
+
+static int encode_block_ssz(
+    const LanternSignedBlock *block,
+    uint8_t **out_data,
+    size_t *out_len)
+{
+    if (!block || !out_data || !out_len)
+    {
+        return -1;
+    }
+
+    *out_data = NULL;
+    *out_len = 0;
+
+    const size_t encoded_capacity = signed_block_max_ssz_size();
+    if (encoded_capacity == 0 || encoded_capacity == SIZE_MAX)
+    {
+        return -1;
+    }
+
+    uint8_t *buffer = malloc(encoded_capacity);
+    if (!buffer)
+    {
+        return -1;
+    }
+
+    size_t written = 0;
+    const int encode_rc = lantern_ssz_encode_signed_block(
+        block,
+        buffer,
+        encoded_capacity,
+        &written);
+    if (encode_rc != 0 || written == 0 || written > encoded_capacity)
+    {
+        free(buffer);
+        return -1;
+    }
+
+    *out_data = buffer;
+    *out_len = written;
+    return 0;
+}
+
+static void persist_invalid_block_on_state_transition_failure(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
+    const struct lantern_log_metadata *meta)
+{
+    if (!client || !client->data_dir || !block || !block_root)
+    {
+        return;
+    }
+
+    uint8_t *encoded_block = NULL;
+    size_t encoded_block_len = 0;
+    const uint8_t *bytes_to_write = raw_block_ssz;
+    size_t bytes_to_write_len = raw_block_ssz_len;
+
+    if (!bytes_to_write || bytes_to_write_len == 0)
+    {
+        if (encode_block_ssz(block, &encoded_block, &encoded_block_len) != 0)
+        {
+            lantern_log_warn(
+                "storage",
+                meta,
+                "failed to encode invalid block slot=%" PRIu64 " for persistence",
+                block->message.block.slot);
+            return;
+        }
+        bytes_to_write = encoded_block;
+        bytes_to_write_len = encoded_block_len;
+    }
+
+    if (lantern_storage_store_invalid_block_bytes_for_root(
+            client->data_dir,
+            block_root,
+            bytes_to_write,
+            bytes_to_write_len)
+        != 0)
+    {
+        lantern_log_warn(
+            "storage",
+            meta,
+            "failed to persist invalid block slot=%" PRIu64,
+            block->message.block.slot);
+    }
+
+    free(encoded_block);
 }
 
 
@@ -1975,6 +2114,8 @@ static void log_imported_block(
  * @param block_root  Precomputed block root (may be NULL)
  * @param meta        Logging metadata
  * @param backfill_depth Backfill depth of the block
+ * @param raw_block_ssz Optional raw SSZ bytes for the block
+ * @param raw_block_ssz_len Length of `raw_block_ssz`
  * @return true if block was imported successfully
  *
  * @note Thread safety: Acquires state_lock and pending_lock
@@ -1985,7 +2126,9 @@ bool lantern_client_import_block(
     const LanternRoot *block_root,
     const struct lantern_log_metadata *meta,
     uint32_t backfill_depth,
-    bool allow_historical)
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len)
 {
     if (!client || !block || !client->has_state)
     {
@@ -2172,6 +2315,13 @@ bool lantern_client_import_block(
             }
             else
             {
+                persist_invalid_block_on_state_transition_failure(
+                    client,
+                    block,
+                    &block_root_local,
+                    raw_block_ssz,
+                    raw_block_ssz_len,
+                    meta);
                 lantern_log_warn(
                     "state",
                     meta,
@@ -2304,6 +2454,13 @@ bool lantern_client_import_block(
 
     if (!apply_state_transition_locked(client, block, meta))
     {
+        persist_invalid_block_on_state_transition_failure(
+            client,
+            block,
+            &block_root_local,
+            raw_block_ssz,
+            raw_block_ssz_len,
+            meta);
         goto cleanup;
     }
 
@@ -2369,6 +2526,8 @@ cleanup:
  * @param peer_text Peer ID string (may be NULL)
  * @param context   Description of source for logging
  * @param backfill_depth Backfill depth of the block
+ * @param raw_block_ssz Optional raw SSZ bytes for the block
+ * @param raw_block_ssz_len Length of `raw_block_ssz`
  *
  * @note Thread safety: Acquires state_lock via lantern_client_import_block
  */
@@ -2379,7 +2538,9 @@ void lantern_client_record_block(
     const char *peer_text,
     const char *context,
     uint32_t backfill_depth,
-    bool allow_historical)
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len)
 {
     if (!client || !block)
     {
@@ -2447,5 +2608,7 @@ void lantern_client_record_block(
         selected_root,
         &meta,
         backfill_depth,
-        allow_historical);
+        allow_historical,
+        raw_block_ssz,
+        raw_block_ssz_len);
 }

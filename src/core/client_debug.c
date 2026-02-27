@@ -57,7 +57,7 @@ int lantern_client_debug_gossip_block(
     {
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
-    return gossip_block_handler(block, NULL, client);
+    return gossip_block_handler(block, NULL, NULL, 0, client);
 }
 
 int lantern_client_debug_gossip_vote(
@@ -115,7 +115,9 @@ int lantern_client_debug_import_block(
                    .validator = client->node_id,
                    .peer = peer_id_text},
                0,
-               true)
+               true,
+               NULL,
+               0)
         ? 1
         : 0;
 }

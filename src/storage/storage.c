@@ -29,6 +29,7 @@
 #define LANTERN_STORAGE_VOTES_MAGIC "LNVOTES\0"
 #define LANTERN_STORAGE_VOTES_VERSION 3u
 #define LANTERN_STORAGE_BLOCKS_DIR "blocks"
+#define LANTERN_STORAGE_INVALID_BLOCKS_DIR "invalid_blocks"
 #define LANTERN_STORAGE_STATES_DIR "states"
 #define LANTERN_STORAGE_INDICES_DIR "indices"
 #define LANTERN_STORAGE_SLOT_INDEX_DIR "slots"
@@ -512,6 +513,10 @@ static int build_blocks_dir(const char *data_dir, char **out_path) {
     return join_path(data_dir, LANTERN_STORAGE_BLOCKS_DIR, out_path);
 }
 
+static int build_invalid_blocks_dir(const char *data_dir, char **out_path) {
+    return join_path(data_dir, LANTERN_STORAGE_INVALID_BLOCKS_DIR, out_path);
+}
+
 static int build_states_dir(const char *data_dir, char **out_path) {
     return join_path(data_dir, LANTERN_STORAGE_STATES_DIR, out_path);
 }
@@ -544,6 +549,7 @@ int lantern_storage_prepare(const char *data_dir) {
 
     int rc = -1;
     char *blocks_dir = NULL;
+    char *invalid_blocks_dir = NULL;
     char *states_dir = NULL;
     char *indices_dir = NULL;
     char *slot_dir = NULL;
@@ -555,6 +561,12 @@ int lantern_storage_prepare(const char *data_dir) {
         goto cleanup;
     }
     if (ensure_directory(blocks_dir) != 0) {
+        goto cleanup;
+    }
+    if (build_invalid_blocks_dir(data_dir, &invalid_blocks_dir) != 0) {
+        goto cleanup;
+    }
+    if (ensure_directory(invalid_blocks_dir) != 0) {
         goto cleanup;
     }
     if (build_states_dir(data_dir, &states_dir) != 0) {
@@ -580,6 +592,7 @@ int lantern_storage_prepare(const char *data_dir) {
 
 cleanup:
     free_path(blocks_dir);
+    free_path(invalid_blocks_dir);
     free_path(states_dir);
     free_path(indices_dir);
     free_path(slot_dir);
@@ -1051,6 +1064,47 @@ int lantern_storage_store_block_for_root(
         return -1;
     }
     return storage_store_block_internal(data_dir, block, root);
+}
+
+int lantern_storage_store_invalid_block_bytes_for_root(
+    const char *data_dir,
+    const LanternRoot *root,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len) {
+    if (!data_dir || !root || !raw_block_ssz || raw_block_ssz_len == 0) {
+        return -1;
+    }
+
+    int rc = -1;
+    char *invalid_blocks_dir = NULL;
+    char *block_path = NULL;
+
+    if (build_invalid_blocks_dir(data_dir, &invalid_blocks_dir) != 0) {
+        goto cleanup;
+    }
+    if (ensure_directory(invalid_blocks_dir) != 0) {
+        goto cleanup;
+    }
+
+    char root_hex[2u * LANTERN_ROOT_SIZE + 1u];
+    if (lantern_bytes_to_hex(root->bytes, LANTERN_ROOT_SIZE, root_hex, sizeof(root_hex), 0) != 0) {
+        goto cleanup;
+    }
+    char filename[sizeof(root_hex) + 4];
+    const int wrote = snprintf(filename, sizeof(filename), "%s.ssz", root_hex);
+    if (wrote < 0 || (size_t)wrote >= sizeof(filename)) {
+        goto cleanup;
+    }
+    if (join_path(invalid_blocks_dir, filename, &block_path) != 0) {
+        goto cleanup;
+    }
+
+    rc = write_atomic_file(block_path, raw_block_ssz, raw_block_ssz_len);
+
+cleanup:
+    free_path(block_path);
+    free_path(invalid_blocks_dir);
+    return rc;
 }
 
 /**

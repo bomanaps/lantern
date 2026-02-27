@@ -260,6 +260,14 @@ int main(void) {
     expect_zero(lantern_storage_store_block(base_dir, &block), "store block");
     /* store again to ensure idempotent */
     expect_zero(lantern_storage_store_block(base_dir, &block), "store block duplicate");
+    const uint8_t invalid_payload[] = {0xDE, 0xAD, 0xBE, 0xEF};
+    expect_zero(
+        lantern_storage_store_invalid_block_bytes_for_root(
+            base_dir,
+            &block_root,
+            invalid_payload,
+            sizeof(invalid_payload)),
+        "store invalid block bytes");
 
     LanternSignedBlockList response;
     lantern_signed_block_list_init(&response);
@@ -332,6 +340,7 @@ int main(void) {
     char votes_path[PATH_MAX];
     char meta_path[PATH_MAX];
     char blocks_dir[PATH_MAX];
+    char invalid_blocks_dir[PATH_MAX];
     char states_dir[PATH_MAX];
     char indices_dir[PATH_MAX];
     char slot_index_dir[PATH_MAX];
@@ -343,6 +352,8 @@ int main(void) {
     assert(written > 0 && (size_t)written < sizeof(meta_path));
     written = snprintf(blocks_dir, sizeof(blocks_dir), "%s/%s", base_dir, "blocks");
     assert(written > 0 && (size_t)written < sizeof(blocks_dir));
+    written = snprintf(invalid_blocks_dir, sizeof(invalid_blocks_dir), "%s/%s", base_dir, "invalid_blocks");
+    assert(written > 0 && (size_t)written < sizeof(invalid_blocks_dir));
     written = snprintf(states_dir, sizeof(states_dir), "%s/%s", base_dir, "states");
     assert(written > 0 && (size_t)written < sizeof(states_dir));
     written = snprintf(indices_dir, sizeof(indices_dir), "%s/%s", base_dir, "indices");
@@ -351,12 +362,25 @@ int main(void) {
     assert(written > 0 && (size_t)written < sizeof(slot_index_dir));
 
     char block_path[PATH_MAX];
+    char invalid_block_path[PATH_MAX];
     char root_hex[2u * LANTERN_ROOT_SIZE + 1u];
     expect_zero(lantern_bytes_to_hex(block_root.bytes, LANTERN_ROOT_SIZE, root_hex, sizeof(root_hex), 0), "hex root");
     written = snprintf(block_path, sizeof(block_path), "%s/%s.ssz", blocks_dir, root_hex);
     assert(written > 0 && (size_t)written < sizeof(block_path));
+    written = snprintf(invalid_block_path, sizeof(invalid_block_path), "%s/%s.ssz", invalid_blocks_dir, root_hex);
+    assert(written > 0 && (size_t)written < sizeof(invalid_block_path));
+
+    FILE *invalid_fp = fopen(invalid_block_path, "rb");
+    assert(invalid_fp != NULL);
+    uint8_t invalid_readback[sizeof(invalid_payload)];
+    size_t invalid_read = fread(invalid_readback, 1u, sizeof(invalid_readback), invalid_fp);
+    assert(invalid_read == sizeof(invalid_readback));
+    assert(memcmp(invalid_readback, invalid_payload, sizeof(invalid_readback)) == 0);
+    assert(fgetc(invalid_fp) == EOF);
+    fclose(invalid_fp);
 
     cleanup_path(block_path);
+    cleanup_path(invalid_block_path);
     expect_zero(
         lantern_bytes_to_hex(legacy_block_root.bytes, LANTERN_ROOT_SIZE, root_hex, sizeof(root_hex), 0),
         "legacy hex root");
@@ -364,6 +388,7 @@ int main(void) {
     assert(written > 0 && (size_t)written < sizeof(block_path));
     cleanup_path(block_path);
     cleanup_dir(blocks_dir);
+    cleanup_dir(invalid_blocks_dir);
     cleanup_dir(slot_index_dir);
     cleanup_dir(indices_dir);
     cleanup_dir(states_dir);

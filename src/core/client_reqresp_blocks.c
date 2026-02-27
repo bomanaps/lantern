@@ -194,7 +194,6 @@ static bool lantern_client_process_stream_block_chunk(
         free(chunk);
         return false;
     }
-    free(raw_block);
 
     LanternRoot computed = {{0}};
     if (lantern_hash_tree_root_block(&streamed_block.message.block, &computed) != 0)
@@ -205,6 +204,7 @@ static bool lantern_client_process_stream_block_chunk(
             "failed to hash streamed block slot=%" PRIu64,
             streamed_block.message.block.slot);
         lantern_signed_block_with_attestation_reset(&streamed_block);
+        free(raw_block);
         free(chunk);
         return true;
     }
@@ -265,8 +265,11 @@ static bool lantern_client_process_stream_block_chunk(
         ctx->peer_text[0] ? ctx->peer_text : NULL,
         "reqresp",
         backfill_depth,
-        true);
+        true,
+        raw_block,
+        written);
     lantern_signed_block_with_attestation_reset(&streamed_block);
+    free(raw_block);
     if (saw_block)
     {
         *saw_block = true;

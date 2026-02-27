@@ -455,6 +455,8 @@ static libp2p_gossipsub_validation_result_t gossipsub_block_validator(
 
     LanternSignedBlock block;
     lantern_signed_block_with_attestation_init(&block);
+    uint8_t *raw_block_ssz = NULL;
+    size_t raw_block_ssz_len = 0;
 
     libp2p_gossipsub_validation_result_t result = LIBP2P_GOSSIPSUB_VALIDATION_ACCEPT;
     char peer_text[128];
@@ -474,7 +476,13 @@ static libp2p_gossipsub_validation_result_t gossipsub_block_validator(
         "block gossip message received bytes=%zu from_peer=%s",
         msg->data_len,
         peer_text[0] ? peer_text : "(local)");
-    if (lantern_gossip_decode_signed_block_snappy(&block, msg->data, msg->data_len) != 0) {
+    if (lantern_gossip_decode_signed_block_snappy(
+            &block,
+            msg->data,
+            msg->data_len,
+            &raw_block_ssz,
+            &raw_block_ssz_len)
+        != 0) {
         lantern_log_warn(
             "gossip",
             &meta,
@@ -484,7 +492,13 @@ static libp2p_gossipsub_validation_result_t gossipsub_block_validator(
         goto cleanup;
     }
 
-    if (service->block_handler(&block, msg->from, service->block_handler_user_data) != 0)
+    if (service->block_handler(
+            &block,
+            msg->from,
+            raw_block_ssz,
+            raw_block_ssz_len,
+            service->block_handler_user_data)
+        != 0)
     {
         result = LIBP2P_GOSSIPSUB_VALIDATION_IGNORE;
     }
@@ -520,6 +534,7 @@ static libp2p_gossipsub_validation_result_t gossipsub_block_validator(
     }
 
 cleanup:
+    free(raw_block_ssz);
     lantern_signed_block_with_attestation_reset(&block);
     return result;
 }

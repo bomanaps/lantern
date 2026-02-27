@@ -25,6 +25,8 @@ struct lantern_gossipsub_config {
 typedef int (*lantern_gossipsub_block_handler)(
     const LanternSignedBlock *block,
     const peer_id_t *from,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
     void *user_data);
 typedef int (*lantern_gossipsub_vote_handler)(
     const LanternSignedVote *vote,
