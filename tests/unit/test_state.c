@@ -989,6 +989,315 @@ static int test_pruning_keeps_pending_justifications(void) {
     return 0;
 }
 
+static int test_pending_votes_survive_interleaved_justification_and_finalization(void) {
+    LanternState state;
+    lantern_state_init(&state);
+    const uint64_t validator_count = 5;
+    expect_zero(
+        lantern_state_generate_genesis(&state, 780, validator_count),
+        "genesis for interleaved pending votes test");
+
+    const uint64_t finalized_slot = 334u;
+    const uint64_t justified_slot = 340u;
+    const uint64_t target_justified_slot = 343u;
+    const uint64_t target_pending_slot = 350u;
+    const uint64_t block_slot = 354u;
+    const uint64_t offset = finalized_slot + 1u;
+    const size_t validator_count_sz = (size_t)validator_count;
+
+    populate_historical_hashes_for_tests(&state, target_pending_slot);
+
+    state.latest_finalized.slot = finalized_slot;
+    state.latest_finalized.root = get_historical_root_for_tests(&state, finalized_slot);
+    state.latest_justified.slot = justified_slot;
+    state.latest_justified.root = get_historical_root_for_tests(&state, justified_slot);
+
+    state.justified_slots_offset = offset;
+    expect_zero(
+        lantern_bitlist_resize(&state.justified_slots, (size_t)(target_pending_slot - offset + 1u)),
+        "resize justified slots for interleaved pending votes test");
+    assert(state.justified_slots.bytes != NULL);
+    memset(state.justified_slots.bytes, 0, state.justified_slots.capacity);
+    mark_slot_justified_for_tests(&state, justified_slot);
+
+    LanternCheckpoint source = state.latest_justified;
+
+    LanternCheckpoint target_justified = source;
+    target_justified.slot = target_justified_slot;
+    target_justified.root = get_historical_root_for_tests(&state, target_justified.slot);
+
+    LanternCheckpoint target_pending = source;
+    target_pending.slot = target_pending_slot;
+    target_pending.root = get_historical_root_for_tests(&state, target_pending.slot);
+
+    expect_zero(
+        lantern_root_list_resize(&state.justification_roots, 2),
+        "resize pending roots for interleaved pending votes test");
+    state.justification_roots.items[0] = target_justified.root;
+    state.justification_roots.items[1] = target_pending.root;
+
+    expect_zero(
+        lantern_bitlist_resize(&state.justification_validators, 2u * validator_count_sz),
+        "resize pending validator bits for interleaved pending votes test");
+    assert(state.justification_validators.bytes != NULL);
+    memset(state.justification_validators.bytes, 0, state.justification_validators.capacity);
+
+    /* Pre-slot-354 pending votes:
+     *   root@343 -> validators {0,2,4}
+     *   root@350 -> validators {0,3}
+     */
+    expect_zero(
+        lantern_bitlist_set(&state.justification_validators, 0, true),
+        "seed root@343 vote for validator 0");
+    expect_zero(
+        lantern_bitlist_set(&state.justification_validators, 2, true),
+        "seed root@343 vote for validator 2");
+    expect_zero(
+        lantern_bitlist_set(&state.justification_validators, 4, true),
+        "seed root@343 vote for validator 4");
+    expect_zero(
+        lantern_bitlist_set(&state.justification_validators, validator_count_sz + 0u, true),
+        "seed root@350 vote for validator 0");
+    expect_zero(
+        lantern_bitlist_set(&state.justification_validators, validator_count_sz + 3u, true),
+        "seed root@350 vote for validator 3");
+
+    LanternAttestations attestations;
+    lantern_attestations_init(&attestations);
+    LanternSignatureList signatures;
+    lantern_signature_list_init(&signatures);
+    expect_zero(
+        lantern_attestations_resize(&attestations, 4),
+        "resize attestations for interleaved pending votes test");
+    expect_zero(
+        lantern_signature_list_resize(&signatures, 4),
+        "resize signatures for interleaved pending votes test");
+
+    build_vote(
+        &attestations.data[0],
+        &signatures.data[0],
+        2,
+        block_slot,
+        &source,
+        &target_justified,
+        0xA1);
+    build_vote(
+        &attestations.data[1],
+        &signatures.data[1],
+        3,
+        block_slot,
+        &source,
+        &target_justified,
+        0xA2);
+    build_vote(
+        &attestations.data[2],
+        &signatures.data[2],
+        0,
+        block_slot,
+        &source,
+        &target_pending,
+        0xA3);
+    build_vote(
+        &attestations.data[3],
+        &signatures.data[3],
+        4,
+        block_slot,
+        &source,
+        &target_pending,
+        0xA4);
+
+    expect_zero(
+        lantern_state_process_attestations(&state, &attestations, &signatures),
+        "process interleaved pending votes");
+
+    assert(state.latest_justified.slot == target_justified.slot);
+    assert(state.latest_finalized.slot == source.slot);
+    assert(state.justification_roots.length == 1);
+    assert(memcmp(
+               state.justification_roots.items[0].bytes,
+               target_pending.root.bytes,
+               LANTERN_ROOT_SIZE)
+           == 0);
+    assert(state.justification_validators.bit_length == validator_count_sz);
+
+    const bool expected_votes[5] = {true, false, false, true, true};
+    for (size_t i = 0; i < validator_count_sz; ++i) {
+        bool voted = bitlist_test_bit(&state.justification_validators, i);
+        if (voted != expected_votes[i]) {
+            fprintf(
+                stderr,
+                "unexpected vote bit for validator %zu: expected=%d got=%d\n",
+                i,
+                expected_votes[i] ? 1 : 0,
+                voted ? 1 : 0);
+            lantern_attestations_reset(&attestations);
+            lantern_signature_list_reset(&signatures);
+            lantern_state_reset(&state);
+            return 1;
+        }
+    }
+
+    lantern_attestations_reset(&attestations);
+    lantern_signature_list_reset(&signatures);
+    lantern_state_reset(&state);
+    return 0;
+}
+
+static int test_pending_votes_preserved_when_new_root_inserts_before_existing_root(void) {
+    LanternState state;
+    lantern_state_init(&state);
+    const uint64_t validator_count = 5;
+    expect_zero(
+        lantern_state_generate_genesis(&state, 790, validator_count),
+        "genesis for insertion-order pending votes test");
+
+    const uint64_t finalized_slot = 334u;
+    const uint64_t justified_slot = 340u;
+    const uint64_t target_justified_slot = 343u;
+    const uint64_t target_pending_slot = 350u;
+    const uint64_t offset = finalized_slot + 1u;
+    const size_t validator_count_sz = (size_t)validator_count;
+
+    populate_historical_hashes_for_tests(&state, target_pending_slot);
+
+    state.latest_finalized.slot = finalized_slot;
+    state.latest_finalized.root = get_historical_root_for_tests(&state, finalized_slot);
+    state.latest_justified.slot = justified_slot;
+    state.latest_justified.root = get_historical_root_for_tests(&state, justified_slot);
+
+    state.justified_slots_offset = offset;
+    expect_zero(
+        lantern_bitlist_resize(&state.justified_slots, (size_t)(target_pending_slot - offset + 1u)),
+        "resize justified slots for insertion-order pending votes test");
+    assert(state.justified_slots.bytes != NULL);
+    memset(state.justified_slots.bytes, 0, state.justified_slots.capacity);
+    mark_slot_justified_for_tests(&state, justified_slot);
+
+    LanternCheckpoint source = state.latest_justified;
+
+    LanternCheckpoint target_justified = source;
+    target_justified.slot = target_justified_slot;
+    target_justified.root = get_historical_root_for_tests(&state, target_justified.slot);
+
+    LanternCheckpoint target_pending = source;
+    target_pending.slot = target_pending_slot;
+    target_pending.root = get_historical_root_for_tests(&state, target_pending.slot);
+
+    LanternAttestations attestations;
+    lantern_attestations_init(&attestations);
+    LanternSignatureList signatures;
+    lantern_signature_list_init(&signatures);
+
+    /* Step 1: create pending root@350 with votes {0,3}. */
+    expect_zero(lantern_attestations_resize(&attestations, 2), "resize step1 attestations");
+    expect_zero(lantern_signature_list_resize(&signatures, 2), "resize step1 signatures");
+    build_vote(
+        &attestations.data[0],
+        &signatures.data[0],
+        0,
+        352,
+        &source,
+        &target_pending,
+        0xB1);
+    build_vote(
+        &attestations.data[1],
+        &signatures.data[1],
+        3,
+        352,
+        &source,
+        &target_pending,
+        0xB2);
+    expect_zero(
+        lantern_state_process_attestations(&state, &attestations, &signatures),
+        "process insertion-order step1");
+
+    /* Step 2: add root@343 with votes {0,2,4}. This must insert before root@350. */
+    expect_zero(lantern_attestations_resize(&attestations, 3), "resize step2 attestations");
+    expect_zero(lantern_signature_list_resize(&signatures, 3), "resize step2 signatures");
+    build_vote(
+        &attestations.data[0],
+        &signatures.data[0],
+        0,
+        353,
+        &source,
+        &target_justified,
+        0xB3);
+    build_vote(
+        &attestations.data[1],
+        &signatures.data[1],
+        2,
+        353,
+        &source,
+        &target_justified,
+        0xB4);
+    build_vote(
+        &attestations.data[2],
+        &signatures.data[2],
+        4,
+        353,
+        &source,
+        &target_justified,
+        0xB5);
+    expect_zero(
+        lantern_state_process_attestations(&state, &attestations, &signatures),
+        "process insertion-order step2");
+
+    /* Step 3: justify root@343 and add one more vote to root@350. */
+    expect_zero(lantern_attestations_resize(&attestations, 2), "resize step3 attestations");
+    expect_zero(lantern_signature_list_resize(&signatures, 2), "resize step3 signatures");
+    build_vote(
+        &attestations.data[0],
+        &signatures.data[0],
+        3,
+        354,
+        &source,
+        &target_justified,
+        0xB6);
+    build_vote(
+        &attestations.data[1],
+        &signatures.data[1],
+        4,
+        354,
+        &source,
+        &target_pending,
+        0xB7);
+    expect_zero(
+        lantern_state_process_attestations(&state, &attestations, &signatures),
+        "process insertion-order step3");
+
+    assert(state.latest_justified.slot == target_justified.slot);
+    assert(state.latest_finalized.slot == source.slot);
+    assert(state.justification_roots.length == 1);
+    assert(memcmp(
+               state.justification_roots.items[0].bytes,
+               target_pending.root.bytes,
+               LANTERN_ROOT_SIZE)
+           == 0);
+    assert(state.justification_validators.bit_length == validator_count_sz);
+
+    const bool expected_votes[5] = {true, false, false, true, true};
+    for (size_t i = 0; i < validator_count_sz; ++i) {
+        bool voted = bitlist_test_bit(&state.justification_validators, i);
+        if (voted != expected_votes[i]) {
+            fprintf(
+                stderr,
+                "unexpected insertion-order vote bit for validator %zu: expected=%d got=%d\n",
+                i,
+                expected_votes[i] ? 1 : 0,
+                voted ? 1 : 0);
+            lantern_attestations_reset(&attestations);
+            lantern_signature_list_reset(&signatures);
+            lantern_state_reset(&state);
+            return 1;
+        }
+    }
+
+    lantern_attestations_reset(&attestations);
+    lantern_signature_list_reset(&signatures);
+    lantern_state_reset(&state);
+    return 0;
+}
+
 static int test_attestations_ignore_zero_hash_votes(void) {
     LanternState state;
     lantern_state_init(&state);
@@ -2419,6 +2728,12 @@ int main(void) {
         return 1;
     }
     if (test_pruning_keeps_pending_justifications() != 0) {
+        return 1;
+    }
+    if (test_pending_votes_survive_interleaved_justification_and_finalization() != 0) {
+        return 1;
+    }
+    if (test_pending_votes_preserved_when_new_root_inserts_before_existing_root() != 0) {
         return 1;
     }
     if (test_attestations_ignore_zero_hash_votes() != 0) {
