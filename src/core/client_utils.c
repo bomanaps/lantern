@@ -127,7 +127,7 @@ uint64_t monotonic_millis(void)
     }
     millis *= CLIENT_UTILS_MILLIS_PER_SECOND;
 
-    uint64_t usec_part = (uint64_t)tv.tv_usec / CLIENT_UTILS_MICROS_PER_MILLI;
+    uint64_t usec_part = (uint64_t)tv.tv_usec / 1000ULL;
     if (millis > UINT64_MAX - usec_part)
     {
         return 0;
