@@ -976,10 +976,7 @@ int lantern_storage_load_votes(const char *data_dir, LanternState *state) {
     size_t signed_vote_size = 0;
     if (header.version == 1u) {
         has_signatures = false;
-    } else if (header.version == 2u) {
-        has_signatures = true;
-        signed_vote_size = LANTERN_SIGNED_VOTE_SSZ_SIZE_LEGACY;
-    } else if (header.version >= 3u) {
+    } else if (header.version >= 2u) {
         has_signatures = true;
         signed_vote_size = LANTERN_SIGNED_VOTE_SSZ_SIZE;
     } else {
@@ -1053,6 +1050,10 @@ int lantern_storage_load_votes(const char *data_dir, LanternState *state) {
             }
         }
         records_read++;
+    }
+    if (remaining != 0) {
+        rc = -1;
+        goto cleanup;
     }
 
     rc = 0;

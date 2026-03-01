@@ -60,22 +60,6 @@ static void expect_bytes_equal(
     }
 }
 
-static void expect_bytes_equal_or_legacy(
-    const uint8_t *expected,
-    size_t expected_len,
-    const uint8_t *actual,
-    size_t actual_len,
-    const uint8_t *legacy,
-    size_t legacy_len) {
-    if (expected_len == actual_len && memcmp(expected, actual, expected_len) == 0) {
-        return;
-    }
-    if (expected_len == legacy_len && memcmp(expected, legacy, expected_len) == 0) {
-        return;
-    }
-    expect_bytes_equal(expected, expected_len, actual, actual_len);
-}
-
 static void maybe_dump_vector(
     const char *env_var,
     const char *label,
@@ -422,7 +406,7 @@ static void test_signed_vote_signature_validation(void) {
 
     LanternSignedVote decoded;
     memset(&decoded, 0, sizeof(decoded));
-    const size_t signature_offset = LANTERN_VOTE_SSZ_SIZE + sizeof(uint32_t);
+    const size_t signature_offset = LANTERN_VOTE_SSZ_SIZE;
     buffer[signature_offset] ^= 0xAA;
     assert(lantern_ssz_decode_signed_vote(&decoded, buffer, sizeof(buffer)) == 0);
     assert(memcmp(&buffer[signature_offset], decoded.signature.bytes, LANTERN_SIGNATURE_SIZE) == 0);
@@ -974,18 +958,17 @@ static void test_signed_block_decode_attestation_signatures_only(void) {
 
     const uint8_t *signatures = encoded + signatures_offset;
     size_t signatures_len = encoded_len - signatures_offset;
-    if (signatures_len < (sizeof(uint32_t) * 2u)) {
+    if (signatures_len < (sizeof(uint32_t) + LANTERN_SIGNATURE_SIZE)) {
         fprintf(stderr, "signature section too short in test fixture\n");
         abort();
     }
     uint32_t att_offset = read_u32_le_test(signatures);
-    uint32_t proposer_offset = read_u32_le_test(signatures + sizeof(uint32_t));
-    if (att_offset != (sizeof(uint32_t) * 2u) || proposer_offset < att_offset || proposer_offset > signatures_len) {
+    if (att_offset != (sizeof(uint32_t) + LANTERN_SIGNATURE_SIZE) || att_offset > signatures_len) {
         fprintf(stderr, "invalid signature subsection offsets in test fixture\n");
         abort();
     }
 
-    size_t attestation_sigs_len = proposer_offset - att_offset;
+    size_t attestation_sigs_len = signatures_len - att_offset;
     size_t attestation_only_len = signatures_offset + attestation_sigs_len;
     uint8_t *attestation_only = malloc(attestation_only_len);
     if (!attestation_only) {
@@ -1049,7 +1032,7 @@ static void test_signed_block_decode_attestation_signatures_only_empty(void) {
         abort();
     }
 
-    /* Old layout: signatures section is an empty attestation_signatures list. */
+    /* Compatibility layout: signatures section omitted (decoded as empty list). */
     size_t attestation_only_len = signatures_offset;
 
     LanternSignedBlock decoded;
@@ -1218,28 +1201,18 @@ static void test_leanspec_vectors(void) {
     LanternSignedVote signed_vote_a_expected;
     build_signed_vote_vector_a(&signed_vote_a_expected);
     uint8_t signed_vote_a_encoded[LANTERN_SIGNED_VOTE_SSZ_SIZE];
-    uint8_t signed_vote_a_encoded_legacy[LANTERN_SIGNED_VOTE_SSZ_SIZE_LEGACY];
     written = 0;
     expect_ok(lantern_ssz_encode_signed_vote(&signed_vote_a_expected,
                                              signed_vote_a_encoded,
                                              sizeof(signed_vote_a_encoded),
                                              &written),
               "signed vote A encode");
-    size_t legacy_written = 0;
-    expect_ok(lantern_ssz_encode_signed_vote_legacy(
-                  &signed_vote_a_expected,
-                  signed_vote_a_encoded_legacy,
-                  sizeof(signed_vote_a_encoded_legacy),
-                  &legacy_written),
-              "signed vote A legacy encode");
     maybe_dump_vector("LANTERN_DUMP_SSZ_SIGNED_VOTE_A", "LANTERN_SSZ_VECTOR_SIGNED_VOTE_A", signed_vote_a_encoded, written);
     g_current_test = "leanspec_signed_vote_a";
-    expect_bytes_equal_or_legacy(LANTERN_SSZ_VECTOR_SIGNED_VOTE_A,
-                                 sizeof(LANTERN_SSZ_VECTOR_SIGNED_VOTE_A),
-                                 signed_vote_a_encoded,
-                                 written,
-                                 signed_vote_a_encoded_legacy,
-                                 legacy_written);
+    expect_bytes_equal(LANTERN_SSZ_VECTOR_SIGNED_VOTE_A,
+                       sizeof(LANTERN_SSZ_VECTOR_SIGNED_VOTE_A),
+                       signed_vote_a_encoded,
+                       written);
     LanternSignedVote signed_vote_a_decoded = {0};
     expect_ok(lantern_ssz_decode_signed_vote(&signed_vote_a_decoded,
                                              LANTERN_SSZ_VECTOR_SIGNED_VOTE_A,
@@ -1250,28 +1223,18 @@ static void test_leanspec_vectors(void) {
     LanternSignedVote signed_vote_b_expected;
     build_signed_vote_vector_b(&signed_vote_b_expected);
     uint8_t signed_vote_b_encoded[LANTERN_SIGNED_VOTE_SSZ_SIZE];
-    uint8_t signed_vote_b_encoded_legacy[LANTERN_SIGNED_VOTE_SSZ_SIZE_LEGACY];
     written = 0;
     expect_ok(lantern_ssz_encode_signed_vote(&signed_vote_b_expected,
                                              signed_vote_b_encoded,
                                              sizeof(signed_vote_b_encoded),
                                              &written),
               "signed vote B encode");
-    legacy_written = 0;
-    expect_ok(lantern_ssz_encode_signed_vote_legacy(
-                  &signed_vote_b_expected,
-                  signed_vote_b_encoded_legacy,
-                  sizeof(signed_vote_b_encoded_legacy),
-                  &legacy_written),
-              "signed vote B legacy encode");
     maybe_dump_vector("LANTERN_DUMP_SSZ_SIGNED_VOTE_B", "LANTERN_SSZ_VECTOR_SIGNED_VOTE_B", signed_vote_b_encoded, written);
     g_current_test = "leanspec_signed_vote_b";
-    expect_bytes_equal_or_legacy(LANTERN_SSZ_VECTOR_SIGNED_VOTE_B,
-                                 sizeof(LANTERN_SSZ_VECTOR_SIGNED_VOTE_B),
-                                 signed_vote_b_encoded,
-                                 written,
-                                 signed_vote_b_encoded_legacy,
-                                 legacy_written);
+    expect_bytes_equal(LANTERN_SSZ_VECTOR_SIGNED_VOTE_B,
+                       sizeof(LANTERN_SSZ_VECTOR_SIGNED_VOTE_B),
+                       signed_vote_b_encoded,
+                       written);
     LanternSignedVote signed_vote_b_decoded = {0};
     expect_ok(lantern_ssz_decode_signed_vote(&signed_vote_b_decoded,
                                              LANTERN_SSZ_VECTOR_SIGNED_VOTE_B,
@@ -1379,26 +1342,16 @@ static void test_leanspec_vectors(void) {
                                               sizeof(signed_block_encoded),
                                               &written),
               "signed block encode");
-    uint8_t signed_block_encoded_legacy[SIGNED_BLOCK_TEST_BUFFER_SIZE];
-    size_t legacy_block_written = 0;
-    expect_ok(lantern_ssz_encode_signed_block_legacy(
-                  &signed_block_expected,
-                  signed_block_encoded_legacy,
-                  sizeof(signed_block_encoded_legacy),
-                  &legacy_block_written),
-              "signed block legacy encode");
     maybe_dump_vector(
         "LANTERN_DUMP_SSZ_SIGNED_BLOCK",
         "LANTERN_SSZ_VECTOR_SIGNED_BLOCK",
         signed_block_encoded,
         written);
     g_current_test = "leanspec_signed_block";
-    expect_bytes_equal_or_legacy(LANTERN_SSZ_VECTOR_SIGNED_BLOCK,
-                                 sizeof(LANTERN_SSZ_VECTOR_SIGNED_BLOCK),
-                                 signed_block_encoded,
-                                 written,
-                                 signed_block_encoded_legacy,
-                                 legacy_block_written);
+    expect_bytes_equal(LANTERN_SSZ_VECTOR_SIGNED_BLOCK,
+                       sizeof(LANTERN_SSZ_VECTOR_SIGNED_BLOCK),
+                       signed_block_encoded,
+                       written);
     LanternSignedBlock signed_block_decoded;
     lantern_signed_block_with_attestation_init(&signed_block_decoded);
     expect_ok(lantern_ssz_decode_signed_block(&signed_block_decoded,
