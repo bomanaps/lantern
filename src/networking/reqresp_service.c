@@ -2276,26 +2276,6 @@ static void *blocks_worker(void *arg) {
             &meta,
             "blocks_by_root response has zero blocks for peer=%s",
             peer_text[0] ? peer_text : "-");
-        if (send_response_chunk(
-                stream,
-                &meta,
-                protocol_id,
-                "blocks_by_root response (empty)",
-                peer_text[0] ? peer_text : NULL,
-                true,
-                LANTERN_REQRESP_RESPONSE_SUCCESS,
-                use_legacy_len,
-                NULL,
-                0,
-                0)
-            != 0) {
-            lantern_signed_block_list_reset(&response);
-            log_stream_error("write", protocol_id, peer_text[0] ? peer_text : NULL);
-            close_stream(stream);
-            free(ssz_buffer);
-            free(snappy_buffer);
-            return NULL;
-        }
     }
 
     for (size_t i = 0; i < block_count; ++i) {
