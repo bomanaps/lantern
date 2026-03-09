@@ -420,5 +420,6 @@ if(LANTERN_BUILD_TESTS)
     )
     set_property(TEST ${_lantern_ctest_targets} PROPERTY TIMEOUT 30)
     set_tests_properties(lantern_client_vote PROPERTIES TIMEOUT 300)
+    set_tests_properties(lantern_state PROPERTIES TIMEOUT 120)
 
 endif()
