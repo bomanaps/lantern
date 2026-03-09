@@ -46,131 +46,12 @@ enum
     ROOT_HEX_BUFFER_LEN = (LANTERN_ROOT_SIZE * 2u) + 3u,
 };
 
-#define LANTERN_STORAGE_STATE_META_VERSION 1u
-
-struct lantern_state_meta_wire
-{
-    uint32_t version;
-    uint32_t reserved;
-    uint64_t historical_roots_offset;
-    uint64_t justified_slots_offset;
-};
-
-static int load_state_meta_for_root(
-    const char *data_dir,
-    const LanternRoot *root,
-    struct lantern_state_meta_wire *out_meta)
-{
-    if (!data_dir || !root || !out_meta)
-    {
-        return -1;
-    }
-
-    char root_hex[(2u * LANTERN_ROOT_SIZE) + 1u];
-    if (lantern_bytes_to_hex(root->bytes, LANTERN_ROOT_SIZE, root_hex, sizeof(root_hex), 0) != 0)
-    {
-        return -1;
-    }
-
-    const size_t base_len = strlen(data_dir);
-    const bool needs_sep =
-        base_len > 0 && data_dir[base_len - 1u] != '/' && data_dir[base_len - 1u] != '\\';
-    const size_t path_len =
-        base_len + (needs_sep ? 1u : 0u) + strlen("states/") + strlen(root_hex) + strlen(".meta") + 1u;
-    char *meta_path = malloc(path_len);
-    if (!meta_path)
-    {
-        return -1;
-    }
-    const int path_written = snprintf(
-        meta_path,
-        path_len,
-        "%s%sstates/%s.meta",
-        data_dir,
-        needs_sep ? "/" : "",
-        root_hex);
-    if (path_written < 0 || (size_t)path_written >= path_len)
-    {
-        free(meta_path);
-        return -1;
-    }
-
-    int rc = -1;
-    FILE *fp = fopen(meta_path, "rb");
-    if (!fp)
-    {
-        free(meta_path);
-        return (errno == ENOENT) ? 1 : -1;
-    }
-
-    if (fseek(fp, 0, SEEK_END) != 0)
-    {
-        goto cleanup;
-    }
-    long file_size = ftell(fp);
-    if (file_size < 0 || (size_t)file_size != sizeof(*out_meta))
-    {
-        if (file_size == 0)
-        {
-            rc = 1;
-        }
-        goto cleanup;
-    }
-    if (fseek(fp, 0, SEEK_SET) != 0)
-    {
-        goto cleanup;
-    }
-
-    if (fread(out_meta, 1u, sizeof(*out_meta), fp) != sizeof(*out_meta))
-    {
-        goto cleanup;
-    }
-    if (out_meta->version != LANTERN_STORAGE_STATE_META_VERSION)
-    {
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    fclose(fp);
-    free(meta_path);
-    return rc;
-}
-
 static int prepare_off_head_snapshot_state(
     const char *data_dir,
     const LanternRoot *root,
     LanternState *state)
 {
     if (!data_dir || !root || !state)
-    {
-        return -1;
-    }
-
-    struct lantern_state_meta_wire meta = {0};
-    const int meta_rc = load_state_meta_for_root(data_dir, root, &meta);
-    if (meta_rc == 0)
-    {
-        state->historical_roots_offset = meta.historical_roots_offset;
-        state->justified_slots_offset = meta.justified_slots_offset;
-    }
-    else if (meta_rc == 1)
-    {
-        state->historical_roots_offset = 0;
-        state->justified_slots_offset =
-            state->latest_finalized.slot == UINT64_MAX ? 0u : (state->latest_finalized.slot + 1u);
-    }
-    else
-    {
-        return -1;
-    }
-
-    if (state->config.num_validators == 0)
-    {
-        return -1;
-    }
-    if (lantern_state_prepare_validator_votes(state, state->config.num_validators) != 0)
     {
         return -1;
     }
@@ -332,8 +213,6 @@ static bool signed_block_signatures_are_valid(
     const LanternAggregatedAttestations *attestations = &block->message.block.body.attestations;
     const LanternAttestationSignatures *sig_groups = &block->signatures.attestation_signatures;
     size_t att_count = attestations->length;
-    bool missing_attestation_signature_payload =
-        (att_count > 0) && (sig_groups->length == 0);
 
     if (!client->genesis.validator_registry.records)
     {
@@ -353,44 +232,32 @@ static bool signed_block_signatures_are_valid(
     }
     if (att_count != sig_groups->length)
     {
-        if (!missing_attestation_signature_payload)
-        {
-            lantern_log_warn(
-                "state",
-                meta,
-                "signed block slot=%" PRIu64 " aggregated signature count mismatch expected=%zu actual=%zu",
-                block->message.block.slot,
-                att_count,
-                sig_groups->length);
-            lantern_state_reset(&parent_state);
-            return false;
-        }
         lantern_log_warn(
             "state",
             meta,
-            "signed block slot=%" PRIu64 " missing attestation signatures payload; accepting legacy compatibility path attestation_count=%zu",
+            "signed block slot=%" PRIu64 " aggregated signature count mismatch expected=%zu actual=%zu",
             block->message.block.slot,
-            att_count);
+            att_count,
+            sig_groups->length);
+        lantern_state_reset(&parent_state);
+        return false;
     }
     if (att_count > 0 && !sig_groups->data)
     {
-        if (!missing_attestation_signature_payload)
-        {
-            lantern_log_warn(
-                "state",
-                meta,
-                "signed block slot=%" PRIu64 " missing aggregated signatures length=%zu",
-                block->message.block.slot,
-                sig_groups->length);
-            lantern_state_reset(&parent_state);
-            return false;
-        }
+        lantern_log_warn(
+            "state",
+            meta,
+            "signed block slot=%" PRIu64 " missing aggregated signatures length=%zu",
+            block->message.block.slot,
+            sig_groups->length);
+        lantern_state_reset(&parent_state);
+        return false;
     }
 
     size_t validator_count = lantern_state_validator_count(state_for_sig);
     const uint8_t **pubkeys = NULL;
 
-    for (size_t i = 0; i < att_count && !missing_attestation_signature_payload; ++i)
+    for (size_t i = 0; i < att_count; ++i)
     {
         const LanternAggregatedAttestation *att = &attestations->data[i];
         const LanternAggregatedSignatureProof *proof = &sig_groups->data[i];
@@ -481,23 +348,13 @@ static bool signed_block_signatures_are_valid(
     bool proposer_signature_present = !lantern_signature_is_zero(&block->signatures.proposer_signature);
     if (!proposer_signature_present)
     {
-        if (!missing_attestation_signature_payload)
-        {
-            lantern_log_warn(
-                "state",
-                meta,
-                "signed block slot=%" PRIu64 " missing proposer signature",
-                block->message.block.slot);
-            lantern_state_reset(&parent_state);
-            return false;
-        }
         lantern_log_warn(
             "state",
             meta,
-            "signed block slot=%" PRIu64 " missing proposer signature; accepting legacy compatibility path",
+            "signed block slot=%" PRIu64 " missing proposer signature",
             block->message.block.slot);
         lantern_state_reset(&parent_state);
-        return true;
+        return false;
     }
 
     LanternSignedVote proposer_signed = {0};
@@ -538,9 +395,10 @@ static void cache_block_aggregated_proofs_locked(
         if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != 0) {
             continue;
         }
-        (void)lantern_client_agg_proof_cache_add(
+        (void)lantern_client_add_new_aggregated_payload(
             client,
             &data_root,
+            &attestations->data[i].data,
             &proofs->data[i],
             attestations->data[i].data.target.slot);
     }
@@ -1087,6 +945,7 @@ static bool init_replay_state(const struct lantern_client *client, LanternState 
     }
 
     struct lantern_log_metadata meta = {.validator = client->node_id};
+    lantern_state_reset(out_state);
     lantern_state_init(out_state);
 
     if (client->genesis.state_bytes && client->genesis.state_size > 0)
@@ -1182,6 +1041,12 @@ static bool rebuild_state_for_root_locked(
     LanternRoot *out_missing_roots,
     size_t missing_roots_cap,
     size_t *out_missing_count);
+static void cache_rebuilt_state_for_root_locked(
+    struct lantern_client *client,
+    const LanternRoot *root,
+    const LanternState *state,
+    const struct lantern_log_metadata *meta,
+    const char *context);
 
 static bool state_matches_root(const LanternState *state, const LanternRoot *root)
 {
@@ -1241,6 +1106,7 @@ static bool load_snapshot_state_for_root_locked(
     if (lantern_ssz_decode_state(&decoded, state_bytes, state_len) == 0
         && prepare_off_head_snapshot_state(client->data_dir, root, &decoded) == 0)
     {
+        lantern_state_reset(out_state);
         *out_state = decoded;
         decoded_owned = false;
         loaded = true;
@@ -1290,6 +1156,20 @@ static bool load_replay_base_from_finalized_locked(
         }
     }
 
+    if (client->has_fork_choice)
+    {
+        const LanternState *cached_state =
+            lantern_fork_choice_block_state(&client->fork_choice, finalized_root);
+        if (cached_state && lantern_state_clone(cached_state, out_state) == 0)
+        {
+            if (out_source)
+            {
+                *out_source = "fork_choice_cache";
+            }
+            return true;
+        }
+    }
+
     if (client->data_dir && client->data_dir[0] != '\0')
     {
         LanternState persisted_finalized;
@@ -1310,6 +1190,12 @@ static bool load_replay_base_from_finalized_locked(
     size_t snapshot_len = 0;
     if (load_snapshot_state_for_root_locked(client, finalized_root, out_state, &snapshot_len))
     {
+        cache_rebuilt_state_for_root_locked(
+            client,
+            finalized_root,
+            out_state,
+            NULL,
+            "finalized_base_snapshot");
         if (out_source)
         {
             *out_source = "state_for_root";
@@ -1342,13 +1228,34 @@ static bool load_replay_base_from_finalized_locked(
 }
 
 static void cache_rebuilt_state_for_root_locked(
-    const struct lantern_client *client,
+    struct lantern_client *client,
     const LanternRoot *root,
     const LanternState *state,
     const struct lantern_log_metadata *meta,
     const char *context)
 {
-    if (!client || !root || !state || !client->data_dir || !client->data_dir[0])
+    if (!client || !root || !state)
+    {
+        return;
+    }
+
+    if (client->has_fork_choice
+        && lantern_fork_choice_set_block_state(&client->fork_choice, root, state) != 0)
+    {
+        char root_hex[ROOT_HEX_BUFFER_LEN];
+        struct lantern_log_metadata fallback_meta = {.validator = client->node_id};
+        const struct lantern_log_metadata *log_meta = meta ? meta : &fallback_meta;
+        format_root_hex(root, root_hex, sizeof(root_hex));
+        lantern_log_warn(
+            "forkchoice",
+            log_meta,
+            "failed to cache in-memory state root=%s slot=%" PRIu64 " context=%s",
+            root_hex[0] ? root_hex : "0x0",
+            state->slot,
+            context ? context : "unknown");
+    }
+
+    if (!client->data_dir || !client->data_dir[0])
     {
         return;
     }
@@ -1389,6 +1296,16 @@ const LanternState *lantern_client_state_for_root_locked(
         return &client->state;
     }
 
+    if (client->has_fork_choice)
+    {
+        const LanternState *cached_state =
+            lantern_fork_choice_block_state(&client->fork_choice, root);
+        if (cached_state)
+        {
+            return cached_state;
+        }
+    }
+
     if (!scratch)
     {
         return NULL;
@@ -1414,6 +1331,12 @@ const LanternState *lantern_client_state_for_root_locked(
                 if (prepare_off_head_snapshot_state(client->data_dir, root, scratch) == 0)
                 {
                     free(state_bytes);
+                    cache_rebuilt_state_for_root_locked(
+                        client,
+                        root,
+                        scratch,
+                        NULL,
+                        "state_for_root_snapshot");
                     if (out_is_scratch)
                     {
                         *out_is_scratch = true;
@@ -1431,12 +1354,6 @@ const LanternState *lantern_client_state_for_root_locked(
         lantern_state_reset(scratch);
         if (rebuild_state_for_root_locked(client, root, scratch, NULL, 0, NULL))
         {
-            cache_rebuilt_state_for_root_locked(
-                client,
-                root,
-                scratch,
-                NULL,
-                "state_for_root");
             if (out_is_scratch)
             {
                 *out_is_scratch = true;
@@ -1457,7 +1374,6 @@ static void adopt_state_locked(struct lantern_client *client, LanternState *stat
     }
     LanternState previous = client->state;
     client->state = *state;
-    lantern_state_attach_fork_choice(&client->state, &client->fork_choice);
     if (client->has_fork_choice)
     {
         if (lantern_fork_choice_update_checkpoints(
@@ -1488,6 +1404,7 @@ static bool rebuild_state_for_root_locked(
     {
         return false;
     }
+    lantern_state_reset(out_state);
     if (out_missing_count)
     {
         *out_missing_count = 0;
@@ -1496,6 +1413,30 @@ static bool rebuild_state_for_root_locked(
     struct lantern_log_metadata meta = {.validator = client->node_id};
     char target_hex[ROOT_HEX_BUFFER_LEN];
     format_root_hex(target_root, target_hex, sizeof(target_hex));
+
+    if (client->has_fork_choice)
+    {
+        const LanternState *cached_state =
+            lantern_fork_choice_block_state(&client->fork_choice, target_root);
+        if (cached_state)
+        {
+            if (lantern_state_clone(cached_state, out_state) == 0)
+            {
+                lantern_log_debug(
+                    "state",
+                    &meta,
+                    "rebuild_state used fork-choice cache target=%s",
+                    target_hex[0] ? target_hex : "0x0");
+                return true;
+            }
+            lantern_state_reset(out_state);
+            lantern_log_warn(
+                "state",
+                &meta,
+                "rebuild_state failed to clone fork-choice cache target=%s",
+                target_hex[0] ? target_hex : "0x0");
+        }
+    }
 
     /*
      * Fast path: if a post-state snapshot exists for this root, use it
@@ -1521,8 +1462,15 @@ static bool rebuild_state_for_root_locked(
             {
                 if (prepare_off_head_snapshot_state(client->data_dir, target_root, &snapshot) == 0)
                 {
+                    lantern_state_reset(out_state);
                     *out_state = snapshot;
                     free(state_bytes);
+                    cache_rebuilt_state_for_root_locked(
+                        client,
+                        target_root,
+                        out_state,
+                        &meta,
+                        "rebuild_snapshot");
                     lantern_log_debug(
                         "state",
                         &meta,
@@ -1782,6 +1730,7 @@ static bool rebuild_state_for_root_locked(
     bool success = false;
     if (use_finalized_shortcut)
     {
+        lantern_state_reset(out_state);
         *out_state = replay_base_state;
         lantern_state_init(&replay_base_state);
         have_replay_base_state = false;
@@ -1808,9 +1757,24 @@ static bool rebuild_state_for_root_locked(
         return false;
     }
 
+    LanternStore replay_store;
+    lantern_store_init(&replay_store);
+    if (lantern_store_prepare_validator_votes(&replay_store, out_state->config.num_validators) != 0)
+    {
+        lantern_signed_block_list_reset(&response);
+        root_chain_reset(&chain);
+        lantern_state_reset(out_state);
+        if (have_replay_base_state)
+        {
+            lantern_state_reset(&replay_base_state);
+        }
+        lantern_store_reset(&replay_store);
+        return false;
+    }
+
     for (size_t i = 0; i < response.length; ++i)
     {
-        int transition_rc = lantern_state_transition(out_state, &response.blocks[i]);
+        int transition_rc = lantern_state_transition(out_state, &replay_store, &response.blocks[i]);
         if (transition_rc != 0)
         {
             LanternRoot block_root = {0};
@@ -1834,16 +1798,24 @@ static bool rebuild_state_for_root_locked(
             {
                 lantern_state_reset(&replay_base_state);
             }
+            lantern_store_reset(&replay_store);
             return false;
         }
     }
 
+    lantern_store_reset(&replay_store);
     lantern_signed_block_list_reset(&response);
     root_chain_reset(&chain);
     if (have_replay_base_state)
     {
         lantern_state_reset(&replay_base_state);
     }
+    cache_rebuilt_state_for_root_locked(
+        client,
+        target_root,
+        out_state,
+        &meta,
+        "rebuild_state");
     return true;
 }
 
@@ -1949,6 +1921,7 @@ static bool add_competing_fork_block_locked(
     struct lantern_client *client,
     const LanternSignedBlock *block,
     const LanternRoot *block_root,
+    const LanternState *post_state,
     const LanternCheckpoint *post_justified,
     const LanternCheckpoint *post_finalized,
     const struct lantern_log_metadata *meta)
@@ -1962,13 +1935,14 @@ static bool add_competing_fork_block_locked(
     proposer_signed.data = block->message.proposer_attestation;
     proposer_signed.signature = block->signatures.proposer_signature;
 
-    if (lantern_fork_choice_add_block(
+    if (lantern_fork_choice_add_block_with_state(
             &client->fork_choice,
             &block->message.block,
             &proposer_signed,
             post_justified,
             post_finalized,
-            block_root) != 0)
+            block_root,
+            post_state) != 0)
     {
         return false;
     }
@@ -2042,13 +2016,10 @@ static bool validate_block_vote_constraints_locked(
                 &rejection))
         {
             /*
-             * Block attestations are advisory for fork-choice vote tracking.
-             * Do not fail block import here: state transition remains the
-             * consensus validity gate, and lantern_fork_choice_add_block()
-             * already best-effort applies block votes.
-             *
-             * This avoids deadlocking checkpoint-sync catch-up when
-             * attestations reference roots not yet restored locally.
+             * Block-body attestations only affect local fork-choice vote
+             * tracking. A valid block can carry attestations that reference
+             * roots we have not restored locally yet, so skip those votes and
+             * let block import continue.
              */
             skipped_constraints += 1u;
             if (rejection.has_unknown_root)
@@ -2061,7 +2032,7 @@ static bool validate_block_vote_constraints_locked(
                 lantern_log_debug(
                     "state",
                     meta,
-                    "ignoring block attestation unknown root=%s slot=%" PRIu64
+                    "skipping block attestation unknown root=%s slot=%" PRIu64
                     " block_slot=%" PRIu64,
                     unknown_hex[0] ? unknown_hex : "0x0",
                     rejection.unknown_slot,
@@ -2072,7 +2043,7 @@ static bool validate_block_vote_constraints_locked(
                 lantern_log_debug(
                     "state",
                     meta,
-                    "ignoring block attestation constraint failure block_slot=%" PRIu64
+                    "skipping block attestation constraint failure block_slot=%" PRIu64
                     " reason=%s",
                     block->message.block.slot,
                     rejection.message);
@@ -2121,7 +2092,7 @@ static bool apply_state_transition_locked(
     }
 
     LanternSignedBlock import_block = *block;
-    if (lantern_state_transition(&client->state, &import_block) != 0)
+    if (lantern_state_transition(&client->state, &client->store, &import_block) != 0)
     {
         lantern_log_warn(
             "state",
@@ -2155,7 +2126,7 @@ static void advance_fork_choice_time_locked(
     }
 
     uint64_t now_milliseconds = validator_wall_time_now_millis();
-    if (lantern_fork_choice_advance_time(&client->fork_choice, now_milliseconds, false) != 0)
+    if (lantern_client_advance_fork_choice_time_locked(client, now_milliseconds, false) != 0)
     {
         lantern_log_debug(
             "forkchoice",
@@ -2238,6 +2209,37 @@ static bool finalized_checkpoint_advanced(
     return false;
 }
 
+static bool finalized_slot_advanced(
+    const LanternCheckpoint *previous_finalized,
+    const LanternCheckpoint *current_finalized)
+{
+    if (!previous_finalized || !current_finalized)
+    {
+        return false;
+    }
+    return current_finalized->slot > previous_finalized->slot;
+}
+
+static void prune_finalized_attestation_material_if_slot_advanced_locked(
+    struct lantern_client *client,
+    const LanternCheckpoint *previous_finalized)
+{
+    if (!client || !previous_finalized)
+    {
+        return;
+    }
+
+    const LanternCheckpoint *current_finalized = &client->state.latest_finalized;
+    if (!finalized_slot_advanced(previous_finalized, current_finalized))
+    {
+        return;
+    }
+
+    (void)lantern_client_prune_finalized_attestation_material(
+        client,
+        current_finalized->slot);
+}
+
 static void persist_finalized_state_if_advanced_locked(
     const struct lantern_client *client,
     const LanternCheckpoint *previous_finalized,
@@ -2308,7 +2310,7 @@ static void persist_state_locked(
             "failed to persist state after slot=%" PRIu64,
             client->state.slot);
     }
-    if (lantern_storage_save_votes(client->data_dir, &client->state) != 0)
+    if (lantern_storage_save_votes(client->data_dir, &client->state, &client->store) != 0)
     {
         lantern_log_warn(
             "storage",
@@ -2632,12 +2634,11 @@ bool lantern_client_import_block(
         goto cleanup;
     }
 
-    cache_block_aggregated_proofs_locked(client, block);
-
     if (parent_off_head)
     {
         LanternRoot parent_root = block->message.block.parent_root;
         LanternState replay_state;
+        lantern_state_init(&replay_state);
         bool have_replay_state = false;
         bool processed = false;
         bool deferred = false;
@@ -2653,18 +2654,18 @@ bool lantern_client_import_block(
                 &missing_count))
         {
             have_replay_state = true;
-            cache_rebuilt_state_for_root_locked(
-                client,
-                &parent_root,
-                &replay_state,
-                meta,
-                "off_head_parent");
-            if (lantern_state_transition(&replay_state, block) == 0)
+            LanternStore replay_store;
+            lantern_store_init(&replay_store);
+            bool replay_store_ready =
+                lantern_store_prepare_validator_votes(&replay_store, replay_state.config.num_validators) == 0;
+            if (replay_store_ready
+                && lantern_state_transition(&replay_state, &replay_store, block) == 0)
             {
                 processed = add_competing_fork_block_locked(
                     client,
                     block,
                     &block_root_local,
+                    &replay_state,
                     &replay_state.latest_justified,
                     &replay_state.latest_finalized,
                     meta);
@@ -2684,6 +2685,7 @@ bool lantern_client_import_block(
                     "off-head state transition failed for slot=%" PRIu64,
                     block->message.block.slot);
             }
+            lantern_store_reset(&replay_store);
         }
         else
         {
@@ -2750,6 +2752,7 @@ bool lantern_client_import_block(
                 else
                 {
                     LanternState head_state;
+                    lantern_state_init(&head_state);
                     if (rebuild_state_for_root_locked(
                             client,
                             &fork_head,
@@ -2761,6 +2764,10 @@ bool lantern_client_import_block(
                         adopt_state_locked(client, &head_state);
                         adopted_state = true;
                     }
+                    else
+                    {
+                        lantern_state_reset(&head_state);
+                    }
                 }
             }
         }
@@ -2771,9 +2778,9 @@ bool lantern_client_import_block(
                 client,
                 &pre_adopt_finalized,
                 meta);
-            (void)lantern_client_agg_proof_cache_prune_finalized(
+            prune_finalized_attestation_material_if_slot_advanced_locked(
                 client,
-                client->state.latest_finalized.slot);
+                &pre_adopt_finalized);
             persist_state_locked(client, meta);
         }
 
@@ -2823,13 +2830,15 @@ bool lantern_client_import_block(
         goto cleanup;
     }
 
+    cache_block_aggregated_proofs_locked(client, block);
+
     persist_finalized_state_if_advanced_locked(
         client,
         &pre_transition_finalized,
         meta);
-    (void)lantern_client_agg_proof_cache_prune_finalized(
+    prune_finalized_attestation_material_if_slot_advanced_locked(
         client,
-        client->state.latest_finalized.slot);
+        &pre_transition_finalized);
     advance_fork_choice_time_locked(client, block, meta);
     get_head_info_locked(client, &head_root, &head_slot);
     persist_state_locked(client, meta);

@@ -7,6 +7,7 @@
 #include <stddef.h>
 
 #include "lantern/consensus/state.h"
+#include "lantern/consensus/store.h"
 #include "lantern/consensus/duties.h"
 #include "lantern/consensus/runtime.h"
 #include "lantern/consensus/fork_choice.h"
@@ -126,18 +127,6 @@ struct lantern_active_blocks_request {
     bool timeout_recorded;
 };
 
-struct lantern_agg_proof_cache_entry {
-    LanternRoot data_root;
-    LanternAggregatedSignatureProof proof;
-    uint64_t target_slot;
-};
-
-struct lantern_agg_proof_cache {
-    struct lantern_agg_proof_cache_entry *entries;
-    size_t length;
-    size_t capacity;
-};
-
 struct lantern_validator_duty_state {
     uint64_t last_slot;
     uint32_t last_interval;
@@ -195,11 +184,11 @@ struct lantern_client {
     struct lantern_consensus_runtime runtime;
     bool has_runtime;
     struct lantern_validator_duty_state validator_duty;
+    LanternStore store;
     LanternForkChoice fork_choice;
     bool has_fork_choice;
     LanternState state;
     bool has_state;
-    struct lantern_agg_proof_cache agg_proof_cache;
     pthread_mutex_t state_lock;
     bool state_lock_initialized;
     bool *validator_enabled;
@@ -210,6 +199,9 @@ struct lantern_client {
     size_t peer_vote_stats_cap;
     pthread_mutex_t peer_vote_lock;
     bool peer_vote_lock_initialized;
+    pthread_t timing_thread;
+    bool timing_thread_started;
+    int timing_stop_flag;
     pthread_t validator_thread;
     bool validator_thread_started;
     int validator_stop_flag;
