@@ -600,10 +600,7 @@ int lantern_store_set_gossip_signature(
     const LanternAttestationData *data,
     const LanternSignature *signature,
     uint64_t target_slot) {
-    if (!store || !key || !signature) {
-        return -1;
-    }
-    if (gossip_signature_map_set(&store->gossip_signatures, key, signature, target_slot) != 0) {
+    if (!store || !key) {
         return -1;
     }
     if (data) {
@@ -612,6 +609,12 @@ int lantern_store_set_gossip_signature(
             &key->data_root,
             data,
             target_slot);
+    }
+    if (!signature || signature_is_zero(signature)) {
+        return 0;
+    }
+    if (gossip_signature_map_set(&store->gossip_signatures, key, signature, target_slot) != 0) {
+        return -1;
     }
     return 0;
 }
@@ -624,6 +627,24 @@ int lantern_store_get_gossip_signature(
         return -1;
     }
     return gossip_signature_map_get(&store->gossip_signatures, key, out_signature);
+}
+
+int lantern_store_remove_gossip_signature(
+    LanternStore *store,
+    const LanternSignatureKey *key) {
+    if (!store || !key) {
+        return -1;
+    }
+
+    struct lantern_gossip_signature_map *map = &store->gossip_signatures;
+    for (size_t i = 0; i < map->length; ++i) {
+        if (!signature_key_equals(&map->entries[i].key, key)) {
+            continue;
+        }
+        gossip_signature_map_remove_index(map, i);
+        return 0;
+    }
+    return -1;
 }
 
 static int lantern_store_add_aggregated_payload(

@@ -90,6 +90,9 @@ struct lantern_vote_rejection_info
     bool has_unknown_root; /**< True if rejection is due to unknown checkpoint root */
     LanternRoot unknown_root; /**< Unknown checkpoint root */
     uint64_t unknown_slot; /**< Slot of unknown checkpoint */
+    bool should_retry_after_block_import; /**< True if block import may unblock the vote */
+    LanternRoot retry_root; /**< Root whose eventual import may unblock validation */
+    uint64_t retry_slot; /**< Slot associated with retry_root */
 };
 
 
@@ -178,6 +181,85 @@ const LanternState *lantern_client_state_for_root_locked(
     const LanternRoot *root,
     LanternState *scratch,
     bool *out_is_scratch);
+
+/**
+ * Return the active attestation committee count for sync/validator cache logic.
+ *
+ * Respects debug overrides used by tests and falls back to the protocol default.
+ */
+size_t lantern_client_attestation_committee_count(const struct lantern_client *client);
+
+/**
+ * Determine whether this node should retain an attestation signature locally.
+ *
+ * The signature is retained only when the node is configured as an aggregator
+ * and the attester is on the local attestation subnet/committee.
+ *
+ * @note Caller must hold state_lock.
+ */
+bool lantern_client_should_cache_attestation_signature_locked(
+    const struct lantern_client *client,
+    const LanternVote *vote);
+
+/**
+ * Cache block-body aggregated proofs as known attestation material.
+ *
+ * Mirrors the block-body proof caching step from the spec's Store.on_block().
+ * Caller must hold state_lock.
+ */
+void lantern_client_cache_block_aggregated_proofs_locked(
+    struct lantern_client *client,
+    const LanternSignedBlock *block);
+
+/**
+ * Cache proposer attestation data and, when eligible, its signature.
+ *
+ * Mirrors the proposer-attestation caching step from the spec's Store.on_block().
+ * Caller must hold state_lock.
+ */
+void lantern_client_cache_proposer_attestation_locked(
+    struct lantern_client *client,
+    const LanternSignedVote *proposer_attestation);
+
+
+/* ============================================================================
+ * Pending Vote Functions
+ * ============================================================================ */
+
+/**
+ * Initialize a pending vote list.
+ *
+ * @param list  List to initialize
+ *
+ * @note Thread safety: This function is thread-safe
+ */
+void pending_vote_list_init(struct lantern_pending_vote_list *list);
+
+
+/**
+ * Reset and free a pending vote list.
+ *
+ * @param list  List to reset
+ *
+ * @note Thread safety: This function is thread-safe
+ */
+void pending_vote_list_reset(struct lantern_pending_vote_list *list);
+
+
+/**
+ * Append a pending gossip vote to the list.
+ *
+ * @param list      List to append to
+ * @param vote      Vote to append
+ * @param peer_text Peer ID text (may be NULL)
+ * @return Pointer to new entry, or NULL on failure
+ *
+ * @note Thread safety: Caller must hold state_lock when mutating client-owned lists
+ */
+struct lantern_pending_vote *pending_vote_list_append(
+    struct lantern_pending_vote_list *list,
+    const LanternSignedVote *vote,
+    const char *peer_text);
 
 
 /* ============================================================================
@@ -429,6 +511,14 @@ void lantern_client_record_vote(
     struct lantern_client *client,
     const LanternSignedVote *vote,
     const char *peer_text);
+
+/**
+ * Replay pending gossip votes after a successful block import.
+ *
+ * Drains the pending vote queue, retrying each buffered vote once against the
+ * updated store. Votes that still fail are discarded.
+ */
+void lantern_client_replay_pending_gossip_votes(struct lantern_client *client);
 
 
 /**
