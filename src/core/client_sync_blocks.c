@@ -765,6 +765,8 @@ static bool build_root_chain_locked(
     struct lantern_client *client,
     const LanternRoot *target_root,
     const LanternRoot *stop_root,
+    bool allow_stop_at_or_before_slot,
+    uint64_t stop_slot,
     struct lantern_root_chain *out_chain)
 {
     if (!client || !target_root || !out_chain || !client->has_fork_choice)
@@ -775,16 +777,10 @@ static bool build_root_chain_locked(
 
     LanternRoot current = *target_root;
     const bool has_stop_root = stop_root && !lantern_root_is_zero(stop_root);
-    bool reached_stop_root = false;
+    bool reached_stop_boundary = false;
     size_t steps = 0;
     while (!lantern_root_is_zero(&current))
     {
-        if (has_stop_root
-            && memcmp(current.bytes, stop_root->bytes, LANTERN_ROOT_SIZE) == 0)
-        {
-            reached_stop_root = true;
-            break;
-        }
         if (steps > LANTERN_HISTORICAL_ROOTS_LIMIT)
         {
             return false;
@@ -808,6 +804,19 @@ static bool build_root_chain_locked(
             return false;
         }
 
+        if (has_stop_root
+            && memcmp(current.bytes, stop_root->bytes, LANTERN_ROOT_SIZE) == 0)
+        {
+            reached_stop_boundary = true;
+            break;
+        }
+
+        if (allow_stop_at_or_before_slot && slot <= stop_slot)
+        {
+            reached_stop_boundary = true;
+            break;
+        }
+
         if (!root_chain_append(out_chain, &current, &parent, slot, has_parent))
         {
             return false;
@@ -822,9 +831,9 @@ static bool build_root_chain_locked(
         steps += 1u;
     }
 
-    if (has_stop_root)
+    if (has_stop_root || allow_stop_at_or_before_slot)
     {
-        return reached_stop_root;
+        return reached_stop_boundary;
     }
 
     return out_chain->length > 0;
@@ -1542,6 +1551,9 @@ static bool rebuild_state_for_root_locked(
     bool have_replay_base_state = false;
     bool use_finalized_shortcut = false;
     LanternRoot replay_stop_root = {0};
+    uint64_t replay_stop_slot = 0;
+    uint64_t anchor_slot = 0;
+    bool allow_anchor_slot_stop = false;
     char replay_stop_hex[ROOT_HEX_BUFFER_LEN] = {0};
 
     if (client->has_fork_choice)
@@ -1551,14 +1563,36 @@ static bool rebuild_state_for_root_locked(
         if (fork_finalized)
         {
             replay_stop_root = fork_finalized->root;
+            replay_stop_slot = fork_finalized->slot;
         }
     }
     else if (client->has_state)
     {
         replay_stop_root = client->state.latest_finalized.root;
+        replay_stop_slot = client->state.latest_finalized.slot;
     }
     if (!lantern_root_is_zero(&replay_stop_root))
     {
+        if (client->has_fork_choice)
+        {
+            const LanternRoot *anchor_root =
+                lantern_fork_choice_anchor_root(&client->fork_choice);
+            if (anchor_root
+                && memcmp(
+                       anchor_root->bytes,
+                       replay_stop_root.bytes,
+                       LANTERN_ROOT_SIZE)
+                    == 0
+                && lantern_fork_choice_anchor_slot(
+                       &client->fork_choice,
+                       &anchor_slot)
+                    == 0
+                && replay_stop_slot < anchor_slot)
+            {
+                allow_anchor_slot_stop = true;
+            }
+        }
+
         const char *replay_base_source = NULL;
         size_t replay_base_bytes = 0;
         format_root_hex(&replay_stop_root, replay_stop_hex, sizeof(replay_stop_hex));
@@ -1580,7 +1614,13 @@ static bool rebuild_state_for_root_locked(
         }
 
         have_replay_base_state = true;
-        if (!build_root_chain_locked(client, target_root, &replay_stop_root, &chain))
+        if (!build_root_chain_locked(
+                client,
+                target_root,
+                &replay_stop_root,
+                allow_anchor_slot_stop,
+                anchor_slot,
+                &chain))
         {
             lantern_log_error(
                 "state",
@@ -1597,13 +1637,14 @@ static bool rebuild_state_for_root_locked(
         lantern_log_info(
             "state",
             &meta,
-            "rebuild_state using finalized base target=%s finalized=%s source=%s bytes=%zu",
+            "rebuild_state using finalized base target=%s finalized=%s source=%s bytes=%zu stop=%s",
             target_hex[0] ? target_hex : "0x0",
             replay_stop_hex[0] ? replay_stop_hex : "0x0",
             replay_base_source ? replay_base_source : "unknown",
-            replay_base_bytes);
+            replay_base_bytes,
+            allow_anchor_slot_stop ? "anchor_slot" : "exact_root");
     }
-    else if (!build_root_chain_locked(client, target_root, NULL, &chain))
+    else if (!build_root_chain_locked(client, target_root, NULL, false, 0, &chain))
     {
         lantern_log_warn(
             "state",

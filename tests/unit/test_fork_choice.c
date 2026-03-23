@@ -765,6 +765,60 @@ static int test_fork_choice_restore_checkpoints(void) {
     return 0;
 }
 
+static int test_fork_choice_anchor_metadata_survives_checkpoint_restore(void) {
+    LanternForkChoice store;
+    lantern_fork_choice_init(&store);
+
+    LanternConfig config = {.num_validators = 4, .genesis_time = 1};
+    assert(lantern_fork_choice_configure(&store, &config) == 0);
+
+    LanternBlock anchor;
+    init_block(&anchor, 8, 0, NULL, 0x51);
+    LanternRoot anchor_root;
+    assert(lantern_hash_tree_root_block(&anchor, &anchor_root) == 0);
+    LanternCheckpoint anchor_cp = make_checkpoint(&anchor_root, anchor.slot);
+    assert(lantern_fork_choice_set_anchor(&store, &anchor, &anchor_cp, &anchor_cp, &anchor_root) == 0);
+
+    const LanternRoot *stored_anchor_root = lantern_fork_choice_anchor_root(&store);
+    uint64_t stored_anchor_slot = 0;
+    assert(stored_anchor_root);
+    assert(roots_equal(stored_anchor_root, &anchor_root));
+    assert(lantern_fork_choice_anchor_slot(&store, &stored_anchor_slot) == 0);
+    assert(stored_anchor_slot == anchor.slot);
+
+    LanternBlock block_one;
+    init_block(&block_one, anchor.slot + 1u, 1, &anchor_root, 0x52);
+    LanternRoot block_one_root;
+    assert(lantern_hash_tree_root_block(&block_one, &block_one_root) == 0);
+    LanternCheckpoint block_one_cp = make_checkpoint(&block_one_root, block_one.slot);
+    assert(
+        lantern_fork_choice_add_block(
+            &store,
+            &block_one,
+            NULL,
+            NULL,
+            NULL,
+            &block_one_root)
+        == 0);
+
+    assert(lantern_fork_choice_restore_checkpoints(&store, &block_one_cp, &anchor_cp) == 0);
+
+    stored_anchor_root = lantern_fork_choice_anchor_root(&store);
+    stored_anchor_slot = 0;
+    assert(stored_anchor_root);
+    assert(roots_equal(stored_anchor_root, &anchor_root));
+    assert(lantern_fork_choice_anchor_slot(&store, &stored_anchor_slot) == 0);
+    assert(stored_anchor_slot == anchor.slot);
+
+    lantern_fork_choice_reset(&store);
+    assert(lantern_fork_choice_anchor_root(&store) == NULL);
+    assert(lantern_fork_choice_anchor_slot(&store, &stored_anchor_slot) != 0);
+
+    reset_block(&block_one);
+    reset_block(&anchor);
+    return 0;
+}
+
 static int test_fork_choice_advance_time_schedules_votes(void) {
     LanternForkChoice store;
     lantern_fork_choice_init(&store);
@@ -1180,6 +1234,9 @@ int main(void) {
         return 1;
     }
     if (test_fork_choice_restore_checkpoints() != 0) {
+        return 1;
+    }
+    if (test_fork_choice_anchor_metadata_survives_checkpoint_restore() != 0) {
         return 1;
     }
     if (test_fork_choice_advance_time_schedules_votes() != 0) {
