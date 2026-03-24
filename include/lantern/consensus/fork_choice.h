@@ -166,6 +166,7 @@ int lantern_fork_choice_restore_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *latest_justified,
     const LanternCheckpoint *latest_finalized);
+int lantern_fork_choice_prune_states(LanternForkChoice *store);
 
 int lantern_fork_choice_accept_new_votes(LanternForkChoice *store);
 int lantern_fork_choice_update_safe_target(LanternForkChoice *store);

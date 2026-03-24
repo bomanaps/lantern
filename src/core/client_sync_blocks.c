@@ -2329,6 +2329,32 @@ static void prune_finalized_attestation_material_if_slot_advanced_locked(
         current_finalized->slot);
 }
 
+static void prune_finalized_fork_choice_states_if_advanced_locked(
+    struct lantern_client *client,
+    const LanternCheckpoint *previous_finalized,
+    const struct lantern_log_metadata *meta)
+{
+    if (!client || !previous_finalized || !client->has_fork_choice)
+    {
+        return;
+    }
+
+    const LanternCheckpoint *current_finalized = &client->state.latest_finalized;
+    if (!finalized_checkpoint_advanced(previous_finalized, current_finalized))
+    {
+        return;
+    }
+
+    if (lantern_fork_choice_prune_states(&client->fork_choice) != 0)
+    {
+        lantern_log_warn(
+            "forkchoice",
+            meta,
+            "failed to prune fork choice states finalized_slot=%" PRIu64,
+            current_finalized->slot);
+    }
+}
+
 static void persist_finalized_state_if_advanced_locked(
     const struct lantern_client *client,
     const LanternCheckpoint *previous_finalized,
@@ -2565,7 +2591,7 @@ static void log_imported_block(
  *
  * @note Thread safety: Acquires state_lock and pending_lock
  */
-bool lantern_client_import_block(
+static bool lantern_client_import_block_internal(
     struct lantern_client *client,
     const LanternSignedBlock *block,
     const LanternRoot *block_root,
@@ -2573,14 +2599,21 @@ bool lantern_client_import_block(
     uint32_t backfill_depth,
     bool allow_historical,
     const uint8_t *raw_block_ssz,
-    size_t raw_block_ssz_len)
+    size_t raw_block_ssz_len,
+    bool drain_pending_children,
+    bool *out_children_ready)
 {
+    if (out_children_ready)
+    {
+        *out_children_ready = false;
+    }
     if (!client || !block || !client->has_state)
     {
         return false;
     }
 
     bool imported = false;
+    bool children_ready = false;
     bool state_locked = lantern_client_lock_state(client);
     if (!state_locked)
     {
@@ -2607,8 +2640,19 @@ bool lantern_client_import_block(
     {
         lantern_client_unlock_state(client, state_locked);
         persist_block_after_import(client, block, meta);
-        lantern_client_process_pending_children(client, &block_root_local);
+        if (drain_pending_children)
+        {
+            lantern_client_process_pending_children(client, &block_root_local);
+        }
+        else
+        {
+            children_ready = true;
+        }
         lantern_client_pending_remove_by_root(client, &block_root_local);
+        if (out_children_ready)
+        {
+            *out_children_ready = children_ready;
+        }
         return false;
     }
 
@@ -2870,6 +2914,10 @@ bool lantern_client_import_block(
             prune_finalized_attestation_material_if_slot_advanced_locked(
                 client,
                 &pre_adopt_finalized);
+            prune_finalized_fork_choice_states_if_advanced_locked(
+                client,
+                &pre_adopt_finalized,
+                meta);
             persist_state_locked(client, meta);
         }
 
@@ -2900,9 +2948,20 @@ bool lantern_client_import_block(
         if (processed)
         {
             persist_block_after_import(client, block, meta);
-            lantern_client_process_pending_children(client, &block_root_local);
+            if (drain_pending_children)
+            {
+                lantern_client_process_pending_children(client, &block_root_local);
+            }
+            else
+            {
+                children_ready = true;
+            }
             update_sync_progress_after_block(client);
             lantern_client_replay_pending_gossip_votes(client);
+        }
+        if (out_children_ready)
+        {
+            *out_children_ready = children_ready;
         }
         return false;
     }
@@ -2930,6 +2989,10 @@ bool lantern_client_import_block(
         client,
         &pre_transition_finalized);
     advance_fork_choice_time_locked(client, block, meta);
+    prune_finalized_fork_choice_states_if_advanced_locked(
+        client,
+        &pre_transition_finalized,
+        meta);
     get_head_info_locked(client, &head_root, &head_slot);
     persist_state_locked(client, meta);
     persist_post_state_and_indices_locked(
@@ -2957,13 +3020,71 @@ cleanup:
             pthread_mutex_unlock(&client->status_lock);
         }
         lantern_client_pending_remove_by_root(client, &block_root_local);
-        lantern_client_process_pending_children(client, &block_root_local);
+        if (drain_pending_children)
+        {
+            lantern_client_process_pending_children(client, &block_root_local);
+        }
+        else
+        {
+            children_ready = true;
+        }
         log_imported_block(block, &head_root, head_slot, meta, quiet_log);
         update_sync_progress_after_block(client);
         lantern_client_replay_pending_gossip_votes(client);
     }
 
+    if (out_children_ready)
+    {
+        *out_children_ready = children_ready;
+    }
     return imported;
+}
+
+bool lantern_client_import_block(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    const struct lantern_log_metadata *meta,
+    uint32_t backfill_depth,
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len)
+{
+    return lantern_client_import_block_internal(
+        client,
+        block,
+        block_root,
+        meta,
+        backfill_depth,
+        allow_historical,
+        raw_block_ssz,
+        raw_block_ssz_len,
+        true,
+        NULL);
+}
+
+bool lantern_client_import_block_without_pending_children(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    const struct lantern_log_metadata *meta,
+    uint32_t backfill_depth,
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
+    bool *out_children_ready)
+{
+    return lantern_client_import_block_internal(
+        client,
+        block,
+        block_root,
+        meta,
+        backfill_depth,
+        allow_historical,
+        raw_block_ssz,
+        raw_block_ssz_len,
+        false,
+        out_children_ready);
 }
 
 

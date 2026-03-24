@@ -166,6 +166,79 @@ static const struct lantern_fork_choice_tree_node *find_tree_snapshot_node(
     return NULL;
 }
 
+static size_t find_block_index(
+    const LanternForkChoice *store,
+    const LanternRoot *root) {
+    if (!store || !root) {
+        return SIZE_MAX;
+    }
+    for (size_t i = 0; i < store->block_len; ++i) {
+        if (roots_equal(&store->blocks[i].root, root)) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
+static void seed_state_allocations(
+    LanternState *state,
+    size_t validator_count,
+    size_t history_len,
+    uint8_t seed) {
+    assert(state != NULL);
+    assert(validator_count > 0);
+    assert(validator_count <= LANTERN_VALIDATOR_REGISTRY_LIMIT);
+
+    size_t pubkey_bytes = validator_count * LANTERN_VALIDATOR_PUBKEY_SIZE;
+    uint8_t *pubkeys = calloc(pubkey_bytes, 1u);
+    assert(pubkeys != NULL);
+    for (size_t i = 0; i < pubkey_bytes; ++i) {
+        pubkeys[i] = (uint8_t)(seed + (uint8_t)i);
+    }
+    assert(lantern_state_set_validator_pubkeys(state, pubkeys, validator_count) == 0);
+    free(pubkeys);
+
+    assert(lantern_root_list_resize(&state->historical_block_hashes, history_len) == 0);
+    assert(lantern_root_list_resize(&state->justification_roots, history_len) == 0);
+    for (size_t i = 0; i < history_len; ++i) {
+        fill_root(&state->historical_block_hashes.items[i], (uint8_t)(seed + (uint8_t)i));
+        fill_root(&state->justification_roots.items[i], (uint8_t)(seed + 0x40u + (uint8_t)i));
+    }
+    assert(lantern_bitlist_resize(&state->justified_slots, history_len) == 0);
+    assert(lantern_bitlist_resize(&state->justification_validators, history_len * validator_count) == 0);
+}
+
+static void build_cached_state(
+    LanternState *out_state,
+    const LanternState *parent_state,
+    const LanternBlock *block,
+    const LanternCheckpoint *latest_justified,
+    const LanternCheckpoint *latest_finalized,
+    uint8_t seed) {
+    assert(out_state != NULL);
+    assert(parent_state != NULL);
+    assert(block != NULL);
+
+    lantern_state_init(out_state);
+    assert(lantern_state_clone(parent_state, out_state) == 0);
+    out_state->slot = block->slot;
+    out_state->latest_block_header.slot = block->slot;
+    out_state->latest_block_header.proposer_index = block->proposer_index;
+    out_state->latest_block_header.parent_root = block->parent_root;
+    if (latest_justified) {
+        out_state->latest_justified = *latest_justified;
+    }
+    if (latest_finalized) {
+        out_state->latest_finalized = *latest_finalized;
+    }
+
+    seed_state_allocations(
+        out_state,
+        (size_t)out_state->config.num_validators,
+        (size_t)block->slot + 2u,
+        seed);
+}
+
 static int test_fork_choice_proposer_attestation_sequence(void) {
     LanternForkChoice store;
     LanternStore backing_store;
@@ -411,6 +484,203 @@ static int test_fork_choice_caches_block_states(void) {
     lantern_store_reset(&backing_store);
     lantern_fork_choice_reset(&store);
     reset_block(&child);
+    reset_block(&genesis);
+    return 0;
+}
+
+static int test_fork_choice_prune_states_keeps_finalized_to_head_chain(void) {
+    LanternForkChoice store;
+    LanternStore backing_store;
+    lantern_fork_choice_init(&store);
+    lantern_store_init(&backing_store);
+    lantern_store_attach_fork_choice(&backing_store, &store);
+
+    LanternConfig config = {.num_validators = 3, .genesis_time = 91};
+    assert(lantern_store_prepare_fork_choice_votes(&backing_store, config.num_validators) == 0);
+    assert(lantern_fork_choice_configure(&store, &config) == 0);
+
+    LanternBlock genesis;
+    init_block(&genesis, 0, 0, NULL, 0x61);
+    LanternRoot genesis_root;
+    assert(lantern_hash_tree_root_block(&genesis, &genesis_root) == 0);
+    LanternCheckpoint genesis_cp = make_checkpoint(&genesis_root, genesis.slot);
+
+    LanternState genesis_state;
+    lantern_state_init(&genesis_state);
+    assert(lantern_state_generate_genesis(&genesis_state, config.genesis_time, config.num_validators) == 0);
+    genesis_state.latest_justified = genesis_cp;
+    genesis_state.latest_finalized = genesis_cp;
+    seed_state_allocations(&genesis_state, config.num_validators, 2u, 0x20);
+
+    assert(
+        lantern_fork_choice_set_anchor_with_state(
+            &store,
+            &genesis,
+            &genesis_cp,
+            &genesis_cp,
+            &genesis_root,
+            &genesis_state)
+        == 0);
+
+    LanternBlock block_one;
+    init_block(&block_one, 1, 1, &genesis_root, 0x62);
+    LanternRoot block_one_root;
+    assert(lantern_hash_tree_root_block(&block_one, &block_one_root) == 0);
+    LanternCheckpoint block_one_cp = make_checkpoint(&block_one_root, block_one.slot);
+
+    LanternState block_one_state;
+    build_cached_state(
+        &block_one_state,
+        &genesis_state,
+        &block_one,
+        &block_one_cp,
+        &genesis_cp,
+        0x30);
+    assert(
+        lantern_fork_choice_add_block_with_state(
+            &store,
+            &block_one,
+            NULL,
+            &genesis_cp,
+            &genesis_cp,
+            &block_one_root,
+            &block_one_state)
+        == 0);
+
+    LanternBlock block_two;
+    init_block(&block_two, 2, 2, &block_one_root, 0x63);
+    LanternRoot block_two_root;
+    assert(lantern_hash_tree_root_block(&block_two, &block_two_root) == 0);
+    LanternCheckpoint block_two_cp = make_checkpoint(&block_two_root, block_two.slot);
+
+    LanternState block_two_state;
+    build_cached_state(
+        &block_two_state,
+        &block_one_state,
+        &block_two,
+        &block_two_cp,
+        &genesis_cp,
+        0x40);
+    assert(
+        lantern_fork_choice_add_block_with_state(
+            &store,
+            &block_two,
+            NULL,
+            &genesis_cp,
+            &genesis_cp,
+            &block_two_root,
+            &block_two_state)
+        == 0);
+
+    LanternBlock block_three;
+    init_block(&block_three, 3, 0, &block_two_root, 0x64);
+    LanternRoot block_three_root;
+    assert(lantern_hash_tree_root_block(&block_three, &block_three_root) == 0);
+    LanternCheckpoint block_three_cp = make_checkpoint(&block_three_root, block_three.slot);
+
+    LanternState block_three_state;
+    build_cached_state(
+        &block_three_state,
+        &block_two_state,
+        &block_three,
+        &block_three_cp,
+        &genesis_cp,
+        0x50);
+    assert(
+        lantern_fork_choice_add_block_with_state(
+            &store,
+            &block_three,
+            NULL,
+            &genesis_cp,
+            &genesis_cp,
+            &block_three_root,
+            &block_three_state)
+        == 0);
+
+    LanternBlock fork_two;
+    init_block(&fork_two, 2, 0, &block_one_root, 0x65);
+    LanternRoot fork_two_root;
+    assert(lantern_hash_tree_root_block(&fork_two, &fork_two_root) == 0);
+
+    LanternState fork_two_state;
+    build_cached_state(
+        &fork_two_state,
+        &block_one_state,
+        &fork_two,
+        &block_one_cp,
+        &genesis_cp,
+        0x60);
+    assert(
+        lantern_fork_choice_add_block_with_state(
+            &store,
+            &fork_two,
+            NULL,
+            &genesis_cp,
+            &genesis_cp,
+            &fork_two_root,
+            &fork_two_state)
+        == 0);
+
+    LanternSignedVote vote0 = make_vote(0, &genesis_cp, &block_three_cp);
+    LanternSignedVote vote1 = make_vote(1, &genesis_cp, &block_three_cp);
+    LanternSignedVote vote2 = make_vote(2, &genesis_cp, &block_three_cp);
+    assert(lantern_fork_choice_add_vote(&store, &vote0, false) == 0);
+    assert(lantern_fork_choice_add_vote(&store, &vote1, false) == 0);
+    assert(lantern_fork_choice_add_vote(&store, &vote2, false) == 0);
+    assert(lantern_fork_choice_accept_new_votes(&store) == 0);
+
+    LanternRoot head;
+    assert(lantern_fork_choice_current_head(&store, &head) == 0);
+    assert(roots_equal(&head, &block_three_root));
+
+    assert(lantern_fork_choice_update_checkpoints(&store, &block_three_cp, &block_two_cp) == 0);
+    assert(lantern_fork_choice_prune_states(&store) == 0);
+
+    size_t genesis_index = find_block_index(&store, &genesis_root);
+    size_t block_one_index = find_block_index(&store, &block_one_root);
+    size_t block_two_index = find_block_index(&store, &block_two_root);
+    size_t block_three_index = find_block_index(&store, &block_three_root);
+    size_t fork_two_index = find_block_index(&store, &fork_two_root);
+    assert(genesis_index != SIZE_MAX);
+    assert(block_one_index != SIZE_MAX);
+    assert(block_two_index != SIZE_MAX);
+    assert(block_three_index != SIZE_MAX);
+    assert(fork_two_index != SIZE_MAX);
+
+    assert(lantern_fork_choice_block_state(&store, &genesis_root) == NULL);
+    assert(lantern_fork_choice_block_state(&store, &block_one_root) == NULL);
+    assert(lantern_fork_choice_block_state(&store, &fork_two_root) == NULL);
+    assert(lantern_fork_choice_block_state(&store, &block_two_root) != NULL);
+    assert(lantern_fork_choice_block_state(&store, &block_three_root) != NULL);
+
+    assert(!store.states[genesis_index].has_state);
+    assert(store.states[genesis_index].state.validators == NULL);
+    assert(store.states[genesis_index].state.historical_block_hashes.items == NULL);
+    assert(!store.states[block_one_index].has_state);
+    assert(store.states[block_one_index].state.validators == NULL);
+    assert(store.states[block_one_index].state.historical_block_hashes.items == NULL);
+    assert(!store.states[fork_two_index].has_state);
+    assert(store.states[fork_two_index].state.validators == NULL);
+    assert(store.states[fork_two_index].state.historical_block_hashes.items == NULL);
+
+    assert(store.states[block_two_index].has_state);
+    assert(store.states[block_two_index].state.validators != NULL);
+    assert(store.states[block_two_index].state.historical_block_hashes.items != NULL);
+    assert(store.states[block_three_index].has_state);
+    assert(store.states[block_three_index].state.validators != NULL);
+    assert(store.states[block_three_index].state.historical_block_hashes.items != NULL);
+
+    lantern_state_reset(&fork_two_state);
+    lantern_state_reset(&block_three_state);
+    lantern_state_reset(&block_two_state);
+    lantern_state_reset(&block_one_state);
+    lantern_state_reset(&genesis_state);
+    lantern_store_reset(&backing_store);
+    lantern_fork_choice_reset(&store);
+    reset_block(&fork_two);
+    reset_block(&block_three);
+    reset_block(&block_two);
+    reset_block(&block_one);
     reset_block(&genesis);
     return 0;
 }
@@ -1219,6 +1489,9 @@ int main(void) {
         return 1;
     }
     if (test_fork_choice_caches_block_states() != 0) {
+        return 1;
+    }
+    if (test_fork_choice_prune_states_keeps_finalized_to_head_chain() != 0) {
         return 1;
     }
     if (test_fork_choice_vote_flow() != 0) {

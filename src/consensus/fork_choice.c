@@ -1093,6 +1093,68 @@ int lantern_fork_choice_restore_checkpoints(
     return 0;
 }
 
+int lantern_fork_choice_prune_states(LanternForkChoice *store) {
+    if (!store || !store->initialized || !store->has_anchor || !store->has_head) {
+        return -1;
+    }
+    if (store->block_len == 0 || !store->states) {
+        return 0;
+    }
+    if (store->state_cap < store->block_len) {
+        return -1;
+    }
+    if (root_is_zero(&store->latest_finalized.root)) {
+        return 0;
+    }
+
+    size_t head_index = 0;
+    size_t finalized_index = 0;
+    if (!map_lookup(store, &store->head, &head_index)
+        || !map_lookup(store, &store->latest_finalized.root, &finalized_index)) {
+        return -1;
+    }
+    if (head_index >= store->block_len || finalized_index >= store->block_len) {
+        return -1;
+    }
+
+    uint8_t *canonical = calloc(store->block_len, sizeof(*canonical));
+    if (!canonical) {
+        return -1;
+    }
+
+    bool found_finalized = false;
+    size_t current = head_index;
+    while (current < store->block_len) {
+        canonical[current] = 1u;
+        if (current == finalized_index) {
+            found_finalized = true;
+            break;
+        }
+        size_t parent_index = store->blocks[current].parent_index;
+        if (parent_index == SIZE_MAX || parent_index >= store->block_len) {
+            break;
+        }
+        current = parent_index;
+    }
+
+    if (!found_finalized) {
+        free(canonical);
+        return -1;
+    }
+
+    for (size_t i = 0; i < store->block_len; ++i) {
+        struct lantern_fork_choice_state_entry *entry = &store->states[i];
+        if (!entry->has_state || canonical[i] != 0u) {
+            continue;
+        }
+        lantern_state_reset(&entry->state);
+        entry->has_state = false;
+    }
+
+    free(canonical);
+    return 0;
+}
+
 static int find_start_index(
     const LanternForkChoice *store,
     const LanternRoot *start_root,
