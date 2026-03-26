@@ -593,6 +593,240 @@ cleanup:
     return 1;
 }
 
+static int test_checkpoint_sync_anchor_alias_restores(void)
+{
+    struct lantern_client client;
+    char dir_template[] = "/tmp/lantern_checkpoint_anchor_restoreXXXXXX";
+    char *data_dir = NULL;
+    LanternCheckpoint remote_justified = {0};
+    LanternCheckpoint remote_finalized = {0};
+    LanternRoot canonical_state_root = {0};
+    LanternRoot expected_anchor_root = {0};
+    LanternRoot actual_head = {0};
+    int rc = 1;
+
+    memset(&client, 0, sizeof(client));
+    client.node_id = "checkpoint_anchor_restore";
+    client.has_state = true;
+    lantern_state_init(&client.state);
+    lantern_store_init(&client.store);
+
+    if (lantern_state_generate_genesis(&client.state, UINT64_C(1761717362), 5u) != 0)
+    {
+        fprintf(stderr, "failed to generate state for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+
+    uint8_t pubkeys[5u * LANTERN_VALIDATOR_PUBKEY_SIZE];
+    fill_pubkeys(pubkeys, 5u);
+    if (lantern_state_set_validator_pubkeys(&client.state, pubkeys, 5u) != 0)
+    {
+        fprintf(stderr, "failed to set validator pubkeys for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+
+    client.state.slot = 4612u;
+    client.state.latest_block_header.slot = 4612u;
+    client.state.latest_block_header.proposer_index = 2u;
+    fill_root(&client.state.latest_block_header.parent_root, 0xF1u);
+
+    fill_root(&remote_justified.root, 0xE5u);
+    remote_justified.slot = 4597u;
+    fill_root(&remote_finalized.root, 0x28u);
+    remote_finalized.slot = 4592u;
+    if (roots_equal(&remote_justified.root, &remote_finalized.root))
+    {
+        remote_finalized.root.bytes[0] ^= 0x01u;
+    }
+    client.state.latest_justified = remote_justified;
+    client.state.latest_finalized = remote_finalized;
+
+    char *temp_dir = mkdtemp(dir_template);
+    if (!temp_dir)
+    {
+        fprintf(stderr, "failed to create temp data dir for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+    data_dir = strdup(temp_dir);
+    if (!data_dir)
+    {
+        fprintf(stderr, "failed to duplicate temp data dir for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+    client.data_dir = data_dir;
+
+    if (lantern_hash_tree_root_state(&client.state, &canonical_state_root) != 0)
+    {
+        fprintf(stderr, "failed to hash checkpoint anchor restore regression state\n");
+        goto cleanup;
+    }
+
+    LanternBlockHeader expected_anchor_header = client.state.latest_block_header;
+    expected_anchor_header.state_root = canonical_state_root;
+    if (lantern_hash_tree_root_block_header(&expected_anchor_header, &expected_anchor_root) != 0)
+    {
+        fprintf(stderr, "failed to hash checkpoint anchor restore regression anchor header\n");
+        goto cleanup;
+    }
+
+    if (initialize_fork_choice(&client) != LANTERN_CLIENT_OK)
+    {
+        fprintf(stderr, "initialize_fork_choice failed for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+
+    if (!roots_equal(&client.state.latest_justified.root, &remote_justified.root)
+        || !roots_equal(&client.state.latest_finalized.root, &remote_finalized.root))
+    {
+        fprintf(stderr, "checkpoint anchor restore regression unexpectedly rewrote client state checkpoints\n");
+        goto cleanup;
+    }
+
+    if (restore_persisted_blocks(&client) != LANTERN_CLIENT_OK)
+    {
+        fprintf(stderr, "restore_persisted_blocks failed for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+
+    if (lantern_fork_choice_current_head(&client.fork_choice, &actual_head) != 0)
+    {
+        fprintf(stderr, "failed to read fork choice head for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+    if (!roots_equal(&actual_head, &expected_anchor_root))
+    {
+        fprintf(stderr, "checkpoint anchor restore regression head mismatch\n");
+        goto cleanup;
+    }
+
+    const LanternCheckpoint *store_justified =
+        lantern_fork_choice_latest_justified(&client.fork_choice);
+    const LanternCheckpoint *store_finalized =
+        lantern_fork_choice_latest_finalized(&client.fork_choice);
+    if (!store_justified || !store_finalized)
+    {
+        fprintf(stderr, "missing fork-choice checkpoints for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+    if (store_justified->slot != remote_justified.slot
+        || !roots_equal(&store_justified->root, &expected_anchor_root))
+    {
+        fprintf(stderr, "checkpoint anchor restore regression justified checkpoint mismatch\n");
+        goto cleanup;
+    }
+    if (store_finalized->slot != remote_finalized.slot
+        || !roots_equal(&store_finalized->root, &expected_anchor_root))
+    {
+        fprintf(stderr, "checkpoint anchor restore regression finalized checkpoint mismatch\n");
+        goto cleanup;
+    }
+
+    LanternBlock child_block;
+    memset(&child_block, 0, sizeof(child_block));
+    child_block.slot = client.state.slot + 1u;
+    if (lantern_proposer_for_slot(
+            child_block.slot,
+            client.state.config.num_validators,
+            &child_block.proposer_index)
+        != 0)
+    {
+        fprintf(stderr, "failed to compute child proposer for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+    child_block.parent_root = expected_anchor_root;
+    lantern_block_body_init(&child_block.body);
+    LanternRoot child_root = {0};
+    if (lantern_hash_tree_root_block(&child_block, &child_root) != 0)
+    {
+        fprintf(stderr, "failed to hash child block for checkpoint anchor restore regression\n");
+        lantern_block_body_reset(&child_block.body);
+        goto cleanup;
+    }
+    if (lantern_fork_choice_add_block_with_state(
+            &client.fork_choice,
+            &child_block,
+            NULL,
+            &remote_justified,
+            &remote_finalized,
+            &child_root,
+            NULL)
+        != 0)
+    {
+        fprintf(stderr, "fork choice rejected first post-anchor block for checkpoint anchor restore regression\n");
+        lantern_block_body_reset(&child_block.body);
+        goto cleanup;
+    }
+    lantern_block_body_reset(&child_block.body);
+
+    const LanternState *cached_anchor_state =
+        lantern_fork_choice_block_state(&client.fork_choice, &expected_anchor_root);
+    if (!cached_anchor_state)
+    {
+        fprintf(stderr, "missing cached anchor state for checkpoint anchor restore regression\n");
+        goto cleanup;
+    }
+
+    LanternState cached_anchor_clone;
+    lantern_state_init(&cached_anchor_clone);
+    if (lantern_state_clone(cached_anchor_state, &cached_anchor_clone) != 0)
+    {
+        fprintf(stderr, "failed to clone cached anchor state for checkpoint anchor restore regression\n");
+        lantern_state_reset(&cached_anchor_clone);
+        goto cleanup;
+    }
+    if (lantern_state_process_slot(&cached_anchor_clone) != 0)
+    {
+        fprintf(stderr, "failed to process cached anchor state slot for checkpoint anchor restore regression\n");
+        lantern_state_reset(&cached_anchor_clone);
+        goto cleanup;
+    }
+    LanternRoot cached_anchor_header_root = {0};
+    if (lantern_hash_tree_root_block_header(
+            &cached_anchor_clone.latest_block_header,
+            &cached_anchor_header_root)
+        != 0)
+    {
+        fprintf(stderr, "failed to hash cached anchor header for checkpoint anchor restore regression\n");
+        lantern_state_reset(&cached_anchor_clone);
+        goto cleanup;
+    }
+    lantern_state_reset(&cached_anchor_clone);
+    if (!roots_equal(&cached_anchor_header_root, &expected_anchor_root))
+    {
+        fprintf(stderr, "checkpoint anchor restore regression cached anchor state drifted\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (data_dir)
+    {
+        cleanup_storage_root_file(data_dir, "states", &expected_anchor_root, "ssz");
+        cleanup_storage_root_file(data_dir, "states", &expected_anchor_root, "meta");
+        cleanup_storage_root_file(data_dir, "blocks", &expected_anchor_root, "ssz");
+        char states_dir[PATH_MAX];
+        char blocks_dir[PATH_MAX];
+        int states_written = snprintf(states_dir, sizeof(states_dir), "%s/states", data_dir);
+        int blocks_written = snprintf(blocks_dir, sizeof(blocks_dir), "%s/blocks", data_dir);
+        if (states_written > 0 && (size_t)states_written < sizeof(states_dir))
+        {
+            cleanup_dir(states_dir);
+        }
+        if (blocks_written > 0 && (size_t)blocks_written < sizeof(blocks_dir))
+        {
+            cleanup_dir(blocks_dir);
+        }
+        client.data_dir = NULL;
+        cleanup_dir(data_dir);
+        free(data_dir);
+    }
+    lantern_fork_choice_reset(&client.fork_choice);
+    lantern_store_reset(&client.store);
+    lantern_state_reset(&client.state);
+    return rc;
+}
+
 int main(void)
 {
     struct lantern_client client;
@@ -808,6 +1042,12 @@ int main(void)
         return 1;
     }
     if (test_pre_anchor_historical_block_is_dropped() != 0)
+    {
+        lantern_state_reset(&client.state);
+        lantern_fork_choice_reset(&client.fork_choice);
+        return 1;
+    }
+    if (test_checkpoint_sync_anchor_alias_restores() != 0)
     {
         lantern_state_reset(&client.state);
         lantern_fork_choice_reset(&client.fork_choice);

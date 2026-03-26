@@ -662,6 +662,55 @@ static void log_genesis_anchor_roots(
         slot);
 }
 
+static void log_fork_choice_state_snapshot(
+    const struct lantern_log_metadata *meta,
+    const LanternState *state,
+    const char *label)
+{
+    if (!meta || !state || !label)
+    {
+        return;
+    }
+
+    char header_parent_hex[ROOT_HEX_BUFFER_LEN];
+    char header_state_root_hex[ROOT_HEX_BUFFER_LEN];
+    char justified_root_hex[ROOT_HEX_BUFFER_LEN];
+    char finalized_root_hex[ROOT_HEX_BUFFER_LEN];
+    format_root_hex(
+        &state->latest_block_header.parent_root,
+        header_parent_hex,
+        sizeof(header_parent_hex));
+    format_root_hex(
+        &state->latest_block_header.state_root,
+        header_state_root_hex,
+        sizeof(header_state_root_hex));
+    format_root_hex(
+        &state->latest_justified.root,
+        justified_root_hex,
+        sizeof(justified_root_hex));
+    format_root_hex(
+        &state->latest_finalized.root,
+        finalized_root_hex,
+        sizeof(finalized_root_hex));
+
+    lantern_log_info(
+        "forkchoice",
+        meta,
+        "%s slot=%" PRIu64 " header_slot=%" PRIu64 " proposer=%" PRIu64
+        " header_parent=%s header_state_root=%s justified_slot=%" PRIu64
+        " justified_root=%s finalized_slot=%" PRIu64 " finalized_root=%s",
+        label,
+        state->slot,
+        state->latest_block_header.slot,
+        state->latest_block_header.proposer_index,
+        header_parent_hex[0] ? header_parent_hex : "0x0",
+        header_state_root_hex[0] ? header_state_root_hex : "0x0",
+        state->latest_justified.slot,
+        justified_root_hex[0] ? justified_root_hex : "0x0",
+        state->latest_finalized.slot,
+        finalized_root_hex[0] ? finalized_root_hex : "0x0");
+}
+
 
 /**
  * Initialize fork choice from genesis state.
@@ -727,6 +776,11 @@ int initialize_fork_choice(struct lantern_client *client)
         return LANTERN_CLIENT_ERR_RUNTIME;
     }
 
+    log_fork_choice_state_snapshot(
+        &meta,
+        &client->state,
+        "fork choice init state snapshot");
+
     LanternRoot anchor_state_root;
     LanternBlockHeader anchor_header;
     LanternRoot anchor_root;
@@ -740,6 +794,54 @@ int initialize_fork_choice(struct lantern_client *client)
     {
         return root_rc;
     }
+
+    char justified_root_hex[ROOT_HEX_BUFFER_LEN];
+    char finalized_root_hex[ROOT_HEX_BUFFER_LEN];
+    char anchor_state_root_hex[ROOT_HEX_BUFFER_LEN];
+    char anchor_root_hex[ROOT_HEX_BUFFER_LEN];
+    format_root_hex(
+        &client->state.latest_justified.root,
+        justified_root_hex,
+        sizeof(justified_root_hex));
+    format_root_hex(
+        &client->state.latest_finalized.root,
+        finalized_root_hex,
+        sizeof(finalized_root_hex));
+    format_root_hex(
+        &anchor_state_root,
+        anchor_state_root_hex,
+        sizeof(anchor_state_root_hex));
+    format_root_hex(
+        &anchor_root,
+        anchor_root_hex,
+        sizeof(anchor_root_hex));
+
+    lantern_log_info(
+        "forkchoice",
+        &meta,
+        "fork choice computed anchor state_root=%s anchor_root=%s"
+        " justified_slot=%" PRIu64 " justified_root=%s finalized_slot=%" PRIu64
+        " finalized_root=%s justified_matches_anchor=%s finalized_matches_anchor=%s",
+        anchor_state_root_hex[0] ? anchor_state_root_hex : "0x0",
+        anchor_root_hex[0] ? anchor_root_hex : "0x0",
+        client->state.latest_justified.slot,
+        justified_root_hex[0] ? justified_root_hex : "0x0",
+        client->state.latest_finalized.slot,
+        finalized_root_hex[0] ? finalized_root_hex : "0x0",
+        memcmp(
+            client->state.latest_justified.root.bytes,
+            anchor_root.bytes,
+            LANTERN_ROOT_SIZE)
+            == 0
+            ? "true"
+            : "false",
+        memcmp(
+            client->state.latest_finalized.root.bytes,
+            anchor_root.bytes,
+            LANTERN_ROOT_SIZE)
+            == 0
+            ? "true"
+            : "false");
 
     log_genesis_anchor_roots(
         &meta,
@@ -755,6 +857,35 @@ int initialize_fork_choice(struct lantern_client *client)
     anchor.parent_root = client->state.latest_block_header.parent_root;
     anchor.state_root = anchor_state_root;
     lantern_block_body_init(&anchor.body);
+
+    LanternRoot synthetic_anchor_block_root = {0};
+    bool have_synthetic_anchor_block_root =
+        lantern_hash_tree_root_block(&anchor, &synthetic_anchor_block_root) == 0;
+    char synthetic_anchor_block_root_hex[ROOT_HEX_BUFFER_LEN];
+    format_root_hex(
+        &synthetic_anchor_block_root,
+        synthetic_anchor_block_root_hex,
+        sizeof(synthetic_anchor_block_root_hex));
+    lantern_log_info(
+        "forkchoice",
+        &meta,
+        "materialized synthetic anchor block slot=%" PRIu64 " hinted_root=%s"
+        " hashed_block_root=%s hinted_root_matches_block=%s",
+        anchor.slot,
+        anchor_root_hex[0] ? anchor_root_hex : "0x0",
+        have_synthetic_anchor_block_root
+            ? (synthetic_anchor_block_root_hex[0]
+                   ? synthetic_anchor_block_root_hex
+                   : "0x0")
+            : "<unavailable>",
+        (have_synthetic_anchor_block_root
+         && memcmp(
+                synthetic_anchor_block_root.bytes,
+                anchor_root.bytes,
+                LANTERN_ROOT_SIZE)
+                == 0)
+            ? "true"
+            : "false");
 
     LanternCheckpoint anchor_justified = client->state.latest_justified;
     LanternCheckpoint anchor_finalized = client->state.latest_finalized;
@@ -785,16 +916,42 @@ int initialize_fork_choice(struct lantern_client *client)
     persist_anchor_block(client, &anchor, &anchor_root);
     if (client->data_dir)
     {
+        LanternState anchor_state_alias = client->state;
+        anchor_state_alias.latest_justified.root = anchor_root;
+        anchor_state_alias.latest_finalized.root = anchor_root;
         if (lantern_storage_store_state_for_root(
                 client->data_dir,
                 &anchor_root,
-                &client->state)
+                &anchor_state_alias)
             != 0)
         {
             lantern_log_warn(
                 "storage",
                 &meta,
-                "failed to persist anchor state");
+                "failed to persist anchor state alias");
+        }
+        else
+        {
+            char alias_justified_hex[ROOT_HEX_BUFFER_LEN];
+            char alias_finalized_hex[ROOT_HEX_BUFFER_LEN];
+            format_root_hex(
+                &anchor_state_alias.latest_justified.root,
+                alias_justified_hex,
+                sizeof(alias_justified_hex));
+            format_root_hex(
+                &anchor_state_alias.latest_finalized.root,
+                alias_finalized_hex,
+                sizeof(alias_finalized_hex));
+            lantern_log_info(
+                "forkchoice",
+                &meta,
+                "persisted anchor state alias root=%s justified_slot=%" PRIu64
+                " justified_root=%s finalized_slot=%" PRIu64 " finalized_root=%s",
+                anchor_root_hex[0] ? anchor_root_hex : "0x0",
+                anchor_state_alias.latest_justified.slot,
+                alias_justified_hex[0] ? alias_justified_hex : "0x0",
+                anchor_state_alias.latest_finalized.slot,
+                alias_finalized_hex[0] ? alias_finalized_hex : "0x0");
         }
     }
     lantern_block_body_reset(&anchor.body);
@@ -933,6 +1090,63 @@ int restore_persisted_blocks(struct lantern_client *client)
     }
     qsort(list.items, list.length, sizeof(list.items[0]), compare_blocks_by_slot);
 
+    const LanternRoot *store_anchor_root =
+        lantern_fork_choice_anchor_root(&client->fork_choice);
+    uint64_t store_anchor_slot = 0;
+    bool have_store_anchor_slot =
+        lantern_fork_choice_anchor_slot(&client->fork_choice, &store_anchor_slot) == 0;
+    LanternRoot store_head = {0};
+    bool have_store_head =
+        lantern_fork_choice_current_head(&client->fork_choice, &store_head) == 0;
+    uint64_t store_head_slot = 0;
+    if (have_store_head
+        && lantern_fork_choice_block_info(
+               &client->fork_choice,
+               &store_head,
+               &store_head_slot,
+               NULL,
+               NULL)
+            != 0)
+    {
+        store_head_slot = 0;
+    }
+    const LanternCheckpoint *store_latest_justified =
+        lantern_fork_choice_latest_justified(&client->fork_choice);
+    const LanternCheckpoint *store_latest_finalized =
+        lantern_fork_choice_latest_finalized(&client->fork_choice);
+    char store_anchor_root_hex[ROOT_HEX_BUFFER_LEN];
+    char store_head_hex[ROOT_HEX_BUFFER_LEN];
+    char store_justified_root_hex[ROOT_HEX_BUFFER_LEN];
+    char store_finalized_root_hex[ROOT_HEX_BUFFER_LEN];
+    format_root_hex(
+        store_anchor_root,
+        store_anchor_root_hex,
+        sizeof(store_anchor_root_hex));
+    format_root_hex(&store_head, store_head_hex, sizeof(store_head_hex));
+    format_root_hex(
+        store_latest_justified ? &store_latest_justified->root : NULL,
+        store_justified_root_hex,
+        sizeof(store_justified_root_hex));
+    format_root_hex(
+        store_latest_finalized ? &store_latest_finalized->root : NULL,
+        store_finalized_root_hex,
+        sizeof(store_finalized_root_hex));
+    lantern_log_info(
+        "forkchoice",
+        &(const struct lantern_log_metadata){.validator = client->node_id},
+        "restoring persisted blocks count=%zu anchor_slot=%" PRIu64 " anchor_root=%s"
+        " head_slot=%" PRIu64 " head_root=%s justified_slot=%" PRIu64
+        " justified_root=%s finalized_slot=%" PRIu64 " finalized_root=%s",
+        list.length,
+        have_store_anchor_slot ? store_anchor_slot : 0u,
+        store_anchor_root_hex[0] ? store_anchor_root_hex : "0x0",
+        have_store_head ? store_head_slot : 0u,
+        have_store_head ? (store_head_hex[0] ? store_head_hex : "0x0") : "<none>",
+        store_latest_justified ? store_latest_justified->slot : 0u,
+        store_justified_root_hex[0] ? store_justified_root_hex : "0x0",
+        store_latest_finalized ? store_latest_finalized->slot : 0u,
+        store_finalized_root_hex[0] ? store_finalized_root_hex : "0x0");
+
     for (size_t i = 0; i < list.length; ++i)
     {
         const struct lantern_persisted_block *entry = &list.items[i];
@@ -956,6 +1170,89 @@ int restore_persisted_blocks(struct lantern_client *client)
             post_justified = &cached_post_state.latest_justified;
             post_finalized = &cached_post_state.latest_finalized;
         }
+        const LanternState *post_state_for_restore =
+            have_cached_post_state ? &cached_post_state : NULL;
+        bool using_canonical_anchor_state = false;
+        if (store_anchor_root
+            && memcmp(
+                   entry->root.bytes,
+                   store_anchor_root->bytes,
+                   LANTERN_ROOT_SIZE)
+                == 0)
+        {
+            post_state_for_restore = &client->state;
+            using_canonical_anchor_state = true;
+        }
+
+        char block_root_hex[ROOT_HEX_BUFFER_LEN];
+        char parent_root_hex[ROOT_HEX_BUFFER_LEN];
+        char post_justified_root_hex[ROOT_HEX_BUFFER_LEN];
+        char post_finalized_root_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(&entry->root, block_root_hex, sizeof(block_root_hex));
+        format_root_hex(&block->parent_root, parent_root_hex, sizeof(parent_root_hex));
+        format_root_hex(
+            &post_justified->root,
+            post_justified_root_hex,
+            sizeof(post_justified_root_hex));
+        format_root_hex(
+            &post_finalized->root,
+            post_finalized_root_hex,
+            sizeof(post_finalized_root_hex));
+
+        bool justified_known =
+            !lantern_root_is_zero(&post_justified->root)
+            && lantern_fork_choice_block_info(
+                   &client->fork_choice,
+                   &post_justified->root,
+                   NULL,
+                   NULL,
+                   NULL)
+                == 0;
+        bool finalized_known =
+            !lantern_root_is_zero(&post_finalized->root)
+            && lantern_fork_choice_block_info(
+                   &client->fork_choice,
+                   &post_finalized->root,
+                   NULL,
+                   NULL,
+                   NULL)
+                == 0;
+        bool trace_restore_entry =
+            block->slot <= client->state.slot + 4u
+            || (store_anchor_root
+                && (memcmp(
+                        post_justified->root.bytes,
+                        store_anchor_root->bytes,
+                        LANTERN_ROOT_SIZE)
+                        != 0
+                    || memcmp(
+                           post_finalized->root.bytes,
+                           store_anchor_root->bytes,
+                           LANTERN_ROOT_SIZE)
+                           != 0));
+        if (trace_restore_entry)
+        {
+            lantern_log_info(
+                "forkchoice",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "restore candidate slot=%" PRIu64 " root=%s parent=%s"
+                " cached_post_state=%s post_justified_slot=%" PRIu64
+                " post_justified_root=%s post_justified_known=%s"
+                " post_finalized_slot=%" PRIu64 " post_finalized_root=%s"
+                " post_finalized_known=%s canonical_anchor_state=%s",
+                block->slot,
+                block_root_hex[0] ? block_root_hex : "0x0",
+                parent_root_hex[0] ? parent_root_hex : "0x0",
+                have_cached_post_state ? "true" : "false",
+                post_justified->slot,
+                post_justified_root_hex[0] ? post_justified_root_hex : "0x0",
+                justified_known ? "true" : "false",
+                post_finalized->slot,
+                post_finalized_root_hex[0] ? post_finalized_root_hex : "0x0",
+                finalized_known ? "true" : "false",
+                using_canonical_anchor_state ? "true" : "false");
+        }
+
         if (lantern_fork_choice_add_block_with_state(
                 &client->fork_choice,
                 block,
@@ -963,14 +1260,28 @@ int restore_persisted_blocks(struct lantern_client *client)
                 post_justified,
                 post_finalized,
                 &entry->root,
-                have_cached_post_state ? &cached_post_state : NULL)
+                post_state_for_restore)
             != 0)
         {
             lantern_log_warn(
                 "forkchoice",
                 &(const struct lantern_log_metadata){.validator = client->node_id},
-                "failed to restore block at slot %" PRIu64,
-                entry->block.message.block.slot);
+                "failed to restore block at slot %" PRIu64
+                " root=%s parent=%s cached_post_state=%s post_justified_slot=%" PRIu64
+                " post_justified_root=%s post_justified_known=%s"
+                " post_finalized_slot=%" PRIu64 " post_finalized_root=%s"
+                " post_finalized_known=%s canonical_anchor_state=%s",
+                entry->block.message.block.slot,
+                block_root_hex[0] ? block_root_hex : "0x0",
+                parent_root_hex[0] ? parent_root_hex : "0x0",
+                have_cached_post_state ? "true" : "false",
+                post_justified->slot,
+                post_justified_root_hex[0] ? post_justified_root_hex : "0x0",
+                justified_known ? "true" : "false",
+                post_finalized->slot,
+                post_finalized_root_hex[0] ? post_finalized_root_hex : "0x0",
+                finalized_known ? "true" : "false",
+                using_canonical_anchor_state ? "true" : "false");
         }
         else
         {
@@ -994,10 +1305,85 @@ int restore_persisted_blocks(struct lantern_client *client)
             "advancing fork choice time after restore failed");
     }
 
+    LanternCheckpoint restored_justified = client->state.latest_justified;
+    LanternCheckpoint restored_finalized = client->state.latest_finalized;
+    const LanternRoot *restore_anchor_root =
+        lantern_fork_choice_anchor_root(&client->fork_choice);
+    uint64_t restore_anchor_slot = 0;
+    bool have_restore_anchor_slot =
+        lantern_fork_choice_anchor_slot(&client->fork_choice, &restore_anchor_slot) == 0;
+    bool restored_justified_known =
+        !lantern_root_is_zero(&restored_justified.root)
+        && lantern_fork_choice_block_info(
+               &client->fork_choice,
+               &restored_justified.root,
+               NULL,
+               NULL,
+               NULL)
+            == 0;
+    bool restored_finalized_known =
+        !lantern_root_is_zero(&restored_finalized.root)
+        && lantern_fork_choice_block_info(
+               &client->fork_choice,
+               &restored_finalized.root,
+               NULL,
+               NULL,
+               NULL)
+            == 0;
+    if (restore_anchor_root && have_restore_anchor_slot)
+    {
+        if (!restored_justified_known && restored_justified.slot <= restore_anchor_slot)
+        {
+            char original_justified_hex[ROOT_HEX_BUFFER_LEN];
+            char anchor_hex[ROOT_HEX_BUFFER_LEN];
+            format_root_hex(
+                &restored_justified.root,
+                original_justified_hex,
+                sizeof(original_justified_hex));
+            format_root_hex(
+                restore_anchor_root,
+                anchor_hex,
+                sizeof(anchor_hex));
+            lantern_log_info(
+                "forkchoice",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "aliasing restored justified checkpoint slot=%" PRIu64
+                " original_root=%s anchor_slot=%" PRIu64 " anchor_root=%s",
+                restored_justified.slot,
+                original_justified_hex[0] ? original_justified_hex : "0x0",
+                restore_anchor_slot,
+                anchor_hex[0] ? anchor_hex : "0x0");
+            restored_justified.root = *restore_anchor_root;
+        }
+        if (!restored_finalized_known && restored_finalized.slot <= restore_anchor_slot)
+        {
+            char original_finalized_hex[ROOT_HEX_BUFFER_LEN];
+            char anchor_hex[ROOT_HEX_BUFFER_LEN];
+            format_root_hex(
+                &restored_finalized.root,
+                original_finalized_hex,
+                sizeof(original_finalized_hex));
+            format_root_hex(
+                restore_anchor_root,
+                anchor_hex,
+                sizeof(anchor_hex));
+            lantern_log_info(
+                "forkchoice",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "aliasing restored finalized checkpoint slot=%" PRIu64
+                " original_root=%s anchor_slot=%" PRIu64 " anchor_root=%s",
+                restored_finalized.slot,
+                original_finalized_hex[0] ? original_finalized_hex : "0x0",
+                restore_anchor_slot,
+                anchor_hex[0] ? anchor_hex : "0x0");
+            restored_finalized.root = *restore_anchor_root;
+        }
+    }
+
     if (lantern_fork_choice_restore_checkpoints(
             &client->fork_choice,
-            &client->state.latest_justified,
-            &client->state.latest_finalized)
+            &restored_justified,
+            &restored_finalized)
         != 0)
     {
         lantern_log_warn(
@@ -2685,6 +3071,16 @@ void lantern_client_process_pending_children(
             continue;
         }
 
+        char parent_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(&current_parent, parent_hex, sizeof(parent_hex));
+        lantern_log_info(
+            "sync",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "pending child replay starting parent=%s pending=%zu queue_len=%zu",
+            parent_hex[0] ? parent_hex : "0x0",
+            pending_count,
+            client->pending_blocks.length);
+
         struct pending_child_replay *replays =
             calloc(pending_count, sizeof(*replays));
         if (!replays)
@@ -2781,8 +3177,15 @@ void lantern_client_process_pending_children(
         }
         free(replays);
 
-        char parent_hex[ROOT_HEX_BUFFER_LEN];
-        format_root_hex(&current_parent, parent_hex, sizeof(parent_hex));
+        lantern_log_info(
+            "sync",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "pending child replay finished parent=%s pending=%zu replayed=%zu imported=%zu queued=%zu",
+            parent_hex[0] ? parent_hex : "0x0",
+            pending_count,
+            replay_count,
+            imported_count,
+            queued_children);
         lantern_log_debug(
             "sync",
             &(const struct lantern_log_metadata){.validator = client->node_id},

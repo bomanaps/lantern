@@ -2123,6 +2123,84 @@ static enum block_parent_action handle_block_parent_locked(
     bool parent_known = lantern_client_block_known_locked(client, &parent_root, NULL);
     if (!parent_known)
     {
+        struct lantern_log_metadata parent_meta = {0};
+        if (meta)
+        {
+            parent_meta = *meta;
+        }
+        parent_meta.has_slot = true;
+        parent_meta.slot = block->message.block.slot;
+
+        LanternRoot head_root = {0};
+        uint64_t head_slot = client->state.slot;
+        if (client->has_fork_choice
+            && lantern_fork_choice_current_head(&client->fork_choice, &head_root) == 0)
+        {
+            uint64_t fork_slot = 0;
+            if (lantern_fork_choice_block_info(
+                    &client->fork_choice,
+                    &head_root,
+                    &fork_slot,
+                    NULL,
+                    NULL)
+                == 0)
+            {
+                head_slot = fork_slot;
+            }
+        }
+        const LanternRoot *anchor_root =
+            client->has_fork_choice
+                ? lantern_fork_choice_anchor_root(&client->fork_choice)
+                : NULL;
+        uint64_t anchor_slot = 0;
+        bool have_anchor_slot =
+            client->has_fork_choice
+            && lantern_fork_choice_anchor_slot(&client->fork_choice, &anchor_slot) == 0;
+        const LanternCheckpoint *store_latest_justified =
+            client->has_fork_choice
+                ? lantern_fork_choice_latest_justified(&client->fork_choice)
+                : NULL;
+        const LanternCheckpoint *store_latest_finalized =
+            client->has_fork_choice
+                ? lantern_fork_choice_latest_finalized(&client->fork_choice)
+                : NULL;
+        char block_hex[ROOT_HEX_BUFFER_LEN];
+        char parent_hex[ROOT_HEX_BUFFER_LEN];
+        char head_hex[ROOT_HEX_BUFFER_LEN];
+        char anchor_hex[ROOT_HEX_BUFFER_LEN];
+        char justified_hex[ROOT_HEX_BUFFER_LEN];
+        char finalized_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(block_root, block_hex, sizeof(block_hex));
+        format_root_hex(&parent_root, parent_hex, sizeof(parent_hex));
+        format_root_hex(&head_root, head_hex, sizeof(head_hex));
+        format_root_hex(anchor_root, anchor_hex, sizeof(anchor_hex));
+        format_root_hex(
+            store_latest_justified ? &store_latest_justified->root : NULL,
+            justified_hex,
+            sizeof(justified_hex));
+        format_root_hex(
+            store_latest_finalized ? &store_latest_finalized->root : NULL,
+            finalized_hex,
+            sizeof(finalized_hex));
+        lantern_log_info(
+            "state",
+            &parent_meta,
+            "parent missing for block slot=%" PRIu64 " root=%s parent=%s"
+            " head_slot=%" PRIu64 " head_root=%s anchor_slot=%" PRIu64
+            " anchor_root=%s store_justified_slot=%" PRIu64
+            " store_justified_root=%s store_finalized_slot=%" PRIu64
+            " store_finalized_root=%s",
+            block->message.block.slot,
+            block_hex[0] ? block_hex : "0x0",
+            parent_hex[0] ? parent_hex : "0x0",
+            head_slot,
+            head_hex[0] ? head_hex : "0x0",
+            have_anchor_slot ? anchor_slot : 0u,
+            anchor_hex[0] ? anchor_hex : "0x0",
+            store_latest_justified ? store_latest_justified->slot : 0u,
+            justified_hex[0] ? justified_hex : "0x0",
+            store_latest_finalized ? store_latest_finalized->slot : 0u,
+            finalized_hex[0] ? finalized_hex : "0x0");
         const char *peer_text = meta && meta->peer ? meta->peer : NULL;
         lantern_client_unlock_state(client, *state_locked);
         *state_locked = false;
