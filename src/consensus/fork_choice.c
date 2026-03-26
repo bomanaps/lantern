@@ -508,9 +508,7 @@ static int register_block(
     const LanternRoot *root,
     const LanternRoot *parent_root,
     uint64_t slot,
-    LanternValidatorIndex proposer_index,
-    const LanternCheckpoint *latest_justified,
-    const LanternCheckpoint *latest_finalized) {
+    LanternValidatorIndex proposer_index) {
     if (!store || !root) {
         return -1;
     }
@@ -519,14 +517,6 @@ static int register_block(
         struct lantern_fork_choice_block_entry *entry = &store->blocks[existing_index];
         entry->slot = slot;
         entry->proposer_index = proposer_index;
-        if (latest_justified) {
-            entry->latest_justified = *latest_justified;
-            entry->has_justified = true;
-        }
-        if (latest_finalized) {
-            entry->latest_finalized = *latest_finalized;
-            entry->has_finalized = true;
-        }
         if (parent_root) {
             entry->parent_root = *parent_root;
             entry->parent_index = parent_index_for_block(store, parent_root);
@@ -548,18 +538,6 @@ static int register_block(
     entry->proposer_index = proposer_index;
     entry->has_validator_count = false;
     entry->validator_count = 0;
-    entry->has_justified = latest_justified != NULL;
-    if (latest_justified) {
-        entry->latest_justified = *latest_justified;
-    } else {
-        memset(&entry->latest_justified, 0, sizeof(entry->latest_justified));
-    }
-    entry->has_finalized = latest_finalized != NULL;
-    if (latest_finalized) {
-        entry->latest_finalized = *latest_finalized;
-    } else {
-        memset(&entry->latest_finalized, 0, sizeof(entry->latest_finalized));
-    }
     size_t new_index = store->block_len;
     store->block_len += 1;
     if (map_insert(store, root, new_index) != 0) {
@@ -697,8 +675,8 @@ int lantern_fork_choice_set_anchor_with_state(
         previous_entry = store->blocks[existing_index];
     }
     size_t previous_block_len = store->block_len;
-    LanternCheckpoint previous_justified = store->latest_justified;
-    LanternCheckpoint previous_finalized = store->latest_finalized;
+    LanternCheckpoint previous_latest_justified = store->latest_justified;
+    LanternCheckpoint previous_latest_finalized = store->latest_finalized;
     LanternRoot previous_anchor_root = store->anchor_root;
     uint64_t previous_anchor_slot = store->anchor_slot;
     LanternRoot previous_head = store->head;
@@ -713,9 +691,7 @@ int lantern_fork_choice_set_anchor_with_state(
             &root,
             &anchor_block->parent_root,
             anchor_block->slot,
-            anchor_block->proposer_index,
-            latest_justified,
-            latest_finalized)
+            anchor_block->proposer_index)
         != 0) {
         return -1;
     }
@@ -739,8 +715,8 @@ int lantern_fork_choice_set_anchor_with_state(
     uint64_t anchor_intervals = anchor_block->slot * store->intervals_per_slot;
     store->time_intervals = anchor_intervals;
     if (anchor_state && lantern_fork_choice_set_block_state(store, &root, anchor_state) != 0) {
-        store->latest_justified = previous_justified;
-        store->latest_finalized = previous_finalized;
+        store->latest_justified = previous_latest_justified;
+        store->latest_finalized = previous_latest_finalized;
         store->anchor_root = previous_anchor_root;
         store->anchor_slot = previous_anchor_slot;
         store->head = previous_head;
@@ -780,28 +756,61 @@ static bool checkpoint_known_in_store(
     if (!store->blocks || checkpoint_index >= store->block_len) {
         return false;
     }
+    if (store->has_anchor && root_compare(&checkpoint->root, &store->anchor_root) == 0) {
+        return true;
+    }
     return store->blocks[checkpoint_index].slot == checkpoint->slot;
 }
 
-static int update_global_checkpoints(
+static bool should_replace_checkpoint(
+    const LanternCheckpoint *current,
+    const LanternCheckpoint *candidate) {
+    if (!current || !candidate || root_is_zero(&candidate->root)) {
+        return false;
+    }
+    if (candidate->slot > current->slot) {
+        return true;
+    }
+    if (candidate->slot == current->slot
+        && root_compare(&candidate->root, &current->root) != 0) {
+        return true;
+    }
+    return false;
+}
+
+static int update_latest_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *post_justified,
     const LanternCheckpoint *post_finalized) {
     if (!store) {
         return -1;
     }
-    if (post_justified
-        && !root_is_zero(&post_justified->root)
-        && post_justified->slot > store->latest_justified.slot
-        && checkpoint_known_in_store(store, post_justified)) {
-        store->latest_justified = *post_justified;
+    LanternCheckpoint latest_justified = store->latest_justified;
+    LanternCheckpoint latest_finalized = store->latest_finalized;
+
+    if (post_justified && !root_is_zero(&post_justified->root)) {
+        if (!checkpoint_known_in_store(store, post_justified)) {
+            return -1;
+        }
+        if (should_replace_checkpoint(&latest_justified, post_justified)) {
+            latest_justified = *post_justified;
+        }
     }
-    if (post_finalized
-        && !root_is_zero(&post_finalized->root)
-        && post_finalized->slot > store->latest_finalized.slot
-        && checkpoint_known_in_store(store, post_finalized)) {
-        store->latest_finalized = *post_finalized;
+    if (post_finalized && !root_is_zero(&post_finalized->root)) {
+        if (!checkpoint_known_in_store(store, post_finalized)) {
+            return -1;
+        }
+        if (should_replace_checkpoint(&latest_finalized, post_finalized)) {
+            latest_finalized = *post_finalized;
+        }
     }
+
+    if (latest_finalized.slot > latest_justified.slot) {
+        return -1;
+    }
+
+    store->latest_justified = latest_justified;
+    store->latest_finalized = latest_finalized;
     return 0;
 }
 
@@ -851,8 +860,8 @@ int lantern_fork_choice_add_block_with_state(
         }
     }
 
-    LanternCheckpoint previous_justified = store->latest_justified;
-    LanternCheckpoint previous_finalized = store->latest_finalized;
+    LanternCheckpoint previous_latest_justified = store->latest_justified;
+    LanternCheckpoint previous_latest_finalized = store->latest_finalized;
     LanternRoot previous_head = store->head;
     bool had_head = store->has_head;
 
@@ -894,15 +903,13 @@ int lantern_fork_choice_add_block_with_state(
             &block_root,
             &block->parent_root,
             block->slot,
-            block->proposer_index,
-            post_justified,
-            post_finalized)
+            block->proposer_index)
         != 0) {
         free(touched);
         vote_undo_reset(&undo);
         return -1;
     }
-    if (update_global_checkpoints(store, post_justified, post_finalized) != 0) {
+    if (update_latest_checkpoints(store, post_justified, post_finalized) != 0) {
         goto rollback;
     }
 
@@ -960,8 +967,8 @@ rollback_attestations:
     lantern_attestations_reset(&expanded);
 
 rollback:
-    store->latest_justified = previous_justified;
-    store->latest_finalized = previous_finalized;
+    store->latest_justified = previous_latest_justified;
+    store->latest_finalized = previous_latest_finalized;
     store->head = previous_head;
     store->has_head = had_head;
 
@@ -1040,7 +1047,7 @@ int lantern_fork_choice_update_checkpoints(
     if (!store || !store->initialized) {
         return -1;
     }
-    return update_global_checkpoints(store, latest_justified, latest_finalized);
+    return update_latest_checkpoints(store, latest_justified, latest_finalized);
 }
 
 int lantern_fork_choice_restore_checkpoints(
@@ -1051,45 +1058,41 @@ int lantern_fork_choice_restore_checkpoints(
         return -1;
     }
 
-    LanternCheckpoint restored_justified = store->latest_justified;
-    LanternCheckpoint restored_finalized = store->latest_finalized;
-    bool justified_changed = false;
+    LanternCheckpoint restored_latest_justified = store->latest_justified;
+    LanternCheckpoint restored_latest_finalized = store->latest_finalized;
 
     if (latest_justified && !root_is_zero(&latest_justified->root)) {
-        size_t justified_index = 0;
-        if (!map_lookup(store, &latest_justified->root, &justified_index)) {
+        if (!checkpoint_known_in_store(store, latest_justified)) {
             return -1;
         }
-        restored_justified = *latest_justified;
-        justified_changed = true;
+        restored_latest_justified = *latest_justified;
     }
     if (latest_finalized && !root_is_zero(&latest_finalized->root)) {
-        size_t finalized_index = 0;
-        if (!map_lookup(store, &latest_finalized->root, &finalized_index)) {
+        if (!checkpoint_known_in_store(store, latest_finalized)) {
             return -1;
         }
-        restored_finalized = *latest_finalized;
+        restored_latest_finalized = *latest_finalized;
     }
-    if (restored_finalized.slot > restored_justified.slot) {
+    if (restored_latest_finalized.slot > restored_latest_justified.slot) {
         return -1;
     }
 
-    LanternCheckpoint previous_justified = store->latest_justified;
-    LanternCheckpoint previous_finalized = store->latest_finalized;
+    LanternCheckpoint previous_latest_justified = store->latest_justified;
+    LanternCheckpoint previous_latest_finalized = store->latest_finalized;
     LanternRoot previous_head = store->head;
     bool previous_has_head = store->has_head;
 
-    store->latest_justified = restored_justified;
-    if (justified_changed && lantern_fork_choice_recompute_head(store) != 0) {
-        store->latest_justified = previous_justified;
-        store->latest_finalized = previous_finalized;
+    store->latest_justified = restored_latest_justified;
+    store->latest_finalized = restored_latest_finalized;
+    if (!root_is_zero(&restored_latest_justified.root)
+        && lantern_fork_choice_recompute_head(store) != 0) {
+        store->latest_justified = previous_latest_justified;
+        store->latest_finalized = previous_latest_finalized;
         store->head = previous_head;
         store->has_head = previous_has_head;
         return -1;
     }
 
-    store->latest_justified = restored_justified;
-    store->latest_finalized = restored_finalized;
     return 0;
 }
 

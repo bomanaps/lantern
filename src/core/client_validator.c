@@ -1781,35 +1781,30 @@ int validator_publish_vote(struct lantern_client *client, const LanternSignedVot
     }
     lantern_client_unlock_state(client, state_locked);
 
-    int rc = lantern_gossipsub_service_publish_vote(&client->gossip, vote);
-    if (rc != 0)
-    {
-        lantern_log_warn(
-            "gossip",
-            &meta,
-            "failed to publish attestation validator=%" PRIu64 " slot=%" PRIu64,
-            vote->data.validator_id,
-            vote->data.slot);
-        return LANTERN_CLIENT_ERR_NETWORK;
-    }
     size_t subnet_id = 0;
     if (lantern_validator_index_compute_subnet_id(
             vote->data.validator_id,
             validator_attestation_committee_count(client),
             &subnet_id)
         == 0) {
-        if (subnet_id == client->gossip.attestation_subnet_id) {
-            if (lantern_gossipsub_service_publish_vote_subnet(&client->gossip, vote) != 0) {
-                lantern_log_warn(
-                    "gossip",
-                    &meta,
-                    "failed to publish subnet attestation validator=%" PRIu64 " slot=%" PRIu64 " subnet=%zu",
-                    vote->data.validator_id,
-                    vote->data.slot,
-                    subnet_id);
-                return LANTERN_CLIENT_ERR_NETWORK;
-            }
+        if (lantern_gossipsub_service_publish_vote_subnet(&client->gossip, vote, subnet_id) != 0) {
+            lantern_log_warn(
+                "gossip",
+                &meta,
+                "failed to publish subnet attestation validator=%" PRIu64 " slot=%" PRIu64 " subnet=%zu",
+                vote->data.validator_id,
+                vote->data.slot,
+                subnet_id);
+            return LANTERN_CLIENT_ERR_NETWORK;
         }
+    } else {
+        lantern_log_warn(
+            "gossip",
+            &meta,
+            "failed to compute attestation subnet validator=%" PRIu64 " slot=%" PRIu64,
+            vote->data.validator_id,
+            vote->data.slot);
+        return LANTERN_CLIENT_ERR_NETWORK;
     }
     lantern_log_info(
         "gossip",

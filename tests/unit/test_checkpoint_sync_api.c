@@ -907,7 +907,7 @@ static int test_health_endpoint(void)
     expect_true(strstr(header, "HTTP/1.1 200") != NULL, "status 200 health");
     expect_true(strstr(header, "Content-Type: application/json") != NULL, "content-type health");
 
-    static const char expected[] = "{\"status\":\"healthy\",\"service\":\"lean-spec-api\"}";
+    static const char expected[] = "{\"status\":\"healthy\",\"service\":\"lean-rpc-api\"}";
     size_t body_len = response_len - header_end;
     expect_true(body_len == sizeof(expected) - 1u, "health body length");
     expect_true(memcmp(response + header_end, expected, sizeof(expected) - 1u) == 0, "health body");

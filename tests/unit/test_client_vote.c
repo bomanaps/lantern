@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -6,11 +7,13 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "../../src/core/client_services_internal.h"
 #include "lantern/consensus/duties.h"
 #include "client_test_helpers.h"
 #include "lantern/consensus/hash.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/networking/gossip_payloads.h"
+#include "lantern/support/string_list.h"
 #include "lantern/storage/storage.h"
 #include "lantern/support/time.h"
 
@@ -64,6 +67,91 @@ static void test_reset_agg_cache(struct lantern_client *client) {
         return;
     }
     lantern_store_reset(&client->store);
+}
+
+static int test_enable_blocks_request_peer(
+    struct lantern_client *client,
+    const char *peer_id)
+{
+    if (!client || !peer_id || peer_id[0] == '\0') {
+        return -1;
+    }
+
+    lantern_string_list_init(&client->connected_peer_ids);
+    if (pthread_mutex_init(&client->connection_lock, NULL) != 0) {
+        return -1;
+    }
+    client->connection_lock_initialized = true;
+
+    if (pthread_mutex_init(&client->status_lock, NULL) != 0) {
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        return -1;
+    }
+    client->status_lock_initialized = true;
+
+    if (lantern_string_list_append(&client->connected_peer_ids, peer_id) != 0) {
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        return -1;
+    }
+    client->connected_peers = 1u;
+
+    client->peer_status_entries = calloc(1u, sizeof(*client->peer_status_entries));
+    if (!client->peer_status_entries) {
+        client->connected_peers = 0u;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        return -1;
+    }
+    client->peer_status_count = 1u;
+    client->peer_status_capacity = 1u;
+    strncpy(
+        client->peer_status_entries[0].peer_id,
+        peer_id,
+        sizeof(client->peer_status_entries[0].peer_id) - 1u);
+    client->peer_status_entries[0].peer_id[sizeof(client->peer_status_entries[0].peer_id) - 1u] =
+        '\0';
+
+    return 0;
+}
+
+static void test_disable_blocks_request_peer(struct lantern_client *client)
+{
+    if (!client) {
+        return;
+    }
+
+    free(client->peer_status_entries);
+    client->peer_status_entries = NULL;
+    client->peer_status_count = 0u;
+    client->peer_status_capacity = 0u;
+
+    free(client->active_blocks_requests);
+    client->active_blocks_requests = NULL;
+    client->active_blocks_request_count = 0u;
+    client->active_blocks_request_capacity = 0u;
+    client->next_blocks_request_id = 0u;
+
+    if (client->status_lock_initialized) {
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+    }
+
+    if (client->connection_lock_initialized) {
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+    }
+
+    lantern_string_list_reset(&client->connected_peer_ids);
+    client->connected_peers = 0u;
 }
 
 static int test_make_dummy_proof(
@@ -413,6 +501,13 @@ static int test_record_vote_buffers_missing_target_state(void) {
         != 0) {
         return 1;
     }
+    if (test_enable_blocks_request_peer(
+            &client,
+            "12D3KooWLU9zbm4c9KTL3f6bAtestVoteMissingTarget111111111111")
+        != 0) {
+        fprintf(stderr, "failed to set up schedulable peer for missing target state test\n");
+        goto cleanup;
+    }
 
     lantern_block_body_init(&grandchild.body);
     uint64_t child_slot = 0;
@@ -458,11 +553,100 @@ static int test_record_vote_buffers_missing_target_state(void) {
         fprintf(stderr, "vote with missing target state should be buffered\n");
         goto cleanup;
     }
+    if (client.next_blocks_request_id != 0u) {
+        fprintf(stderr, "missing target state vote should not schedule block requests\n");
+        goto cleanup;
+    }
 
     rc = 0;
 
 cleanup:
+    test_disable_blocks_request_peer(&client);
     lantern_block_body_reset(&grandchild.body);
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
+static int test_record_vote_buffers_source_root_known_only_via_historical_hashes(void) {
+    struct lantern_client client;
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    LanternRoot anchor_root;
+    LanternRoot child_root;
+    LanternRoot historical_source_root;
+    int rc = 1;
+
+    memset(&historical_source_root, 0, sizeof(historical_source_root));
+
+    if (client_test_setup_vote_validation_client(
+            &client,
+            "vote_historical_source_only",
+            &pub,
+            &secret,
+            &anchor_root,
+            &child_root)
+        != 0) {
+        return 1;
+    }
+
+    if (lantern_fork_choice_set_block_state(&client.fork_choice, &child_root, &client.state) != 0) {
+        fprintf(stderr, "failed to cache child state for historical source test\n");
+        goto cleanup;
+    }
+
+    if (lantern_root_list_resize(&client.state.historical_block_hashes, 1u) != 0) {
+        fprintf(stderr, "failed to resize historical block hashes for source fallback test\n");
+        goto cleanup;
+    }
+    client_test_fill_root(&historical_source_root, 0xA5u);
+    client.state.historical_block_hashes.items[0] = historical_source_root;
+
+    {
+        uint64_t unexpected_slot = 0;
+        if (client_test_slot_for_root(&client, &historical_source_root, &unexpected_slot) == 0) {
+            fprintf(stderr, "historical-only source root unexpectedly exists in fork choice\n");
+            goto cleanup;
+        }
+    }
+
+    LanternSignedVote vote;
+    memset(&vote, 0, sizeof(vote));
+    uint64_t child_slot = 0;
+    if (client_test_slot_for_root(&client, &child_root, &child_slot) != 0) {
+        fprintf(stderr, "failed to resolve child slot for historical source test\n");
+        goto cleanup;
+    }
+    vote.data.validator_id = 0u;
+    vote.data.slot = 2u;
+    vote.data.head.slot = child_slot;
+    vote.data.head.root = child_root;
+    vote.data.target.slot = child_slot;
+    vote.data.target.root = child_root;
+    vote.data.source.slot = 0u;
+    vote.data.source.root = historical_source_root;
+
+    if (client_test_sign_vote_with_secret(&vote, secret) != 0) {
+        fprintf(stderr, "failed to sign vote with historical-only source root\n");
+        goto cleanup;
+    }
+
+    if (lantern_client_debug_record_vote(&client, &vote, "vote_historical_source_peer") != 0) {
+        fprintf(stderr, "lantern_client_debug_record_vote failed for historical source test\n");
+        goto cleanup;
+    }
+
+    if (lantern_store_validator_has_vote(&client.store, 0u)) {
+        fprintf(stderr, "historical-only source root vote should not be stored\n");
+        goto cleanup;
+    }
+    if (lantern_client_pending_vote_count(&client) != 1u) {
+        fprintf(stderr, "historical-only source root vote should be buffered\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
     client_test_teardown_vote_validation_client(&client, pub, secret);
     return rc;
 }
@@ -2302,8 +2486,8 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
         fprintf(stderr, "failed to record votes for subnet filter test\n");
         goto cleanup;
     }
-    if (client.store.gossip_signatures.length != 2u) {
-        fprintf(stderr, "expected only matching-subnet gossip signatures before aggregation\n");
+    if (client.store.gossip_signatures.length != 3u) {
+        fprintf(stderr, "expected every gossip signature to be cached before aggregation\n");
         goto cleanup;
     }
     if (lantern_hash_tree_root_attestation_data(&vote0.data.data, &data_root) != 0) {
@@ -2333,11 +2517,11 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
     if (!lantern_bitlist_get(&decoded.proof.participants, 0u)
         || !lantern_bitlist_get(&decoded.proof.participants, 4u)
         || lantern_bitlist_get(&decoded.proof.participants, 1u)) {
-        fprintf(stderr, "published aggregated proof participants did not enforce subnet filtering\n");
+        fprintf(stderr, "published aggregated proof participants should still match the local subnet\n");
         goto cleanup;
     }
-    if (client.store.gossip_signatures.length != 0u) {
-        fprintf(stderr, "expected aggregated gossip signatures to be fully pruned after publish\n");
+    if (client.store.gossip_signatures.length != 1u) {
+        fprintf(stderr, "expected only the aggregated subnet signatures to be pruned after publish\n");
         goto cleanup;
     }
     if (lantern_store_get_gossip_signature(&client.store, &vote0_key, &cached_signature) == 0
@@ -2345,8 +2529,8 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
         fprintf(stderr, "aggregated subnet votes should have been removed from gossip cache\n");
         goto cleanup;
     }
-    if (lantern_store_get_gossip_signature(&client.store, &vote1_key, &cached_signature) == 0) {
-        fprintf(stderr, "cross-subnet gossip vote should never enter the gossip signature cache\n");
+    if (lantern_store_get_gossip_signature(&client.store, &vote1_key, &cached_signature) != 0) {
+        fprintf(stderr, "cross-subnet gossip vote should remain cached after local subnet aggregation\n");
         goto cleanup;
     }
 
@@ -2543,6 +2727,9 @@ int main(void) {
         return 1;
     }
     if (test_record_vote_buffers_missing_target_state() != 0) {
+        return 1;
+    }
+    if (test_record_vote_buffers_source_root_known_only_via_historical_hashes() != 0) {
         return 1;
     }
     if (test_record_vote_buffers_unknown_head() != 0) {

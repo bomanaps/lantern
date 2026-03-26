@@ -301,9 +301,13 @@ int gossip_vote_handler(
 static bool verify_and_cache_aggregated_attestation_locked(
     struct lantern_client *client,
     const LanternSignedAggregatedAttestation *attestation,
-    const struct lantern_log_metadata *meta) {
+    const struct lantern_log_metadata *meta,
+    LanternRoot *out_missing_root) {
     if (!client || !attestation || !meta || !client->has_state) {
         return false;
+    }
+    if (out_missing_root) {
+        memset(out_missing_root, 0, sizeof(*out_missing_root));
     }
     if (attestation->proof.participants.bit_length == 0
         || !attestation->proof.participants.bytes
@@ -314,12 +318,28 @@ static bool verify_and_cache_aggregated_attestation_locked(
 
     LanternState target_state;
     lantern_state_init(&target_state);
-    const LanternState *sig_state = lantern_client_state_for_root_locked(
+    LanternRoot missing_root = {0};
+    const LanternState *sig_state = lantern_client_state_for_root_local_locked(
         client,
         &attestation->data.target.root,
         &target_state,
         NULL);
+    if (!sig_state
+        && !lantern_client_find_missing_state_root_locked(
+               client,
+               &attestation->data.target.root,
+               &missing_root)) {
+        sig_state = lantern_client_state_for_root_locked(
+            client,
+            &attestation->data.target.root,
+            &target_state,
+            NULL);
+    }
     if (!sig_state) {
+        if (out_missing_root) {
+            *out_missing_root =
+                lantern_root_is_zero(&missing_root) ? attestation->data.target.root : missing_root;
+        }
         lantern_state_reset(&target_state);
         return false;
     }
@@ -416,14 +436,22 @@ int gossip_aggregated_attestation_handler(
     if (!locked) {
         return LANTERN_CLIENT_ERR_RUNTIME;
     }
-    bool verified = verify_and_cache_aggregated_attestation_locked(client, attestation, &meta);
+    LanternRoot missing_root = {0};
+    bool verified = verify_and_cache_aggregated_attestation_locked(
+        client,
+        attestation,
+        &meta,
+        &missing_root);
     lantern_client_unlock_state(client, locked);
     if (!verified) {
+        char missing_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(&missing_root, missing_hex, sizeof(missing_hex));
         lantern_log_debug(
             "gossip",
             &meta,
-            "ignoring aggregated attestation slot=%" PRIu64,
-            attestation->data.slot);
+            "ignoring aggregated attestation slot=%" PRIu64 " missing_root=%s",
+            attestation->data.slot,
+            missing_hex[0] ? missing_hex : "0x0");
         return LANTERN_CLIENT_ERR_IGNORED;
     }
     lantern_log_debug(
@@ -728,23 +756,21 @@ int initialize_fork_choice(struct lantern_client *client)
     anchor.state_root = anchor_state_root;
     lantern_block_body_init(&anchor.body);
 
-    LanternCheckpoint anchor_checkpoint;
-    anchor_checkpoint.root = anchor_root;
-    anchor_checkpoint.slot = anchor.slot;
+    LanternCheckpoint anchor_justified = client->state.latest_justified;
+    LanternCheckpoint anchor_finalized = client->state.latest_finalized;
+    anchor_justified.root = anchor_root;
+    anchor_finalized.root = anchor_root;
 
     /*
-     * Seed fork-choice with anchor_checkpoint (whose root matches the anchor
-     * block that set_anchor registers in the tree).  This guarantees
-     * lmd_ghost_compute can always find its start_root during block restore.
-     *
-     * Real persisted checkpoints are synced to the store AFTER
-     * restore_persisted_blocks() via lantern_fork_choice_restore_checkpoints().
+     * Seed fork-choice with the anchor block/root while preserving the state's
+     * justified/finalized slots. This matches LeanSpec checkpoint bootstrap:
+     * both checkpoints refer to the materialized anchor root from the start.
      */
     if (lantern_fork_choice_set_anchor_with_state(
             &client->fork_choice,
             &anchor,
-            &anchor_checkpoint,
-            &anchor_checkpoint,
+            &anchor_justified,
+            &anchor_finalized,
             &anchor_root,
             &client->state)
         != 0)
@@ -968,48 +994,10 @@ int restore_persisted_blocks(struct lantern_client *client)
             "advancing fork choice time after restore failed");
     }
 
-    LanternCheckpoint restored_justified = client->state.latest_justified;
-    LanternCheckpoint restored_finalized = client->state.latest_finalized;
-    const LanternCheckpoint *anchor_checkpoint =
-        lantern_fork_choice_latest_justified(&client->fork_choice);
-    if (anchor_checkpoint && !lantern_root_is_zero(&anchor_checkpoint->root))
-    {
-        /*
-         * Keep checkpoint slots from state, but if the persisted checkpoint roots
-         * are not present in this local fork-choice tree (common after checkpoint
-         * sync), remap them to the local anchor root before restore.
-         *
-         * This mirrors leanSpec store bootstrap behavior where justified/finalized
-         * roots are anchored to the local store anchor.
-         */
-        if (!lantern_root_is_zero(&restored_justified.root)
-            && lantern_fork_choice_block_info(
-                   &client->fork_choice,
-                   &restored_justified.root,
-                   NULL,
-                   NULL,
-                   NULL)
-                != 0)
-        {
-            restored_justified.root = anchor_checkpoint->root;
-        }
-        if (!lantern_root_is_zero(&restored_finalized.root)
-            && lantern_fork_choice_block_info(
-                   &client->fork_choice,
-                   &restored_finalized.root,
-                   NULL,
-                   NULL,
-                   NULL)
-                != 0)
-        {
-            restored_finalized.root = anchor_checkpoint->root;
-        }
-    }
-
     if (lantern_fork_choice_restore_checkpoints(
             &client->fork_choice,
-            &restored_justified,
-            &restored_finalized)
+            &client->state.latest_justified,
+            &client->state.latest_finalized)
         != 0)
     {
         lantern_log_warn(
@@ -2066,6 +2054,73 @@ static bool pending_child_root_queue_next(
     *out_root = queue->items[queue->next_index];
     queue->next_index += 1u;
     return true;
+}
+
+void lantern_client_pending_remove_branch_by_root(
+    struct lantern_client *client,
+    const LanternRoot *root)
+{
+    if (!client || !root || lantern_root_is_zero(root))
+    {
+        return;
+    }
+
+    bool locked = lantern_client_lock_pending(client);
+    if (!locked)
+    {
+        return;
+    }
+
+    struct pending_child_root_queue queue;
+    pending_child_root_queue_init(&queue);
+    if (!pending_child_root_queue_append(&queue, root))
+    {
+        pending_child_root_queue_reset(&queue);
+        lantern_client_unlock_pending(client, locked);
+        return;
+    }
+
+    size_t removed = 0;
+    LanternRoot current = {0};
+    while (pending_child_root_queue_next(&queue, &current))
+    {
+        for (size_t i = client->pending_blocks.length; i-- > 0;)
+        {
+            struct lantern_pending_block *entry = &client->pending_blocks.items[i];
+            bool root_matches =
+                memcmp(entry->root.bytes, current.bytes, LANTERN_ROOT_SIZE) == 0;
+            bool child_matches =
+                memcmp(entry->parent_root.bytes, current.bytes, LANTERN_ROOT_SIZE) == 0;
+            if (!root_matches && !child_matches)
+            {
+                continue;
+            }
+
+            LanternRoot child_root = entry->root;
+            pending_block_list_remove(&client->pending_blocks, i);
+            removed += 1u;
+
+            if (child_matches)
+            {
+                (void)pending_child_root_queue_append(&queue, &child_root);
+            }
+        }
+    }
+
+    pending_child_root_queue_reset(&queue);
+    lantern_client_unlock_pending(client, locked);
+
+    if (removed > 0)
+    {
+        char root_hex[ROOT_HEX_BUFFER_LEN];
+        format_root_hex(root, root_hex, sizeof(root_hex));
+        lantern_log_debug(
+            "sync",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "pruned pending branch root=%s removed=%zu",
+            root_hex[0] ? root_hex : "0x0",
+            removed);
+    }
 }
 
 void lantern_client_request_pending_parent_after_blocks(

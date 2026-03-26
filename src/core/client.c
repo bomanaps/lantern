@@ -1298,7 +1298,7 @@ static int checkpoint_sync_parse_port(
     return 0;
 }
 
-static int checkpoint_sync_parse_url(
+int lantern_client_checkpoint_sync_parse_url(
     const char *url,
     char **out_host,
     uint16_t *out_port,
@@ -1322,7 +1322,7 @@ static int checkpoint_sync_parse_url(
     }
     else if (strncasecmp(url, https_prefix, strlen(https_prefix)) == 0)
     {
-        /* TLS not supported; downgrade to plain HTTP */
+        /* TLS transport is not implemented yet; downgrade to plain HTTP parsing */
         prefix_len = strlen(https_prefix);
     }
     else
@@ -2064,7 +2064,12 @@ static int checkpoint_sync_fetch_state_bytes(
     char *host = NULL;
     char *base_path = NULL;
     uint16_t port = 0;
-    if (checkpoint_sync_parse_url(checkpoint_sync_url, &host, &port, &base_path) != 0)
+    if (lantern_client_checkpoint_sync_parse_url(
+            checkpoint_sync_url,
+            &host,
+            &port,
+            &base_path)
+        != 0)
     {
         return -1;
     }
@@ -2345,14 +2350,12 @@ static lantern_client_error client_load_state_from_checkpoint(
     }
 
     /*
-     * Preserve checkpoint roots exactly as provided by the remote state.
-     *
-     * Rewriting justified/finalized roots here mutates state content before
-     * fork-choice anchor initialization, which can skew state/anchor hashing
-     * relative to peers and force unnecessary slot-0 backfill requests.
-     * Any root remapping needed for local fork-choice restoration is handled
-     * later during restore_persisted_blocks().
+     * Checkpoint-sync materializes a synthetic anchor block into fork choice.
+     * Point the state's checkpoints at that anchor root so the single
+     * fork-choice checkpoint pair always refers to a locally known block.
      */
+    decoded.latest_justified.root = anchor_root;
+    decoded.latest_finalized.root = anchor_root;
 
     char state_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
     char anchor_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -2831,12 +2834,24 @@ static lantern_client_error client_start_protocols(
     struct lantern_client *client,
     uint8_t node_key[NODE_PRIVATE_KEY_SIZE])
 {
+    size_t attestation_committee_count =
+        client->debug_attestation_committee_count > 0
+            ? client->debug_attestation_committee_count
+            : LANTERN_ATTESTATION_COMMITTEE_COUNT;
     size_t subnet_id = 0;
     if (client->local_validators && client->local_validator_count > 0) {
-        (void)lantern_validator_index_compute_subnet_id(
-            client->local_validators[0].global_index,
-            LANTERN_ATTESTATION_COMMITTEE_COUNT,
-            &subnet_id);
+        if (lantern_validator_index_compute_subnet_id(
+                client->local_validators[0].global_index,
+                attestation_committee_count,
+                &subnet_id)
+            != 0) {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to compute startup attestation subnet validator=%" PRIu64,
+                client->local_validators[0].global_index);
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
     }
     struct lantern_gossipsub_config gossip_cfg = {
         .host = client->network.host,
@@ -2860,6 +2875,39 @@ static lantern_client_error client_start_protocols(
         return LANTERN_CLIENT_ERR_NETWORK;
     }
     client->gossip_running = true;
+    if (client->local_validators && client->local_validator_count > 0) {
+        for (size_t i = 0; i < client->local_validator_count; ++i) {
+            size_t validator_subnet_id = 0;
+            if (lantern_validator_index_compute_subnet_id(
+                    client->local_validators[i].global_index,
+                    attestation_committee_count,
+                    &validator_subnet_id)
+                != 0) {
+                lantern_log_error(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to compute attestation subnet validator=%" PRIu64,
+                    client->local_validators[i].global_index);
+                lantern_gossipsub_service_reset(&client->gossip);
+                client->gossip_running = false;
+                return LANTERN_CLIENT_ERR_NETWORK;
+            }
+            if (lantern_gossipsub_service_subscribe_attestation_subnet(
+                    &client->gossip,
+                    validator_subnet_id)
+                != 0) {
+                lantern_log_error(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to subscribe attestation subnet validator=%" PRIu64 " subnet=%zu",
+                    client->local_validators[i].global_index,
+                    validator_subnet_id);
+                lantern_gossipsub_service_reset(&client->gossip);
+                client->gossip_running = false;
+                return LANTERN_CLIENT_ERR_NETWORK;
+            }
+        }
+    }
 
     struct lantern_reqresp_service_callbacks req_callbacks;
     memset(&req_callbacks, 0, sizeof(req_callbacks));
