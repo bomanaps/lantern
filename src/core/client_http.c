@@ -140,8 +140,14 @@ int http_snapshot_head(void *context, struct lantern_http_head_snapshot *out_sna
     LanternCheckpoint finalized = client->state.latest_finalized;
     if (client->has_fork_choice)
     {
+        const LanternCheckpoint *fork_justified =
+            lantern_fork_choice_latest_justified(&client->fork_choice);
         const LanternCheckpoint *fork_finalized =
             lantern_fork_choice_latest_finalized(&client->fork_choice);
+        if (fork_justified && !lantern_root_is_zero(&fork_justified->root))
+        {
+            justified = *fork_justified;
+        }
         if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
         {
             finalized = *fork_finalized;

@@ -1495,7 +1495,6 @@ static void handle_connection_closed_event(
 
     char peer_text[128];
     format_peer_id_text(peer, peer_text, sizeof(peer_text));
-
     lantern_log_info(
         "network",
         &(const struct lantern_log_metadata){

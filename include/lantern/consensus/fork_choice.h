@@ -29,10 +29,6 @@ struct lantern_fork_choice_block_entry {
     LanternValidatorIndex proposer_index;
     bool has_validator_count;
     uint64_t validator_count;
-    bool has_justified;
-    bool has_finalized;
-    LanternCheckpoint latest_justified;
-    LanternCheckpoint latest_finalized;
 };
 
 struct lantern_fork_choice_state_entry {
@@ -160,7 +156,8 @@ int lantern_fork_choice_update_checkpoints(
  * startup restoration and may move checkpoints backwards when the persisted
  * state is behind the temporary anchor checkpoints used during init.
  *
- * Any provided checkpoint root must already exist in the fork-choice store.
+ * Restored checkpoints must refer to blocks already materialized in the local
+ * fork-choice tree.
  */
 int lantern_fork_choice_restore_checkpoints(
     LanternForkChoice *store,
