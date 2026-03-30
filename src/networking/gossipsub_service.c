@@ -20,20 +20,13 @@
 #include "protocol/gossipsub/gossipsub.h"
 #include "../../external/c-libp2p/src/protocol/gossipsub/proto/gen/gossipsub_rpc.pb.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
 libp2p_err_t libp2p_gossipsub_rpc_decode_frame(
     const uint8_t *frame,
     size_t frame_len,
     libp2p_gossipsub_RPC **out_rpc);
-#ifdef __cplusplus
-}
-#endif
 
 #define LANTERN_GOSSIPSUB_TOPIC_CAP 128u
 #define LANTERN_ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
-#define LANTERN_GOSSIPSUB_PROTOCOL "/meshsub/1.0.0"
 #define LANTERN_GOSSIPSUB_HEARTBEAT_INTERVAL_MS 700u
 #define LANTERN_GOSSIPSUB_FANOUT_TTL_MS 60000u
 #define LANTERN_GOSSIPSUB_MESH_D 8
@@ -46,10 +39,8 @@ libp2p_err_t libp2p_gossipsub_rpc_decode_frame(
 #define LANTERN_LEANSPEC_JUSTIFICATION_LOOKBACK 3u
 #define LANTERN_LEANSPEC_SEEN_TTL_FACTOR 2u
 
-/* Accept both raw 1.0.0 and libp2p's stacked identifiers (prefix/1.1.0) */
 static const char *const k_leanspec_gossipsub_protocols[] = {
     "/meshsub/1.1.0",
-    "/meshsub/1.0.0/1.1.0",
     "/meshsub/1.0.0",
 };
 
