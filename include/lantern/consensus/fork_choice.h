@@ -29,10 +29,6 @@ struct lantern_fork_choice_block_entry {
     LanternValidatorIndex proposer_index;
     bool has_validator_count;
     uint64_t validator_count;
-    bool has_justified;
-    bool has_finalized;
-    LanternCheckpoint latest_justified;
-    LanternCheckpoint latest_finalized;
 };
 
 struct lantern_fork_choice_state_entry {
@@ -50,6 +46,8 @@ struct lantern_fork_choice_root_index_entry {
 typedef struct lantern_fork_choice {
     bool initialized;
     bool has_anchor;
+    LanternRoot anchor_root;
+    uint64_t anchor_slot;
     LanternConfig config;
     uint32_t seconds_per_slot;
     uint32_t intervals_per_slot;
@@ -158,12 +156,14 @@ int lantern_fork_choice_update_checkpoints(
  * startup restoration and may move checkpoints backwards when the persisted
  * state is behind the temporary anchor checkpoints used during init.
  *
- * Any provided checkpoint root must already exist in the fork-choice store.
+ * Restored checkpoints must refer to blocks already materialized in the local
+ * fork-choice tree.
  */
 int lantern_fork_choice_restore_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *latest_justified,
     const LanternCheckpoint *latest_finalized);
+int lantern_fork_choice_prune_states(LanternForkChoice *store);
 
 int lantern_fork_choice_accept_new_votes(LanternForkChoice *store);
 int lantern_fork_choice_update_safe_target(LanternForkChoice *store);
@@ -192,6 +192,8 @@ int lantern_fork_choice_set_block_state(
 const LanternState *lantern_fork_choice_block_state(
     const LanternForkChoice *store,
     const LanternRoot *root);
+const LanternRoot *lantern_fork_choice_anchor_root(const LanternForkChoice *store);
+int lantern_fork_choice_anchor_slot(const LanternForkChoice *store, uint64_t *out_slot);
 const LanternCheckpoint *lantern_fork_choice_latest_justified(const LanternForkChoice *store);
 const LanternCheckpoint *lantern_fork_choice_latest_finalized(const LanternForkChoice *store);
 const LanternRoot *lantern_fork_choice_safe_target(const LanternForkChoice *store);

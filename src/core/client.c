@@ -1301,7 +1301,7 @@ static int checkpoint_sync_parse_port(
     return 0;
 }
 
-static int checkpoint_sync_parse_url(
+int lantern_client_checkpoint_sync_parse_url(
     const char *url,
     char **out_host,
     uint16_t *out_port,
@@ -1325,7 +1325,7 @@ static int checkpoint_sync_parse_url(
     }
     else if (strncasecmp(url, https_prefix, strlen(https_prefix)) == 0)
     {
-        /* TLS not supported; downgrade to plain HTTP */
+        /* TLS transport is not implemented yet; downgrade to plain HTTP parsing */
         prefix_len = strlen(https_prefix);
     }
     else
@@ -2067,7 +2067,12 @@ static int checkpoint_sync_fetch_state_bytes(
     char *host = NULL;
     char *base_path = NULL;
     uint16_t port = 0;
-    if (checkpoint_sync_parse_url(checkpoint_sync_url, &host, &port, &base_path) != 0)
+    if (lantern_client_checkpoint_sync_parse_url(
+            checkpoint_sync_url,
+            &host,
+            &port,
+            &base_path)
+        != 0)
     {
         return -1;
     }
@@ -2334,6 +2339,8 @@ static lantern_client_error client_load_state_from_checkpoint(
         goto cleanup;
     }
 
+    LanternCheckpoint original_latest_justified = decoded.latest_justified;
+    LanternCheckpoint original_latest_finalized = decoded.latest_finalized;
     LanternBlockHeader anchor_header = decoded.latest_block_header;
     anchor_header.state_root = state_root;
     LanternRoot anchor_root;
@@ -2347,20 +2354,142 @@ static lantern_client_error client_load_state_from_checkpoint(
         goto cleanup;
     }
 
+    char header_parent_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char header_state_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char original_justified_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char original_finalized_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    format_root_hex(
+        &decoded.latest_block_header.parent_root,
+        header_parent_hex,
+        sizeof(header_parent_hex));
+    format_root_hex(
+        &decoded.latest_block_header.state_root,
+        header_state_root_hex,
+        sizeof(header_state_root_hex));
+    format_root_hex(
+        &original_latest_justified.root,
+        original_justified_root_hex,
+        sizeof(original_justified_root_hex));
+    format_root_hex(
+        &original_latest_finalized.root,
+        original_finalized_root_hex,
+        sizeof(original_finalized_root_hex));
+
+    lantern_log_info(
+        "checkpoint_sync",
+        &meta,
+        "decoded checkpoint state slot=%" PRIu64
+        " header_slot=%" PRIu64 " proposer=%" PRIu64 " header_parent=%s"
+        " header_state_root=%s justified_slot=%" PRIu64 " justified_root=%s"
+        " finalized_slot=%" PRIu64 " finalized_root=%s",
+        decoded.slot,
+        decoded.latest_block_header.slot,
+        decoded.latest_block_header.proposer_index,
+        header_parent_hex[0] ? header_parent_hex : "0x0",
+        header_state_root_hex[0] ? header_state_root_hex : "0x0",
+        original_latest_justified.slot,
+        original_justified_root_hex[0] ? original_justified_root_hex : "0x0",
+        original_latest_finalized.slot,
+        original_finalized_root_hex[0] ? original_finalized_root_hex : "0x0");
+
     /*
-     * Preserve checkpoint roots exactly as provided by the remote state.
+     * Keep the fetched checkpoint state canonical. Fork choice rewrites the
+     * checkpoint roots to the synthetic anchor locally during bootstrap, but
+     * mutating the decoded state here changes its hash and causes a different
+     * anchor to be recomputed later from the modified snapshot.
      *
-     * Rewriting justified/finalized roots here mutates state content before
-     * fork-choice anchor initialization, which can skew state/anchor hashing
-     * relative to peers and force unnecessary slot-0 backfill requests.
-     * Any root remapping needed for local fork-choice restoration is handled
-     * later during restore_persisted_blocks().
+     * We still materialize the anchor-alias view below for diagnostics so the
+     * logs show how the state/root pair would drift if those checkpoint roots
+     * were rewritten before fork-choice initialization.
      */
+    LanternState anchor_checkpoint_alias = decoded;
+    anchor_checkpoint_alias.latest_justified.root = anchor_root;
+    anchor_checkpoint_alias.latest_finalized.root = anchor_root;
 
     char state_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
     char anchor_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    LanternRoot adjusted_state_root = {0};
+    LanternRoot adjusted_anchor_root = {0};
+    bool have_adjusted_state_root = false;
+    bool have_adjusted_anchor_root = false;
+    if (lantern_hash_tree_root_state(&anchor_checkpoint_alias, &adjusted_state_root) == 0)
+    {
+        have_adjusted_state_root = true;
+        LanternBlockHeader adjusted_anchor_header = anchor_checkpoint_alias.latest_block_header;
+        adjusted_anchor_header.state_root = adjusted_state_root;
+        if (lantern_hash_tree_root_block_header(
+                &adjusted_anchor_header,
+                &adjusted_anchor_root)
+            == 0)
+        {
+            have_adjusted_anchor_root = true;
+        }
+        else
+        {
+            lantern_log_warn(
+                "checkpoint_sync",
+                &meta,
+                "failed to compute adjusted checkpoint anchor root after checkpoint root override");
+        }
+    }
+    else
+    {
+        lantern_log_warn(
+            "checkpoint_sync",
+            &meta,
+            "failed to compute adjusted checkpoint state root after checkpoint root override");
+    }
+
+    char adjusted_state_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char adjusted_anchor_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char adjusted_justified_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    char adjusted_finalized_root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
     format_root_hex(&state_root, state_root_hex, sizeof(state_root_hex));
     format_root_hex(&anchor_root, anchor_root_hex, sizeof(anchor_root_hex));
+    format_root_hex(
+        &adjusted_state_root,
+        adjusted_state_root_hex,
+        sizeof(adjusted_state_root_hex));
+    format_root_hex(
+        &adjusted_anchor_root,
+        adjusted_anchor_root_hex,
+        sizeof(adjusted_anchor_root_hex));
+    format_root_hex(
+        &anchor_checkpoint_alias.latest_justified.root,
+        adjusted_justified_root_hex,
+        sizeof(adjusted_justified_root_hex));
+    format_root_hex(
+        &anchor_checkpoint_alias.latest_finalized.root,
+        adjusted_finalized_root_hex,
+        sizeof(adjusted_finalized_root_hex));
+
+    lantern_log_info(
+        "checkpoint_sync",
+        &meta,
+        "checkpoint root override justified_before=%s justified_after=%s"
+        " finalized_before=%s finalized_after=%s original_state_root=%s"
+        " adjusted_state_root=%s original_anchor_root=%s adjusted_anchor_root=%s"
+        " adjusted_anchor_matches_original=%s",
+        original_justified_root_hex[0] ? original_justified_root_hex : "0x0",
+        adjusted_justified_root_hex[0] ? adjusted_justified_root_hex : "0x0",
+        original_finalized_root_hex[0] ? original_finalized_root_hex : "0x0",
+        adjusted_finalized_root_hex[0] ? adjusted_finalized_root_hex : "0x0",
+        state_root_hex[0] ? state_root_hex : "0x0",
+        have_adjusted_state_root
+            ? (adjusted_state_root_hex[0] ? adjusted_state_root_hex : "0x0")
+            : "<unavailable>",
+        anchor_root_hex[0] ? anchor_root_hex : "0x0",
+        have_adjusted_anchor_root
+            ? (adjusted_anchor_root_hex[0] ? adjusted_anchor_root_hex : "0x0")
+            : "<unavailable>",
+        (have_adjusted_anchor_root
+         && memcmp(
+                adjusted_anchor_root.bytes,
+                anchor_root.bytes,
+                LANTERN_ROOT_SIZE)
+                == 0)
+            ? "true"
+            : "false");
 
     lantern_state_reset(&client->state);
     client->state = decoded;
@@ -2834,12 +2963,24 @@ static lantern_client_error client_start_protocols(
     struct lantern_client *client,
     uint8_t node_key[NODE_PRIVATE_KEY_SIZE])
 {
+    size_t attestation_committee_count =
+        client->debug_attestation_committee_count > 0
+            ? client->debug_attestation_committee_count
+            : LANTERN_ATTESTATION_COMMITTEE_COUNT;
     size_t subnet_id = 0;
     if (client->local_validators && client->local_validator_count > 0) {
-        (void)lantern_validator_index_compute_subnet_id(
-            client->local_validators[0].global_index,
-            LANTERN_ATTESTATION_COMMITTEE_COUNT,
-            &subnet_id);
+        if (lantern_validator_index_compute_subnet_id(
+                client->local_validators[0].global_index,
+                attestation_committee_count,
+                &subnet_id)
+            != 0) {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to compute startup attestation subnet validator=%" PRIu64,
+                client->local_validators[0].global_index);
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
     }
     struct lantern_gossipsub_config gossip_cfg = {
         .host = client->network.host,
@@ -2863,6 +3004,39 @@ static lantern_client_error client_start_protocols(
         return LANTERN_CLIENT_ERR_NETWORK;
     }
     client->gossip_running = true;
+    if (client->local_validators && client->local_validator_count > 0) {
+        for (size_t i = 0; i < client->local_validator_count; ++i) {
+            size_t validator_subnet_id = 0;
+            if (lantern_validator_index_compute_subnet_id(
+                    client->local_validators[i].global_index,
+                    attestation_committee_count,
+                    &validator_subnet_id)
+                != 0) {
+                lantern_log_error(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to compute attestation subnet validator=%" PRIu64,
+                    client->local_validators[i].global_index);
+                lantern_gossipsub_service_reset(&client->gossip);
+                client->gossip_running = false;
+                return LANTERN_CLIENT_ERR_NETWORK;
+            }
+            if (lantern_gossipsub_service_subscribe_attestation_subnet(
+                    &client->gossip,
+                    validator_subnet_id)
+                != 0) {
+                lantern_log_error(
+                    "client",
+                    &(const struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to subscribe attestation subnet validator=%" PRIu64 " subnet=%zu",
+                    client->local_validators[i].global_index,
+                    validator_subnet_id);
+                lantern_gossipsub_service_reset(&client->gossip);
+                client->gossip_running = false;
+                return LANTERN_CLIENT_ERR_NETWORK;
+            }
+        }
+    }
 
     struct lantern_reqresp_service_callbacks req_callbacks;
     memset(&req_callbacks, 0, sizeof(req_callbacks));
@@ -3267,7 +3441,7 @@ static void shutdown_genesis_and_network(struct lantern_client *client)
         "client",
         &(const struct lantern_log_metadata){.validator = client->node_id},
         "shutdown: stopping gossipsub");
-    lantern_gossipsub_service_reset(&client->gossip);
+    lantern_gossipsub_service_stop(&client->gossip);
     client->gossip_running = false;
     lantern_log_info(
         "client",
@@ -3278,6 +3452,7 @@ static void shutdown_genesis_and_network(struct lantern_client *client)
         &(const struct lantern_log_metadata){.validator = client->node_id},
         "shutdown: resetting libp2p host");
     lantern_libp2p_host_reset(&client->network);
+    lantern_gossipsub_service_reset(&client->gossip);
     lantern_log_info(
         "client",
         &(const struct lantern_log_metadata){.validator = client->node_id},

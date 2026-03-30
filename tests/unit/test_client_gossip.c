@@ -1,11 +1,14 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "../../src/core/client_services_internal.h"
 #include "client_test_helpers.h"
 #include "lantern/consensus/hash.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/core/client.h"
+#include "lantern/support/string_list.h"
 
 static void reset_agg_cache(struct lantern_client *client)
 {
@@ -13,6 +16,91 @@ static void reset_agg_cache(struct lantern_client *client)
         return;
     }
     lantern_store_reset(&client->store);
+}
+
+static int test_enable_blocks_request_peer(
+    struct lantern_client *client,
+    const char *peer_id)
+{
+    if (!client || !peer_id || peer_id[0] == '\0') {
+        return -1;
+    }
+
+    lantern_string_list_init(&client->connected_peer_ids);
+    if (pthread_mutex_init(&client->connection_lock, NULL) != 0) {
+        return -1;
+    }
+    client->connection_lock_initialized = true;
+
+    if (pthread_mutex_init(&client->status_lock, NULL) != 0) {
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        return -1;
+    }
+    client->status_lock_initialized = true;
+
+    if (lantern_string_list_append(&client->connected_peer_ids, peer_id) != 0) {
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        return -1;
+    }
+    client->connected_peers = 1u;
+
+    client->peer_status_entries = calloc(1u, sizeof(*client->peer_status_entries));
+    if (!client->peer_status_entries) {
+        client->connected_peers = 0u;
+        lantern_string_list_reset(&client->connected_peer_ids);
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+        return -1;
+    }
+    client->peer_status_count = 1u;
+    client->peer_status_capacity = 1u;
+    strncpy(
+        client->peer_status_entries[0].peer_id,
+        peer_id,
+        sizeof(client->peer_status_entries[0].peer_id) - 1u);
+    client->peer_status_entries[0].peer_id[sizeof(client->peer_status_entries[0].peer_id) - 1u] =
+        '\0';
+
+    return 0;
+}
+
+static void test_disable_blocks_request_peer(struct lantern_client *client)
+{
+    if (!client) {
+        return;
+    }
+
+    free(client->peer_status_entries);
+    client->peer_status_entries = NULL;
+    client->peer_status_count = 0u;
+    client->peer_status_capacity = 0u;
+
+    free(client->active_blocks_requests);
+    client->active_blocks_requests = NULL;
+    client->active_blocks_request_count = 0u;
+    client->active_blocks_request_capacity = 0u;
+    client->next_blocks_request_id = 0u;
+
+    if (client->status_lock_initialized) {
+        pthread_mutex_destroy(&client->status_lock);
+        client->status_lock_initialized = false;
+    }
+
+    if (client->connection_lock_initialized) {
+        pthread_mutex_destroy(&client->connection_lock);
+        client->connection_lock_initialized = false;
+    }
+
+    lantern_string_list_reset(&client->connected_peer_ids);
+    client->connected_peers = 0u;
 }
 
 static int build_single_participant_aggregated_attestation(
@@ -330,6 +418,13 @@ static int test_gossip_aggregated_attestation_rejects_unknown_target(void)
         != 0) {
         return 1;
     }
+    if (test_enable_blocks_request_peer(
+            &client,
+            "12D3KooWQH2VQK1kF2L8a7T4AtestAggUnknownTarget111111111111")
+        != 0) {
+        fprintf(stderr, "failed to set up schedulable peer for aggregated gossip test\n");
+        goto cleanup;
+    }
 
     if (build_single_participant_aggregated_attestation(
             &client,
@@ -352,12 +447,17 @@ static int test_gossip_aggregated_attestation_rejects_unknown_target(void)
         fprintf(stderr, "unknown-target aggregated attestation should not be cached\n");
         goto cleanup_attestation;
     }
+    if (client.next_blocks_request_id != 0u) {
+        fprintf(stderr, "unknown-target aggregated attestation should not schedule block requests\n");
+        goto cleanup_attestation;
+    }
 
     rc = 0;
 
 cleanup_attestation:
     lantern_signed_aggregated_attestation_reset(&attestation);
 cleanup:
+    test_disable_blocks_request_peer(&client);
     reset_agg_cache(&client);
     client_test_teardown_vote_validation_client(&client, pub, secret);
     return rc;

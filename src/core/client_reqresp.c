@@ -106,6 +106,7 @@ static void peer_status_local_view(
     struct lantern_client *client,
     const LanternRoot *head_root,
     uint64_t *out_local_slot,
+    uint64_t *out_local_finalized_slot,
     bool *out_head_known);
 static struct lantern_peer_status_entry *lantern_client_update_peer_status_entry_locked(
     struct lantern_client *client,
@@ -306,28 +307,35 @@ static void peer_status_local_view(
     struct lantern_client *client,
     const LanternRoot *head_root,
     uint64_t *out_local_slot,
+    uint64_t *out_local_finalized_slot,
     bool *out_head_known)
 {
     if (out_local_slot)
     {
         *out_local_slot = 0;
     }
+    if (out_local_finalized_slot)
+    {
+        *out_local_finalized_slot = 0;
+    }
     if (out_head_known)
     {
         *out_head_known = false;
     }
 
-    if (!client || !head_root || !out_local_slot || !out_head_known)
+    if (!client || !head_root || !out_local_slot || !out_local_finalized_slot || !out_head_known)
     {
         return;
     }
 
     uint64_t local_slot = 0;
+    uint64_t local_finalized_slot = 0;
     bool head_known = false;
     bool state_locked = lantern_client_lock_state(client);
     if (state_locked)
     {
         local_slot = client->state.latest_block_header.slot;
+        local_finalized_slot = client->state.latest_finalized.slot;
         if (client->has_fork_choice)
         {
             LanternRoot fork_head = {0};
@@ -345,12 +353,19 @@ static void peer_status_local_view(
                     local_slot = fork_slot;
                 }
             }
+            const LanternCheckpoint *fork_finalized =
+                lantern_fork_choice_latest_finalized(&client->fork_choice);
+            if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
+            {
+                local_finalized_slot = fork_finalized->slot;
+            }
         }
         head_known = lantern_client_block_known_locked(client, head_root, NULL);
     }
     else if (client->has_state)
     {
         local_slot = client->state.latest_block_header.slot;
+        local_finalized_slot = client->state.latest_finalized.slot;
         if (client->has_fork_choice)
         {
             LanternRoot fork_head = {0};
@@ -367,6 +382,12 @@ static void peer_status_local_view(
                 {
                     local_slot = fork_slot;
                 }
+            }
+            const LanternCheckpoint *fork_finalized =
+                lantern_fork_choice_latest_finalized(&client->fork_choice);
+            if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
+            {
+                local_finalized_slot = fork_finalized->slot;
             }
             uint64_t fork_slot = 0;
             if (lantern_fork_choice_block_info(
@@ -384,8 +405,103 @@ static void peer_status_local_view(
     lantern_client_unlock_state(client, state_locked);
 
     *out_local_slot = local_slot;
+    *out_local_finalized_slot = local_finalized_slot;
     *out_head_known = head_known;
 
+}
+
+static void maybe_seed_head_request_from_status(
+    struct lantern_client *client,
+    const LanternStatusMessage *peer_status,
+    const char *peer_id_text,
+    uint64_t local_head_slot,
+    uint64_t local_finalized_slot,
+    bool head_known)
+{
+    if (!client || !peer_status || !peer_id_text || peer_id_text[0] == '\0')
+    {
+        return;
+    }
+    if (head_known || lantern_root_is_zero(&peer_status->head.root))
+    {
+        return;
+    }
+
+    const bool peer_finalized_ahead = peer_status->finalized.slot > local_finalized_slot;
+    const bool peer_head_ahead = peer_status->head.slot > local_head_slot;
+    if (!peer_finalized_ahead && !peer_head_ahead)
+    {
+        return;
+    }
+
+    bool has_pending_blocks = false;
+    bool pending_locked = lantern_client_lock_pending(client);
+    if (pending_locked)
+    {
+        has_pending_blocks = client->pending_blocks.length > 0;
+    }
+    lantern_client_unlock_pending(client, pending_locked);
+    if (has_pending_blocks)
+    {
+        return;
+    }
+
+    uint64_t now_ms = monotonic_millis();
+    bool recently_requested = false;
+    if (client->status_lock_initialized && pthread_mutex_lock(&client->status_lock) == 0)
+    {
+        if (!lantern_root_is_zero(&client->sync_last_requested_root)
+            && memcmp(
+                   client->sync_last_requested_root.bytes,
+                   peer_status->head.root.bytes,
+                   LANTERN_ROOT_SIZE)
+                == 0
+            && client->sync_last_requested_root_ms != 0
+            && now_ms >= client->sync_last_requested_root_ms
+            && (now_ms - client->sync_last_requested_root_ms) < LANTERN_BLOCKS_REQUEST_TIMEOUT_MS)
+        {
+            recently_requested = true;
+        }
+        pthread_mutex_unlock(&client->status_lock);
+    }
+    if (recently_requested)
+    {
+        return;
+    }
+
+    const LanternRoot roots[1] = {peer_status->head.root};
+    const uint32_t depths[1] = {0u};
+    if (!lantern_client_try_schedule_blocks_request_batch(
+            client,
+            peer_id_text,
+            roots,
+            depths,
+            1u))
+    {
+        return;
+    }
+
+    if (client->status_lock_initialized && pthread_mutex_lock(&client->status_lock) == 0)
+    {
+        client->sync_last_requested_root = peer_status->head.root;
+        client->sync_last_requested_root_ms = now_ms;
+        pthread_mutex_unlock(&client->status_lock);
+    }
+
+    char head_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
+    format_root_hex(&peer_status->head.root, head_hex, sizeof(head_hex));
+    lantern_log_info(
+        "sync",
+        &(const struct lantern_log_metadata){
+            .validator = client->node_id,
+            .peer = peer_id_text},
+        "peer is ahead; requesting head block root=%s peer_head_slot=%" PRIu64
+        " peer_finalized_slot=%" PRIu64 " local_head_slot=%" PRIu64 " local_finalized_slot=%" PRIu64,
+        head_hex[0] ? head_hex : "0x0",
+        peer_status->head.slot,
+        peer_status->finalized.slot,
+        local_head_slot,
+        local_finalized_slot);
 }
 
 static bool peer_status_is_eligible(
@@ -1133,8 +1249,8 @@ int reqresp_build_status(void *context, LanternStatusMessage *out_status)
  *
  * @spec subspecs/networking/reqresp/message.py - Status protocol
  *
- * Processes a peer's status message, updates peer tracking, and records
- * sync progress. Peer status does not proactively trigger block requests.
+ * Processes a peer's status message, updates peer tracking, records
+ * sync progress, and may proactively seed backfill for an ahead peer's head.
  *
  * @param context      Client instance
  * @param peer_status  Status message from peer
@@ -1455,8 +1571,8 @@ int reqresp_collect_blocks(
  * @spec subspecs/forkchoice/store.py - Sync decision logic
  *
  * Updates peer status tracking and sync progress based on the received
- * status message. Block requests are initiated only by reactive sync
- * paths (gossip backfill or missing parents), not by status alone.
+ * status message. When a materially ahead peer advertises an unknown head,
+ * this path may also seed backfill by requesting that head block.
  *
  * @param client       Client instance
  * @param peer_status  Status message from peer
@@ -1486,8 +1602,14 @@ static void lantern_client_on_peer_status(
     copy_peer_id_text(peer_id, peer_copy, sizeof(peer_copy));
 
     uint64_t local_slot = 0;
+    uint64_t local_finalized_slot = 0;
     bool head_known = false;
-    peer_status_local_view(client, &peer_status->head.root, &local_slot, &head_known);
+    peer_status_local_view(
+        client,
+        &peer_status->head.root,
+        &local_slot,
+        &local_finalized_slot,
+        &head_known);
 
     struct lantern_log_metadata meta = {
         .validator = client->node_id,
@@ -1516,6 +1638,13 @@ static void lantern_client_on_peer_status(
         peer_status,
         peer_copy,
         local_slot);
+    maybe_seed_head_request_from_status(
+        client,
+        peer_status,
+        peer_copy,
+        local_slot,
+        local_finalized_slot,
+        head_known);
 }
 
 
@@ -1551,12 +1680,14 @@ static void lantern_client_adopt_peer_genesis(
     /* Use the peer's advertised head root as both state_root and hint so our fork-choice
        anchor matches the peer even if we cannot reproduce their SSZ state. */
     anchor.state_root = peer_status->head.root;
+    LanternCheckpoint anchor_checkpoint = peer_status->finalized;
+    anchor_checkpoint.root = peer_status->head.root;
 
     if (lantern_fork_choice_set_anchor(
             &client->fork_choice,
             &anchor,
-            &peer_status->finalized,
-            &peer_status->finalized,
+            &anchor_checkpoint,
+            &anchor_checkpoint,
             &peer_status->head.root)
         != 0)
     {

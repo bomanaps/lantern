@@ -45,6 +45,7 @@ struct lantern_gossipsub_service {
     char vote_subnet_topic[128];
     char aggregated_attestation_topic[128];
     const char *data_dir;
+    const char *devnet;
     size_t attestation_subnet_id;
     int subscribe_attestation_subnet;
     int (*publish_hook)(const char *topic, const uint8_t *payload, size_t payload_len, void *user_data);
@@ -60,9 +61,13 @@ struct lantern_gossipsub_service {
     libp2p_gossipsub_validator_handle_t *vote_validator_handle;
     libp2p_gossipsub_validator_handle_t *vote_subnet_validator_handle;
     libp2p_gossipsub_validator_handle_t *aggregated_attestation_validator_handle;
+    char (*extra_vote_subnet_topics)[128];
+    libp2p_gossipsub_validator_handle_t **extra_vote_subnet_validator_handles;
+    size_t extra_vote_subnet_topic_count;
 };
 
 void lantern_gossipsub_service_init(struct lantern_gossipsub_service *service);
+void lantern_gossipsub_service_stop(struct lantern_gossipsub_service *service);
 void lantern_gossipsub_service_reset(struct lantern_gossipsub_service *service);
 int lantern_gossipsub_service_start(
     struct lantern_gossipsub_service *service,
@@ -75,10 +80,14 @@ int lantern_gossipsub_service_publish_vote(
     const LanternSignedVote *vote);
 int lantern_gossipsub_service_publish_vote_subnet(
     struct lantern_gossipsub_service *service,
-    const LanternSignedVote *vote);
+    const LanternSignedVote *vote,
+    size_t subnet_id);
 int lantern_gossipsub_service_publish_aggregated_attestation(
     struct lantern_gossipsub_service *service,
     const LanternSignedAggregatedAttestation *attestation);
+int lantern_gossipsub_service_subscribe_attestation_subnet(
+    struct lantern_gossipsub_service *service,
+    size_t subnet_id);
 void lantern_gossipsub_service_set_publish_hook(
     struct lantern_gossipsub_service *service,
     int (*hook)(const char *topic, const uint8_t *payload, size_t payload_len, void *user_data),

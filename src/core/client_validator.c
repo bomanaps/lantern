@@ -1361,75 +1361,6 @@ void validator_duty_state_reset(struct lantern_validator_duty_state *state)
     memset(state, 0, sizeof(*state));
 }
 
-
-/* ============================================================================
- * Vote Time Utilities
- * ============================================================================ */
-
-/**
- * Compute wall-clock time for a vote slot.
- *
- * Calculates the Unix timestamp (in seconds) at which the given vote slot
- * begins, based on genesis time and seconds per slot configuration.
- *
- * @param client       Client instance (must have fork_choice initialized)
- * @param vote_slot    Slot number to compute time for
- * @param out_seconds  Output for computed time in seconds (Unix timestamp)
- *
- * @return true on success
- * @return false if client is NULL, fork_choice not initialized, out_seconds
- *         is NULL, or computed time overflows uint64_t
- *
- * @note Thread safety: This function is thread-safe
- */
-bool lantern_client_vote_time_seconds(
-    const struct lantern_client *client,
-    uint64_t vote_slot,
-    uint64_t *out_seconds)
-{
-    if (!client || !client->has_fork_choice || !out_seconds)
-    {
-        return false;
-    }
-    uint32_t seconds_per_slot = client->fork_choice.seconds_per_slot;
-    if (seconds_per_slot == 0)
-    {
-        seconds_per_slot = 1;
-    }
-    uint64_t slot_for_time = vote_slot;
-    if (slot_for_time != UINT64_MAX)
-    {
-        slot_for_time += 1u;
-    }
-
-#if defined(__SIZEOF_INT128__)
-    __uint128_t slot_offset = (__uint128_t)slot_for_time * (uint64_t)seconds_per_slot;
-    __uint128_t result = slot_offset + (__uint128_t)client->fork_choice.config.genesis_time;
-    if (result > UINT64_MAX)
-    {
-        return false;
-    }
-    *out_seconds = (uint64_t)result;
-#else
-    /* Fallback for platforms without 128-bit integers */
-    uint64_t genesis_time = client->fork_choice.config.genesis_time;
-    /* Check for overflow in multiplication */
-    if (seconds_per_slot != 0 && slot_for_time > UINT64_MAX / seconds_per_slot)
-    {
-        return false;
-    }
-    uint64_t slot_offset = slot_for_time * (uint64_t)seconds_per_slot;
-    /* Check for overflow in addition */
-    if (slot_offset > UINT64_MAX - genesis_time)
-    {
-        return false;
-    }
-    *out_seconds = slot_offset + genesis_time;
-#endif
-    return true;
-}
-
-
 /* ============================================================================
  * Validator Service Checks
  * ============================================================================ */
@@ -1949,35 +1880,30 @@ int validator_publish_vote(struct lantern_client *client, const LanternSignedVot
     }
     lantern_client_unlock_state(client, state_locked);
 
-    int rc = lantern_gossipsub_service_publish_vote(&client->gossip, vote);
-    if (rc != 0)
-    {
-        lantern_log_warn(
-            "gossip",
-            &meta,
-            "failed to publish attestation validator=%" PRIu64 " slot=%" PRIu64,
-            vote->data.validator_id,
-            vote->data.slot);
-        return LANTERN_CLIENT_ERR_NETWORK;
-    }
     size_t subnet_id = 0;
     if (lantern_validator_index_compute_subnet_id(
             vote->data.validator_id,
             validator_attestation_committee_count(client),
             &subnet_id)
         == 0) {
-        if (subnet_id == client->gossip.attestation_subnet_id) {
-            if (lantern_gossipsub_service_publish_vote_subnet(&client->gossip, vote) != 0) {
-                lantern_log_warn(
-                    "gossip",
-                    &meta,
-                    "failed to publish subnet attestation validator=%" PRIu64 " slot=%" PRIu64 " subnet=%zu",
-                    vote->data.validator_id,
-                    vote->data.slot,
-                    subnet_id);
-                return LANTERN_CLIENT_ERR_NETWORK;
-            }
+        if (lantern_gossipsub_service_publish_vote_subnet(&client->gossip, vote, subnet_id) != 0) {
+            lantern_log_warn(
+                "gossip",
+                &meta,
+                "failed to publish subnet attestation validator=%" PRIu64 " slot=%" PRIu64 " subnet=%zu",
+                vote->data.validator_id,
+                vote->data.slot,
+                subnet_id);
+            return LANTERN_CLIENT_ERR_NETWORK;
         }
+    } else {
+        lantern_log_warn(
+            "gossip",
+            &meta,
+            "failed to compute attestation subnet validator=%" PRIu64 " slot=%" PRIu64,
+            vote->data.validator_id,
+            vote->data.slot);
+        return LANTERN_CLIENT_ERR_NETWORK;
     }
     lantern_log_info(
         "gossip",

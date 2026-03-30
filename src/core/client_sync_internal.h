@@ -162,6 +162,24 @@ bool lantern_client_block_known_locked(
     uint64_t *out_slot);
 
 /**
+ * Get a state snapshot for a specific block root without attempting replay.
+ *
+ * This probes only exact local sources:
+ * - the current state
+ * - fork-choice cached states
+ * - exact persisted state snapshots / finalized replay base snapshots
+ *
+ * It does not reconstruct missing states from a chain of blocks.
+ *
+ * @note Thread safety: Caller must hold state_lock
+ */
+const LanternState *lantern_client_state_for_root_local_locked(
+    struct lantern_client *client,
+    const LanternRoot *root,
+    LanternState *scratch,
+    bool *out_is_scratch);
+
+/**
  * Get a state snapshot for a specific block root.
  *
  * Returns a pointer to either the client's current state (if it matches the root)
@@ -183,17 +201,24 @@ const LanternState *lantern_client_state_for_root_locked(
     bool *out_is_scratch);
 
 /**
- * Return the active attestation committee count for sync/validator cache logic.
+ * Find the first missing block/root on the replay path back toward the finalized anchor.
  *
- * Respects debug overrides used by tests and falls back to the protocol default.
+ * Returns true and populates `out_missing_root` when the ancestry required to
+ * reconstruct `root` is not locally connected. Returns false when the ancestry
+ * looks locally complete or the root cannot be analyzed.
+ *
+ * @note Thread safety: Caller must hold state_lock
  */
-size_t lantern_client_attestation_committee_count(const struct lantern_client *client);
+bool lantern_client_find_missing_state_root_locked(
+    struct lantern_client *client,
+    const LanternRoot *root,
+    LanternRoot *out_missing_root);
 
 /**
  * Determine whether this node should retain an attestation signature locally.
  *
- * The signature is retained only when the node is configured as an aggregator
- * and the attester is on the local attestation subnet/committee.
+ * The signature is retained when the node is configured as an aggregator.
+ * Attestation subnet selection happens at the gossip subscription layer.
  *
  * @note Caller must hold state_lock.
  */
@@ -456,6 +481,27 @@ bool lantern_client_import_block(
     const uint8_t *raw_block_ssz,
     size_t raw_block_ssz_len);
 
+/**
+ * Import a block without recursively draining its pending descendants.
+ *
+ * Used by the iterative pending-child replay path to avoid deep mutual
+ * recursion between block import and pending-child processing.
+ *
+ * @param out_children_ready Optional output set when the block became known
+ *                           locally and its pending children should be queued
+ *                           for iterative replay.
+ */
+bool lantern_client_import_block_without_pending_children(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    const struct lantern_log_metadata *meta,
+    uint32_t backfill_depth,
+    bool allow_historical,
+    const uint8_t *raw_block_ssz,
+    size_t raw_block_ssz_len,
+    bool *out_children_ready);
+
 
 /**
  * Record a received block and attempt import.
@@ -673,6 +719,18 @@ bool lantern_client_try_schedule_blocks_request_batch(
  * @note Thread safety: Acquires pending_lock
  */
 void lantern_client_pending_remove_by_root(struct lantern_client *client, const LanternRoot *root);
+
+/**
+ * Remove a pending block and any pending descendants rooted under it.
+ *
+ * @param client  Client instance
+ * @param root    Root of the dropped block
+ *
+ * @note Thread safety: Acquires pending_lock
+ */
+void lantern_client_pending_remove_branch_by_root(
+    struct lantern_client *client,
+    const LanternRoot *root);
 
 
 /**

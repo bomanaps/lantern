@@ -212,6 +212,21 @@ bool lantern_client_persisted_state_is_stale_for_checkpoint_sync(
     uint64_t *out_gap);
 
 /**
+ * Parse a checkpoint sync base URL.
+ *
+ * `http://` URLs are parsed directly. `https://` URLs are currently accepted
+ * but downgraded to the existing plaintext HTTP transport. Callers own the
+ * returned host/base-path buffers and must free them with `free()`.
+ *
+ * @return 0 on success, -1 on parse/validation failure.
+ */
+int lantern_client_checkpoint_sync_parse_url(
+    const char *url,
+    char **out_host,
+    uint16_t *out_port,
+    char **out_base_path);
+
+/**
  * Cache an individual attestation signature keyed by validator and attestation root.
  *
  * @param client     Client instance (state_lock must be held)
@@ -386,25 +401,6 @@ bool lantern_client_lock_pending(struct lantern_client *client);
  * @note Thread safety: This function is thread-safe
  */
 void lantern_client_unlock_pending(struct lantern_client *client, bool locked);
-
-
-/* ============================================================================
- * Validator Record Functions
- * ============================================================================ */
-
-/**
- * Get a validator record from the genesis registry.
- *
- * @param client         Client instance
- * @param global_index   Validator global index
- * @return Pointer to validator record, or NULL if not found
- *
- * @note Thread safety: This function is thread-safe (read-only access)
- */
-const struct lantern_validator_record *lantern_client_get_validator_record(
-    const struct lantern_client *client,
-    uint64_t global_index);
-
 
 #ifdef __cplusplus
 }

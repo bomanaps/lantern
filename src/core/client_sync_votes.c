@@ -114,7 +114,8 @@ static bool validate_vote_checkpoint(
     }
 
     uint64_t block_slot = 0;
-    if (!lantern_client_block_known_locked(client, &checkpoint->root, &block_slot))
+    bool known = lantern_client_block_known_locked(client, &checkpoint->root, &block_slot);
+    if (!known)
     {
         lantern_log_debug(
             log_facility,
@@ -212,7 +213,6 @@ static bool buffer_pending_vote_locked(
     return true;
 }
 
-
 /**
  * @brief Validates vote cache availability.
  *
@@ -272,14 +272,6 @@ static bool validate_vote_cache_state(
     return true;
 }
 
-size_t lantern_client_attestation_committee_count(const struct lantern_client *client)
-{
-    if (client && client->debug_attestation_committee_count > 0) {
-        return client->debug_attestation_committee_count;
-    }
-    return DEFAULT_SYNC_ATTESTATION_COMMITTEE_COUNT;
-}
-
 bool lantern_client_should_cache_attestation_signature_locked(
     const struct lantern_client *client,
     const LanternVote *vote)
@@ -287,22 +279,7 @@ bool lantern_client_should_cache_attestation_signature_locked(
     if (!client || !vote || !client->assigned_validators || !client->assigned_validators->enr.is_aggregator) {
         return false;
     }
-
-    size_t committee_count = lantern_client_attestation_committee_count(client);
-    if (committee_count == 0) {
-        return false;
-    }
-
-    size_t vote_subnet = 0;
-    if (lantern_validator_index_compute_subnet_id(
-            vote->validator_id,
-            committee_count,
-            &vote_subnet)
-        != 0) {
-        return false;
-    }
-
-    return vote_subnet == client->gossip.attestation_subnet_id;
+    return true;
 }
 
 
@@ -430,20 +407,39 @@ static bool process_vote_locked(
 
     LanternState target_state;
     lantern_state_init(&target_state);
-    const LanternState *sig_state = lantern_client_state_for_root_locked(
+    LanternRoot missing_target_root = {0};
+    const LanternState *sig_state = lantern_client_state_for_root_local_locked(
         client,
         &vote->data.target.root,
         &target_state,
         NULL);
+    if (!sig_state
+        && !lantern_client_find_missing_state_root_locked(
+               client,
+               &vote->data.target.root,
+               &missing_target_root))
+    {
+        sig_state = lantern_client_state_for_root_locked(
+            client,
+            &vote->data.target.root,
+            &target_state,
+            NULL);
+    }
     if (!sig_state)
     {
         char target_hex[VOTE_ROOT_HEX_BUFFER_LEN];
+        char retry_hex[VOTE_ROOT_HEX_BUFFER_LEN];
         format_root_hex(&vote->data.target.root, target_hex, sizeof(target_hex));
+        format_root_hex(
+            lantern_root_is_zero(&missing_target_root) ? &vote->data.target.root : &missing_target_root,
+            retry_hex,
+            sizeof(retry_hex));
         lantern_log_debug(
             "gossip",
             meta,
-            "missing target state root=%s for validator=%" PRIu64 " slot=%" PRIu64,
+            "missing target state root=%s retry_root=%s for validator=%" PRIu64 " slot=%" PRIu64,
             target_hex[0] ? target_hex : "0x0",
+            retry_hex[0] ? retry_hex : "0x0",
             vote->data.validator_id,
             vote->data.slot);
         lantern_vote_rejection_set(
@@ -452,7 +448,8 @@ static bool process_vote_locked(
             vote->data.target.slot,
             target_hex[0] ? target_hex : "0x0");
         rejection->should_retry_after_block_import = true;
-        rejection->retry_root = vote->data.target.root;
+        rejection->retry_root =
+            lantern_root_is_zero(&missing_target_root) ? vote->data.target.root : missing_target_root;
         rejection->retry_slot = vote->data.target.slot;
         lantern_state_reset(&target_state);
         return false;
@@ -1006,7 +1003,7 @@ void lantern_client_replay_pending_gossip_votes(struct lantern_client *client)
             client,
             &pending.items[i].vote,
             peer_text,
-            false,
+            true,
             true);
     }
 
