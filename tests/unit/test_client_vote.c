@@ -1681,9 +1681,9 @@ static int test_record_vote_defers_interval_pipeline(void) {
         fprintf(stderr, "interval 2 aggregation failed for staged gossip vote\n");
         goto cleanup;
     }
-    if (client.store.new_aggregated_payloads.length != 1
-        || client.store.known_aggregated_payloads.length != 0) {
-        fprintf(stderr, "interval 2 aggregation did not stage proof into new payload pool\n");
+    if (client.store.new_aggregated_payloads.length != 0
+        || client.store.known_aggregated_payloads.length != 1) {
+        fprintf(stderr, "interval 2 aggregation did not publish the local proof into the known payload pool\n");
         goto cleanup;
     }
     if (had_safe_before) {
@@ -1733,7 +1733,7 @@ static int test_record_vote_defers_interval_pipeline(void) {
     }
     if (client.store.new_aggregated_payloads.length != 0
         || client.store.known_aggregated_payloads.length != 1) {
-        fprintf(stderr, "aggregated payload pools did not migrate after interval 4\n");
+        fprintf(stderr, "aggregated payload pools diverged after interval 4\n");
         goto cleanup;
     }
 
@@ -2038,7 +2038,7 @@ cleanup:
     return rc;
 }
 
-static int test_debug_aggregate_attestation_signatures_carries_forward_new_payloads(void) {
+static int test_debug_aggregate_attestation_signatures_stores_local_payloads_as_known(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
     struct PQSignatureSchemeSecretKey *secret = NULL;
@@ -2125,13 +2125,18 @@ static int test_debug_aggregate_attestation_signatures_carries_forward_new_paylo
         fprintf(stderr, "expected one fresh aggregate from non-recursive aggregation\n");
         goto cleanup;
     }
-    if (client.store.new_aggregated_payloads.length != 2u) {
-        fprintf(stderr, "non-recursive aggregation should carry forward prior new payloads\n");
+    if (client.store.new_aggregated_payloads.length != 1u) {
+        fprintf(stderr, "non-recursive aggregation should leave prior new payloads untouched\n");
         goto cleanup;
     }
     if (!aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &carried_root)
-        || !aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &fresh_root)) {
-        fprintf(stderr, "non-recursive aggregation did not retain both carried and fresh payloads\n");
+        || aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &fresh_root)) {
+        fprintf(stderr, "non-recursive aggregation should not publish local output into the new pool\n");
+        goto cleanup;
+    }
+    if (client.store.known_aggregated_payloads.length != 1u
+        || !aggregated_pool_contains_root(&client.store.known_aggregated_payloads, &fresh_root)) {
+        fprintf(stderr, "non-recursive aggregation should store local output in the known pool\n");
         goto cleanup;
     }
     if (client.store.attestation_signatures.length != 0u) {
@@ -2801,10 +2806,8 @@ static int test_block_build_keeps_known_payload_after_newer_raw_vote(void) {
     LanternSignedVote proof_vote;
     LanternSignedVote raw_vote;
     LanternAggregatedSignatureProof cached_proof;
-    LanternAttestations collected;
-    LanternSignatureList collected_signatures;
-    LanternAggregatedAttestations aggregated_attestations;
-    LanternAttestationSignatures aggregated_signatures;
+    LanternAggregatedAttestations collected;
+    LanternAttestationSignatures collected_signatures;
     int rc = 1;
 
     memset(&parent_root, 0, sizeof(parent_root));
@@ -2814,10 +2817,8 @@ static int test_block_build_keeps_known_payload_after_newer_raw_vote(void) {
     memset(&proof_vote, 0, sizeof(proof_vote));
     memset(&raw_vote, 0, sizeof(raw_vote));
     lantern_aggregated_signature_proof_init(&cached_proof);
-    lantern_attestations_init(&collected);
-    lantern_signature_list_init(&collected_signatures);
-    lantern_aggregated_attestations_init(&aggregated_attestations);
-    lantern_attestation_signatures_init(&aggregated_signatures);
+    lantern_aggregated_attestations_init(&collected);
+    lantern_attestation_signatures_init(&collected_signatures);
 
     if (client_test_setup_vote_validation_client_with_validator_count(
             &client,
@@ -2933,41 +2934,24 @@ static int test_block_build_keeps_known_payload_after_newer_raw_vote(void) {
             collected_signatures.length);
         goto cleanup;
     }
-    if (memcmp(&collected.data[0], &proof_vote.data, sizeof(proof_vote.data)) != 0) {
+    if (memcmp(&collected.data[0].data, &proof_vote.data.data, sizeof(proof_vote.data.data)) != 0) {
         fprintf(stderr, "block collection did not keep the proof-backed attestation\n");
         goto cleanup;
     }
-    if (memcmp(&collected_signatures.data[0], &proof_vote.signature, sizeof(proof_vote.signature)) != 0) {
-        fprintf(stderr, "block collection did not recover the proof-backed attestation signature\n");
+    if (!proof_payload_equals(&collected_signatures.data[0], &cached_proof)) {
+        fprintf(stderr, "block collection did not reuse the known cached proof\n");
         goto cleanup;
     }
-
-    lantern_client_error agg_rc = lantern_client_aggregate_attestations_for_block(
-        &client,
-        &collected,
-        &collected_signatures,
-        &aggregated_attestations,
-        &aggregated_signatures);
-    if (agg_rc != LANTERN_CLIENT_OK) {
-        fprintf(stderr, "failed to aggregate collected proof-backed attestation rc=%d\n", (int)agg_rc);
-        goto cleanup;
-    }
-    if (aggregated_attestations.length != 1u || aggregated_signatures.length != 1u) {
-        fprintf(stderr, "expected cached proof reuse for collected proof-backed attestation\n");
-        goto cleanup;
-    }
-    if (!proof_payload_equals(&aggregated_signatures.data[0], &cached_proof)) {
-        fprintf(stderr, "aggregated block attestations did not reuse the known cached proof\n");
+    if (!lantern_bitlist_get(&collected.data[0].aggregation_bits, (size_t)validator_id)) {
+        fprintf(stderr, "block collection did not preserve cached proof participants\n");
         goto cleanup;
     }
 
     rc = 0;
 
 cleanup:
-    lantern_attestation_signatures_reset(&aggregated_signatures);
-    lantern_aggregated_attestations_reset(&aggregated_attestations);
-    lantern_signature_list_reset(&collected_signatures);
-    lantern_attestations_reset(&collected);
+    lantern_attestation_signatures_reset(&collected_signatures);
+    lantern_aggregated_attestations_reset(&collected);
     lantern_aggregated_signature_proof_reset(&cached_proof);
     test_reset_agg_cache(&client);
     client_test_teardown_vote_validation_client(&client, pub, secret);
@@ -3038,8 +3022,8 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
         fprintf(stderr, "failed to record votes for subnet filter test\n");
         goto cleanup;
     }
-    if (client.store.attestation_signatures.length != 2u) {
-        fprintf(stderr, "expected only matching-subnet gossip signatures before aggregation\n");
+    if (client.store.attestation_signatures.length != 3u) {
+        fprintf(stderr, "expected all gossip signatures to be cached before subnet filtering\n");
         goto cleanup;
     }
     if (lantern_hash_tree_root_attestation_data(&vote0.data.data, &data_root) != 0) {
@@ -3161,8 +3145,8 @@ static int test_publish_attestations_includes_proposer(void) {
         fprintf(stderr, "validator_publish_attestations failed for proposer publish test\n");
         goto cleanup;
     }
-    if (capture.calls != 2u || capture.payload_len == 0u || !capture.payload) {
-        fprintf(stderr, "expected proposer attestation to publish on both gossip topics\n");
+    if (capture.calls != 1u || capture.payload_len == 0u || !capture.payload) {
+        fprintf(stderr, "expected proposer attestation to publish on the attestation subnet topic\n");
         goto cleanup;
     }
     if (lantern_gossip_decode_signed_vote_snappy(&published_vote, capture.payload, capture.payload_len) != 0) {
@@ -3325,7 +3309,7 @@ int main(void) {
     if (test_new_aggregated_payloads_promote_to_known() != 0) {
         return 1;
     }
-    if (test_debug_aggregate_attestation_signatures_carries_forward_new_payloads() != 0) {
+    if (test_debug_aggregate_attestation_signatures_stores_local_payloads_as_known() != 0) {
         return 1;
     }
     if (test_debug_aggregate_attestation_signatures_recursive_rebuilds_new_payloads() != 0) {

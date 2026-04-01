@@ -90,8 +90,8 @@ int lantern_state_collect_attestations_for_block(
     uint64_t block_slot,
     uint64_t proposer_index,
     const LanternRoot *parent_root,
-    LanternAttestations *out_attestations,
-    LanternSignatureList *out_signatures);
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures);
 int lantern_state_compute_vote_checkpoints(
     const LanternState *state,
     const LanternStore *store,

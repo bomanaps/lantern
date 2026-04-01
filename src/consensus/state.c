@@ -64,34 +64,40 @@ static int lantern_state_append_historical_root(LanternState *state, const Lante
 static int lantern_state_set_justified_slot_bit(LanternState *state, uint64_t slot, bool value);
 bool lantern_state_slot_in_justified_window(const LanternState *state, uint64_t slot);
 int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slot, bool *out_value);
-static bool attestation_list_contains_validator(const LanternAttestations *list, uint64_t validator_id);
-struct lantern_block_attestation_candidate {
-    LanternVote vote;
+static bool lantern_root_list_contains(const struct lantern_root_list *list, const LanternRoot *root);
+static bool lantern_attestation_head_is_known(
+    const LanternState *state,
+    const LanternStore *store,
+    const LanternCheckpoint *head);
+struct lantern_block_payload_group {
     LanternRoot data_root;
-    bool has_vote;
+    LanternAttestationData data;
 };
-static void lantern_vote_from_attestation_data(
-    LanternVote *out_vote,
-    uint64_t validator_id,
-    const LanternAttestationData *data);
-static void lantern_resolve_block_attestation_signature(
-    const LanternStore *vote_store,
-    const LanternStore *proof_store,
-    const struct lantern_block_attestation_candidate *candidate,
-    LanternSignature *out_signature);
 static int collect_attestations_for_checkpoint(
     const LanternState *state,
-    const LanternStore *vote_store,
     const LanternStore *proof_store,
     const LanternCheckpoint *checkpoint,
-    LanternAttestations *out_attestations,
-    LanternSignatureList *out_signatures);
+    struct lantern_root_list *processed_data_roots,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures);
 static int lantern_state_process_attestations_internal(
     LanternState *state,
     LanternStore *store,
     const LanternAttestations *attestations,
     const LanternSignatureList *signatures,
     bool apply_consensus_effects);
+static lantern_state_aggregate_result state_select_child_proofs_from_pool(
+    const struct lantern_aggregated_payload_pool *pool,
+    const LanternRoot *data_root,
+    bool *covered,
+    LanternAggregatedSignatureProof **out_children,
+    size_t *out_child_count,
+    size_t *out_child_capacity);
+static lantern_state_aggregate_result state_append_cached_proof(
+    const LanternAttestationData *data,
+    const LanternAggregatedSignatureProof *proof,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures);
 
 static const LanternState *lantern_state_cached_fork_choice_state_for_root(
     const LanternStore *store,
@@ -321,170 +327,162 @@ static int lantern_state_verify_block_signatures(
     return 0;
 }
 
-static bool attestation_list_contains_validator(const LanternAttestations *list, uint64_t validator_id) {
-    if (!list || !list->data || list->length == 0) {
+static bool lantern_root_list_contains(const struct lantern_root_list *list, const LanternRoot *root) {
+    if (!list || !list->items || !root) {
         return false;
     }
     for (size_t i = 0; i < list->length; ++i) {
-        if (list->data[i].validator_id == validator_id) {
+        if (memcmp(list->items[i].bytes, root->bytes, LANTERN_ROOT_SIZE) == 0) {
             return true;
         }
     }
     return false;
 }
 
-static void lantern_vote_from_attestation_data(
-    LanternVote *out_vote,
-    uint64_t validator_id,
-    const LanternAttestationData *data) {
-    if (!out_vote || !data) {
-        return;
+static bool lantern_attestation_head_is_known(
+    const LanternState *state,
+    const LanternStore *store,
+    const LanternCheckpoint *head) {
+    if (!state || !head || lantern_root_is_zero(&head->root)) {
+        return false;
     }
-
-    memset(out_vote, 0, sizeof(*out_vote));
-    out_vote->validator_id = validator_id;
-    out_vote->slot = data->slot;
-    out_vote->head = data->head;
-    out_vote->target = data->target;
-    out_vote->source = data->source;
+    if (store && store->fork_choice
+        && lantern_fork_choice_block_info(store->fork_choice, &head->root, NULL, NULL, NULL) == 0) {
+        return true;
+    }
+    if (head->slot < state->historical_block_hashes.length) {
+        return memcmp(
+                   state->historical_block_hashes.items[head->slot].bytes,
+                   head->root.bytes,
+                   LANTERN_ROOT_SIZE)
+            == 0;
+    }
+    return false;
 }
 
-static void lantern_resolve_block_attestation_signature(
-    const LanternStore *vote_store,
-    const LanternStore *proof_store,
-    const struct lantern_block_attestation_candidate *candidate,
-    LanternSignature *out_signature) {
-    if (!out_signature) {
-        return;
+static int lantern_block_payload_group_compare(const void *lhs, const void *rhs) {
+    const struct lantern_block_payload_group *left = lhs;
+    const struct lantern_block_payload_group *right = rhs;
+    if (!left || !right) {
+        return 0;
     }
-
-    memset(out_signature, 0, sizeof(*out_signature));
-    if (!candidate) {
-        return;
+    if (left->data.target.slot < right->data.target.slot) {
+        return -1;
     }
-
-    size_t validator_index = (size_t)candidate->vote.validator_id;
-    if (vote_store
-        && vote_store->validator_votes
-        && validator_index < vote_store->validator_votes_len) {
-        const struct lantern_vote_record *record = &vote_store->validator_votes[validator_index];
-        if (record->has_vote
-            && record->has_signature
-            && memcmp(&record->vote, &candidate->vote, sizeof(candidate->vote)) == 0) {
-            *out_signature = record->signature;
-            return;
-        }
+    if (left->data.target.slot > right->data.target.slot) {
+        return 1;
     }
-
-    if (!proof_store) {
-        return;
-    }
-
-    LanternSignatureKey key = {
-        .validator_index = candidate->vote.validator_id,
-        .data_root = candidate->data_root,
-    };
-    (void)lantern_store_get_attestation_signature(proof_store, &key, out_signature);
+    return memcmp(left->data_root.bytes, right->data_root.bytes, LANTERN_ROOT_SIZE);
 }
 
 static int collect_attestations_for_checkpoint(
     const LanternState *state,
-    const LanternStore *vote_store,
     const LanternStore *proof_store,
     const LanternCheckpoint *checkpoint,
-    LanternAttestations *out_attestations,
-    LanternSignatureList *out_signatures) {
-    if (!state || !vote_store || !proof_store || !checkpoint || !out_attestations || !out_signatures) {
+    struct lantern_root_list *processed_data_roots,
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures) {
+    if (!state || !proof_store || !checkpoint || !processed_data_roots || !out_attestations || !out_signatures) {
         return -1;
-    }
-    if (state->config.num_validators == 0 || state->config.num_validators > SIZE_MAX) {
-        return 0;
     }
     const struct lantern_aggregated_payload_pool *payloads = &proof_store->known_aggregated_payloads;
     if (!payloads->entries || payloads->length == 0) {
         return 0;
     }
 
-    size_t validator_count = (size_t)state->config.num_validators;
-    struct lantern_block_attestation_candidate *candidates =
-        calloc(validator_count, sizeof(*candidates));
-    if (!candidates) {
+    struct lantern_block_payload_group *groups =
+        calloc(payloads->length, sizeof(*groups));
+    if (!groups) {
         return -1;
     }
+    size_t group_count = 0u;
+    int rc = 0;
 
     for (size_t payload_index = 0; payload_index < payloads->length; ++payload_index) {
         const struct lantern_aggregated_payload_entry *entry = &payloads->entries[payload_index];
-        const struct lantern_bitlist *participants = &entry->proof.participants;
         LanternAttestationData data;
         memset(&data, 0, sizeof(data));
 
-        if (participants->bit_length == 0 || !participants->bytes) {
+        if (entry->proof.participants.bit_length == 0 || !entry->proof.participants.bytes) {
             continue;
         }
         if (lantern_store_get_attestation_data(proof_store, &entry->data_root, &data) != 0) {
             continue;
         }
-
-        size_t limit = participants->bit_length;
-        if (limit > validator_count) {
-            limit = validator_count;
+        if (!lantern_attestation_head_is_known(state, proof_store, &data.head)) {
+            continue;
         }
-        for (size_t validator_index = 0; validator_index < limit; ++validator_index) {
-            if (!lantern_bitlist_get(participants, validator_index)) {
-                continue;
-            }
-            if (candidates[validator_index].has_vote
-                && candidates[validator_index].vote.slot >= data.slot) {
-                continue;
-            }
-            lantern_vote_from_attestation_data(
-                &candidates[validator_index].vote,
-                (uint64_t)validator_index,
-                &data);
-            candidates[validator_index].data_root = entry->data_root;
-            candidates[validator_index].has_vote = true;
+        if (!lantern_checkpoint_equal(&data.source, checkpoint)) {
+            continue;
         }
+        if (lantern_root_list_contains(processed_data_roots, &entry->data_root)) {
+            continue;
+        }
+        bool seen_group = false;
+        for (size_t i = 0; i < group_count; ++i) {
+            if (memcmp(groups[i].data_root.bytes, entry->data_root.bytes, LANTERN_ROOT_SIZE) == 0) {
+                seen_group = true;
+                break;
+            }
+        }
+        if (seen_group) {
+            continue;
+        }
+        groups[group_count].data_root = entry->data_root;
+        groups[group_count].data = data;
+        group_count += 1u;
     }
 
-    for (size_t validator_index = 0; validator_index < validator_count; ++validator_index) {
-        const struct lantern_block_attestation_candidate *candidate = &candidates[validator_index];
-        LanternSignature signature;
+    if (group_count > 1u) {
+        qsort(groups, group_count, sizeof(*groups), lantern_block_payload_group_compare);
+    }
 
-        if (!candidate->has_vote) {
+    for (size_t group_index = 0; group_index < group_count; ++group_index) {
+        bool covered[LANTERN_VALIDATOR_REGISTRY_LIMIT];
+        memset(covered, 0, sizeof(covered));
+        LanternAggregatedSignatureProof *selected = NULL;
+        size_t selected_count = 0u;
+        size_t selected_capacity = 0u;
+
+        lantern_state_aggregate_result select_rc = state_select_child_proofs_from_pool(
+            payloads,
+            &groups[group_index].data_root,
+            covered,
+            &selected,
+            &selected_count,
+            &selected_capacity);
+        if (select_rc != LANTERN_STATE_AGGREGATE_OK) {
+            free(selected);
+            rc = -1;
+            break;
+        }
+        if (selected_count == 0u) {
+            free(selected);
             continue;
         }
-        if (!lantern_checkpoint_equal(&candidate->vote.source, checkpoint)) {
-            continue;
+        if (lantern_root_list_append(processed_data_roots, &groups[group_index].data_root) != 0) {
+            free(selected);
+            rc = -1;
+            break;
         }
-        if (attestation_list_contains_validator(out_attestations, candidate->vote.validator_id)) {
-            continue;
+        for (size_t proof_index = 0; proof_index < selected_count; ++proof_index) {
+            if (state_append_cached_proof(
+                    &groups[group_index].data,
+                    &selected[proof_index],
+                    out_attestations,
+                    out_signatures)
+                != LANTERN_STATE_AGGREGATE_OK) {
+                rc = -1;
+                break;
+            }
         }
-        if (out_attestations->length >= LANTERN_MAX_ATTESTATIONS) {
-            (void)lantern_attestations_resize(out_attestations, 0);
-            (void)lantern_signature_list_resize(out_signatures, 0);
-            free(candidates);
-            return -1;
-        }
-        if (lantern_attestations_append(out_attestations, &candidate->vote) != 0) {
-            (void)lantern_attestations_resize(out_attestations, 0);
-            (void)lantern_signature_list_resize(out_signatures, 0);
-            free(candidates);
-            return -1;
-        }
-        lantern_resolve_block_attestation_signature(
-            vote_store,
-            proof_store,
-            candidate,
-            &signature);
-        if (lantern_signature_list_append(out_signatures, &signature) != 0) {
-            (void)lantern_attestations_resize(out_attestations, 0);
-            (void)lantern_signature_list_resize(out_signatures, 0);
-            free(candidates);
-            return -1;
+        free(selected);
+        if (rc != 0) {
+            break;
         }
     }
-    free(candidates);
-    return 0;
+    free(groups);
+    return rc;
 }
 
 struct state_aggregation_group {
@@ -2858,12 +2856,9 @@ int lantern_state_collect_attestations_for_block(
     uint64_t block_slot,
     uint64_t proposer_index,
     const LanternRoot *parent_root,
-    LanternAttestations *out_attestations,
-    LanternSignatureList *out_signatures) {
+    LanternAggregatedAttestations *out_attestations,
+    LanternAttestationSignatures *out_signatures) {
     if (!state || !store || !out_attestations || !out_signatures || !parent_root) {
-        return -1;
-    }
-    if (!store->validator_votes || store->validator_votes_len == 0) {
         return -1;
     }
     const LanternState *base_state = lantern_state_cached_fork_choice_state_for_root(store, parent_root);
@@ -2873,11 +2868,11 @@ int lantern_state_collect_attestations_for_block(
     if (block_slot <= base_state->slot) {
         return -1;
     }
-    if (lantern_attestations_resize(out_attestations, 0) != 0) {
+    if (lantern_aggregated_attestations_resize(out_attestations, 0) != 0) {
         return -1;
     }
-    if (lantern_signature_list_resize(out_signatures, 0) != 0) {
-        (void)lantern_attestations_resize(out_attestations, 0);
+    if (lantern_attestation_signatures_resize(out_signatures, 0) != 0) {
+        (void)lantern_aggregated_attestations_resize(out_attestations, 0);
         return -1;
     }
 
@@ -2885,20 +2880,13 @@ int lantern_state_collect_attestations_for_block(
     lantern_state_init(&slot_snapshot);
     LanternState scratch;
     lantern_state_init(&scratch);
-    LanternStore slot_store;
-    lantern_store_init(&slot_store);
     LanternStore scratch_store;
     lantern_store_init(&scratch_store);
+    struct lantern_root_list processed_data_roots;
+    lantern_root_list_init(&processed_data_roots);
     int rc = 0;
-    bool fixed_point = false;
-    LanternAggregatedAttestations aggregated_view;
-    lantern_aggregated_attestations_init(&aggregated_view);
 
     if (lantern_state_clone(base_state, &slot_snapshot) != 0) {
-        rc = -1;
-        goto cleanup;
-    }
-    if (lantern_store_clone_validator_votes(store, &slot_store) != 0) {
         rc = -1;
         goto cleanup;
     }
@@ -2908,8 +2896,14 @@ int lantern_state_collect_attestations_for_block(
     }
 
     LanternCheckpoint checkpoint = slot_snapshot.latest_justified;
+    if (slot_snapshot.latest_block_header.slot == 0u) {
+        checkpoint.root = *parent_root;
+    }
     size_t iteration = 0;
-    size_t iteration_guard = store->validator_votes_len == 0 ? 1 : store->validator_votes_len;
+    size_t iteration_guard = store->known_aggregated_payloads.length + 1u;
+    if (iteration_guard == 0u) {
+        iteration_guard = 1u;
+    }
     if (iteration_guard < SIZE_MAX) {
         iteration_guard += 1u;
     }
@@ -2918,21 +2912,20 @@ int lantern_state_collect_attestations_for_block(
         .slot = block_slot,
     };
     while (true) {
+        size_t previous_attestation_count = out_attestations->length;
         if (collect_attestations_for_checkpoint(
                 &slot_snapshot,
-                &slot_store,
                 store,
                 &checkpoint,
+                &processed_data_roots,
                 out_attestations,
                 out_signatures)
             != 0) {
             rc = -1;
             goto cleanup;
         }
-        lantern_aggregated_attestations_reset(&aggregated_view);
-        if (lantern_wrap_attestations_as_aggregated(out_attestations, &aggregated_view) != 0) {
-            rc = -1;
-            goto cleanup;
+        if (out_attestations->length == previous_attestation_count) {
+            break;
         }
 
         lantern_state_reset(&scratch);
@@ -2942,7 +2935,7 @@ int lantern_state_collect_attestations_for_block(
         }
         lantern_store_reset(&scratch_store);
         lantern_store_init(&scratch_store);
-        if (lantern_store_clone_validator_votes(&slot_store, &scratch_store) != 0) {
+        if (lantern_store_prepare_validator_votes(&scratch_store, scratch.config.num_validators) != 0) {
             rc = -1;
             goto cleanup;
         }
@@ -2952,9 +2945,9 @@ int lantern_state_collect_attestations_for_block(
         candidate.slot = block_slot;
         candidate.proposer_index = proposer_index;
         candidate.parent_root = *parent_root;
-        candidate.body.attestations.data = aggregated_view.data;
-        candidate.body.attestations.length = aggregated_view.length;
-        candidate.body.attestations.capacity = aggregated_view.length;
+        candidate.body.attestations.data = out_attestations->data;
+        candidate.body.attestations.length = out_attestations->length;
+        candidate.body.attestations.capacity = out_attestations->length;
 
         if (lantern_state_process_block(&scratch, &scratch_store, &candidate, NULL) != 0) {
             rc = -1;
@@ -2962,15 +2955,7 @@ int lantern_state_collect_attestations_for_block(
         }
 
         LanternCheckpoint post_checkpoint = scratch.latest_justified;
-        lantern_state_reset(&scratch);
-        lantern_store_reset(&slot_store);
-        lantern_store_init(&slot_store);
-        if (lantern_store_clone_validator_votes(&scratch_store, &slot_store) != 0) {
-            rc = -1;
-            goto cleanup;
-        }
         if (lantern_checkpoint_equal(&post_checkpoint, &checkpoint)) {
-            fixed_point = true;
             break;
         }
         checkpoint = post_checkpoint;
@@ -2979,25 +2964,22 @@ int lantern_state_collect_attestations_for_block(
             lantern_log_warn(
                 "state",
                 &meta,
-                "attestation collection failed to converge after %zu iterations (validators=%zu)",
+                "attestation collection failed to converge after %zu iterations (payloads=%zu)",
                 iteration,
-                store->validator_votes_len);
+                store->known_aggregated_payloads.length);
+            rc = -1;
             break;
         }
     }
 
 cleanup:
     lantern_store_reset(&scratch_store);
-    lantern_store_reset(&slot_store);
     lantern_state_reset(&scratch);
     lantern_state_reset(&slot_snapshot);
-    lantern_aggregated_attestations_reset(&aggregated_view);
-    if (!fixed_point) {
-        rc = -1;
-    }
+    lantern_root_list_reset(&processed_data_roots);
     if (rc != 0) {
-        (void)lantern_attestations_resize(out_attestations, 0);
-        (void)lantern_signature_list_resize(out_signatures, 0);
+        (void)lantern_aggregated_attestations_resize(out_attestations, 0);
+        (void)lantern_attestation_signatures_resize(out_signatures, 0);
     }
     return rc;
 }

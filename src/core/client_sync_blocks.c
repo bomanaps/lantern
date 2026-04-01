@@ -2137,7 +2137,7 @@ static enum block_parent_action handle_block_parent_locked(
             parent_meta = *meta;
         }
         parent_meta.has_slot = true;
-        parent_meta.slot = block->message.block.slot;
+        parent_meta.slot = block->block.slot;
 
         LanternRoot head_root = {0};
         uint64_t head_slot = client->state.slot;
@@ -2198,7 +2198,7 @@ static enum block_parent_action handle_block_parent_locked(
             " anchor_root=%s store_justified_slot=%" PRIu64
             " store_justified_root=%s store_finalized_slot=%" PRIu64
             " store_finalized_root=%s",
-            block->message.block.slot,
+            block->block.slot,
             block_hex[0] ? block_hex : "0x0",
             parent_hex[0] ? parent_hex : "0x0",
             head_slot,
