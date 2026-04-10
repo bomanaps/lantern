@@ -346,7 +346,6 @@ int lantern_client_debug_publish_aggregated_attestations(
     uint64_t slot);
 lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
     struct lantern_client *client,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures);
 int lantern_client_debug_run_interval_aggregation(

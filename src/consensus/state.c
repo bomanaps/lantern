@@ -1248,7 +1248,6 @@ lantern_state_aggregate_result lantern_state_aggregate(
     const LanternAttestationSignatureInputs *attestation_signatures,
     const struct lantern_aggregated_payload_pool *new_payloads,
     const struct lantern_aggregated_payload_pool *known_payloads,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures) {
     if (!state || !out_attestations || !out_signatures) {
@@ -1264,7 +1263,7 @@ lantern_state_aggregate_result lantern_state_aggregate(
         || (raw_signatures && raw_signatures->length > 0u && !raw_signatures->data)) {
         return LANTERN_STATE_AGGREGATE_INVALID_PARAM;
     }
-    if (recursive && new_payloads && new_payloads->length > 0u && !store) {
+    if (new_payloads && new_payloads->length > 0u && !store) {
         return LANTERN_STATE_AGGREGATE_INVALID_PARAM;
     }
 
@@ -1315,7 +1314,7 @@ lantern_state_aggregate_result lantern_state_aggregate(
         }
     }
 
-    if (rc == LANTERN_STATE_AGGREGATE_OK && recursive && store && new_payloads && new_payloads->entries) {
+    if (rc == LANTERN_STATE_AGGREGATE_OK && store && new_payloads && new_payloads->entries) {
         for (size_t i = 0; i < new_payloads->length; ++i) {
             LanternAttestationData data;
             memset(&data, 0, sizeof(data));
@@ -1344,29 +1343,27 @@ lantern_state_aggregate_result lantern_state_aggregate(
             size_t child_count = 0u;
             size_t child_capacity = 0u;
 
-            if (recursive) {
+            rc = state_select_child_proofs_from_pool(
+                new_payloads,
+                &groups[i].data_root,
+                covered,
+                &children,
+                &child_count,
+                &child_capacity);
+            if (rc == LANTERN_STATE_AGGREGATE_OK) {
                 rc = state_select_child_proofs_from_pool(
-                    new_payloads,
+                    known_payloads,
                     &groups[i].data_root,
                     covered,
                     &children,
                     &child_count,
                     &child_capacity);
-                if (rc == LANTERN_STATE_AGGREGATE_OK) {
-                    rc = state_select_child_proofs_from_pool(
-                        known_payloads,
-                        &groups[i].data_root,
-                        covered,
-                        &children,
-                        &child_count,
-                        &child_capacity);
-                }
             }
             if (rc == LANTERN_STATE_AGGREGATE_OK) {
                 rc = state_append_selected_group(
                     state,
                     &groups[i],
-                    recursive ? covered : NULL,
+                    covered,
                     children,
                     child_count,
                     out_attestations,

@@ -1172,7 +1172,6 @@ static lantern_client_error aggregate_attestation_signatures(
     struct lantern_client *client,
     const LanternAttestations *att_list,
     const LanternSignatureList *att_signatures,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures)
 {
@@ -1201,18 +1200,14 @@ static lantern_client_error aggregate_attestation_signatures(
             &client->state,
             &client->store,
             &attestation_signatures,
-            recursive ? &client->store.new_aggregated_payloads : NULL,
-            recursive ? &client->store.known_aggregated_payloads : NULL,
-            recursive,
+            &client->store.new_aggregated_payloads,
+            &client->store.known_aggregated_payloads,
             out_attestations,
             out_signatures));
 
     if (rc == LANTERN_CLIENT_OK)
     {
-        if (recursive)
-        {
-            lantern_store_clear_new_aggregated_payloads(&client->store);
-        }
+        lantern_store_clear_new_aggregated_payloads(&client->store);
 
         for (size_t i = 0; i < out_attestations->length; ++i)
         {
@@ -1222,19 +1217,12 @@ static lantern_client_error aggregate_attestation_signatures(
                 rc = LANTERN_CLIENT_ERR_VALIDATOR;
                 break;
             }
-            int add_rc = recursive
-                ? lantern_store_add_new_aggregated_payload(
-                      &client->store,
-                      &data_root,
-                      &out_attestations->data[i].data,
-                      &out_signatures->data[i],
-                      out_attestations->data[i].data.target.slot)
-                : lantern_store_add_known_aggregated_payload(
-                      &client->store,
-                      &data_root,
-                      &out_attestations->data[i].data,
-                      &out_signatures->data[i],
-                      out_attestations->data[i].data.target.slot);
+            int add_rc = lantern_store_add_new_aggregated_payload(
+                &client->store,
+                &data_root,
+                &out_attestations->data[i].data,
+                &out_signatures->data[i],
+                out_attestations->data[i].data.target.slot);
             if (add_rc != 0)
             {
                 rc = LANTERN_CLIENT_ERR_ALLOC;
@@ -1256,7 +1244,6 @@ static lantern_client_error aggregate_attestation_signatures(
 
 lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
     struct lantern_client *client,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures)
 {
@@ -1281,7 +1268,6 @@ lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
             client,
             &attestations,
             &signatures,
-            recursive,
             out_attestations,
             out_signatures);
     }
@@ -2321,7 +2307,6 @@ static int validator_publish_aggregated_attestations(struct lantern_client *clie
     uint64_t aggregation_started_ms = monotonic_millis();
     lantern_client_error result = lantern_client_debug_aggregate_attestation_signatures(
         client,
-        false,
         &aggregated_attestations,
         &aggregated_signatures);
     uint64_t aggregation_finished_ms = monotonic_millis();

@@ -109,7 +109,6 @@ lantern_state_aggregate_result lantern_state_aggregate(
     const LanternAttestationSignatureInputs *attestation_signatures,
     const struct lantern_aggregated_payload_pool *new_payloads,
     const struct lantern_aggregated_payload_pool *known_payloads,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures);
 

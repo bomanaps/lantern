@@ -77,7 +77,6 @@ lantern_client_error lantern_client_aggregate_attestations_for_block(
     LanternAttestationSignatures *out_signatures);
 lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
     struct lantern_client *client,
-    bool recursive,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures);
 int validator_publish_attestations(struct lantern_client *client, uint64_t slot);
@@ -1681,9 +1680,9 @@ static int test_record_vote_defers_interval_pipeline(void) {
         fprintf(stderr, "interval 2 aggregation failed for staged gossip vote\n");
         goto cleanup;
     }
-    if (client.store.new_aggregated_payloads.length != 0
-        || client.store.known_aggregated_payloads.length != 1) {
-        fprintf(stderr, "interval 2 aggregation did not publish the local proof into the known payload pool\n");
+    if (client.store.new_aggregated_payloads.length != 1
+        || client.store.known_aggregated_payloads.length != 0) {
+        fprintf(stderr, "interval 2 aggregation did not publish the local proof into the new payload pool\n");
         goto cleanup;
     }
     if (had_safe_before) {
@@ -2038,124 +2037,7 @@ cleanup:
     return rc;
 }
 
-static int test_debug_aggregate_attestation_signatures_stores_local_payloads_as_known(void) {
-    struct lantern_client client;
-    struct PQSignatureSchemePublicKey *pub = NULL;
-    struct PQSignatureSchemeSecretKey *secret = NULL;
-    LanternRoot anchor_root;
-    LanternRoot child_root;
-    struct lantern_validator_config_entry assigned;
-    LanternSignedVote vote;
-    LanternRoot carried_root;
-    LanternRoot fresh_root;
-    LanternAggregatedSignatureProof carried_proof;
-    LanternAggregatedAttestations aggregated_attestations;
-    LanternAttestationSignatures aggregated_signatures;
-    int rc = 1;
-
-    memset(&assigned, 0, sizeof(assigned));
-    memset(&vote, 0, sizeof(vote));
-    memset(&carried_root, 0, sizeof(carried_root));
-    memset(&fresh_root, 0, sizeof(fresh_root));
-    lantern_aggregated_signature_proof_init(&carried_proof);
-    lantern_aggregated_attestations_init(&aggregated_attestations);
-    lantern_attestation_signatures_init(&aggregated_signatures);
-
-    if (client_test_setup_vote_validation_client(
-            &client,
-            "aggregate_non_recursive_carry",
-            &pub,
-            &secret,
-            &anchor_root,
-            &child_root)
-        != 0) {
-        return 1;
-    }
-
-    assigned.enr.is_aggregator = true;
-    client.assigned_validators = &assigned;
-    client.debug_attestation_committee_count = 1u;
-    client.gossip.attestation_subnet_id = 0u;
-
-    LanternAttestationData carried_data = test_make_attestation_data(7u, 0x55u);
-    client_test_fill_root_with_index(&carried_root, 0x707u);
-    if (test_make_dummy_proof(&carried_proof, 0u, 0x44u) != 0) {
-        fprintf(stderr, "failed to build carried proof for non-recursive aggregation test\n");
-        goto cleanup;
-    }
-    if (lantern_client_add_new_aggregated_payload(
-            &client,
-            &carried_root,
-            &carried_data,
-            &carried_proof,
-            carried_data.target.slot)
-        != 0) {
-        fprintf(stderr, "failed to seed carried new payload for non-recursive aggregation test\n");
-        goto cleanup;
-    }
-
-    if (make_signed_vote_for_validator(&client, secret, 0u, &anchor_root, &child_root, &vote) != 0) {
-        fprintf(stderr, "failed to build signed vote for non-recursive aggregation test\n");
-        goto cleanup;
-    }
-    if (lantern_client_debug_record_vote(&client, &vote, "aggregate_non_recursive") != 0) {
-        fprintf(stderr, "failed to record vote for non-recursive aggregation test\n");
-        goto cleanup;
-    }
-    if (client.store.attestation_signatures.length != 1u) {
-        fprintf(stderr, "expected one cached attestation signature before non-recursive aggregation\n");
-        goto cleanup;
-    }
-
-    if (lantern_hash_tree_root_attestation_data(&vote.data.data, &fresh_root) != 0) {
-        fprintf(stderr, "failed to hash fresh attestation data for non-recursive aggregation test\n");
-        goto cleanup;
-    }
-
-    lantern_client_error agg_rc = lantern_client_debug_aggregate_attestation_signatures(
-        &client,
-        false,
-        &aggregated_attestations,
-        &aggregated_signatures);
-    if (agg_rc != LANTERN_CLIENT_OK) {
-        fprintf(stderr, "non-recursive aggregation failed rc=%d\n", (int)agg_rc);
-        goto cleanup;
-    }
-    if (aggregated_attestations.length != 1u || aggregated_signatures.length != 1u) {
-        fprintf(stderr, "expected one fresh aggregate from non-recursive aggregation\n");
-        goto cleanup;
-    }
-    if (client.store.new_aggregated_payloads.length != 1u) {
-        fprintf(stderr, "non-recursive aggregation should leave prior new payloads untouched\n");
-        goto cleanup;
-    }
-    if (!aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &carried_root)
-        || aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &fresh_root)) {
-        fprintf(stderr, "non-recursive aggregation should not publish local output into the new pool\n");
-        goto cleanup;
-    }
-    if (client.store.known_aggregated_payloads.length != 1u
-        || !aggregated_pool_contains_root(&client.store.known_aggregated_payloads, &fresh_root)) {
-        fprintf(stderr, "non-recursive aggregation should store local output in the known pool\n");
-        goto cleanup;
-    }
-    if (client.store.attestation_signatures.length != 0u) {
-        fprintf(stderr, "non-recursive aggregation should prune raw attestation signatures for aggregated data\n");
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    lantern_attestation_signatures_reset(&aggregated_signatures);
-    lantern_aggregated_attestations_reset(&aggregated_attestations);
-    lantern_aggregated_signature_proof_reset(&carried_proof);
-    test_reset_agg_cache(&client);
-    client_test_teardown_vote_validation_client(&client, pub, secret);
-    return rc;
-}
-
-static int test_debug_aggregate_attestation_signatures_recursive_rebuilds_new_payloads(void) {
+static int test_debug_aggregate_attestation_signatures_rebuilds_new_payloads(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
     struct PQSignatureSchemeSecretKey *secret = NULL;
@@ -2231,28 +2113,27 @@ static int test_debug_aggregate_attestation_signatures_recursive_rebuilds_new_pa
 
     lantern_client_error agg_rc = lantern_client_debug_aggregate_attestation_signatures(
         &client,
-        true,
         &aggregated_attestations,
         &aggregated_signatures);
     if (agg_rc != LANTERN_CLIENT_OK) {
-        fprintf(stderr, "recursive aggregation failed rc=%d\n", (int)agg_rc);
+        fprintf(stderr, "aggregation failed rc=%d\n", (int)agg_rc);
         goto cleanup;
     }
     if (aggregated_attestations.length != 1u || aggregated_signatures.length != 1u) {
-        fprintf(stderr, "expected one fresh aggregate from recursive aggregation\n");
+        fprintf(stderr, "expected one fresh aggregate from aggregation\n");
         goto cleanup;
     }
     if (client.store.new_aggregated_payloads.length != 1u) {
-        fprintf(stderr, "recursive aggregation should rebuild the new payload pool from fresh results only\n");
+        fprintf(stderr, "aggregation should rebuild the new payload pool from fresh results only\n");
         goto cleanup;
     }
     if (!aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &fresh_root)
         || aggregated_pool_contains_root(&client.store.new_aggregated_payloads, &stale_root)) {
-        fprintf(stderr, "recursive aggregation did not rebuild the new payload pool correctly\n");
+        fprintf(stderr, "aggregation did not rebuild the new payload pool correctly\n");
         goto cleanup;
     }
     if (client.store.attestation_signatures.length != 0u) {
-        fprintf(stderr, "recursive aggregation should prune raw attestation signatures for aggregated data\n");
+        fprintf(stderr, "aggregation should prune raw attestation signatures for aggregated data\n");
         goto cleanup;
     }
 
@@ -3309,10 +3190,7 @@ int main(void) {
     if (test_new_aggregated_payloads_promote_to_known() != 0) {
         return 1;
     }
-    if (test_debug_aggregate_attestation_signatures_stores_local_payloads_as_known() != 0) {
-        return 1;
-    }
-    if (test_debug_aggregate_attestation_signatures_recursive_rebuilds_new_payloads() != 0) {
+    if (test_debug_aggregate_attestation_signatures_rebuilds_new_payloads() != 0) {
         return 1;
     }
     if (test_attestation_material_prunes_finalized_entries() != 0) {
