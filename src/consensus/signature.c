@@ -11,6 +11,15 @@
 #include "lantern/support/strings.h"
 #include "pq-bindings-c-rust.h"
 
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+_Static_assert(
+    LANTERN_SIGNATURE_SIZE == SIGNATURE_SIZE,
+    "LANTERN_SIGNATURE_SIZE must match the c-leanvm-xmss SIGNATURE_SIZE");
+#else
+typedef char lantern_signature_size_matches_wrapper[
+    (LANTERN_SIGNATURE_SIZE == SIGNATURE_SIZE) ? 1 : -1];
+#endif
+
 static double get_time_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
@@ -53,25 +62,6 @@ static void log_agg_proof_preview(const LanternByteList *proof) {
         proof->length,
         hex[0] ? hex : "-",
         ellipsis);
-
-    if (proof->length >= 9u) {
-        uint32_t proof_len = (uint32_t)proof->data[1]
-            | ((uint32_t)proof->data[2] << 8u)
-            | ((uint32_t)proof->data[3] << 16u)
-            | ((uint32_t)proof->data[4] << 24u);
-        uint32_t randomness_count = (uint32_t)proof->data[5]
-            | ((uint32_t)proof->data[6] << 8u)
-            | ((uint32_t)proof->data[7] << 16u)
-            | ((uint32_t)proof->data[8] << 24u);
-        lantern_log_debug(
-            "signature",
-            NULL,
-            "aggregation proof header version=0x%02x proof_len=%" PRIu32 " randomness_count=%" PRIu32 " total_len=%zu",
-            (unsigned)proof->data[0],
-            proof_len,
-            randomness_count,
-            proof->length);
-    }
 }
 
 bool lantern_signature_is_zero(const LanternSignature *signature) {
@@ -263,35 +253,48 @@ bool lantern_signature_aggregate(
     }
 
     if (ok) {
-        pq_xmss_aggregation_setup_prover();
-        uintptr_t written_len = 0;
-        enum PQSigningError err = pq_aggregate_signatures(
-            (const struct PQSignatureSchemePublicKey *const *)pubkey_handles,
-            (const struct PQSignature *const *)sig_handles,
-            count,
-            message->bytes,
-            LANTERN_ROOT_SIZE,
-            epoch,
-            out_proof->data,
-            out_proof->length,
-            &written_len);
-        if (err != Success || written_len == 0 || written_len > out_proof->length) {
-            lantern_log_error(
-                "signature",
-                NULL,
-                "aggregation failed err=%d written=%zu buffer=%zu count=%zu",
-                (int)err,
-                (size_t)written_len,
-                (size_t)out_proof->length,
-                count);
-            ok = false;
-        } else if (lantern_byte_list_resize(out_proof, (size_t)written_len) != 0) {
-            lantern_log_error(
-                "signature",
-                NULL,
-                "aggregation resize failed written=%zu",
-                (size_t)written_len);
-            ok = false;
+        if (count == 1u) {
+            if (lantern_byte_list_resize(out_proof, LANTERN_SIGNATURE_SIZE) != 0) {
+                lantern_log_error(
+                    "signature",
+                    NULL,
+                    "single-signature aggregation resize failed written=%zu",
+                    (size_t)LANTERN_SIGNATURE_SIZE);
+                ok = false;
+            } else {
+                memcpy(out_proof->data, signatures[0].bytes, LANTERN_SIGNATURE_SIZE);
+            }
+        } else {
+            pq_xmss_aggregation_setup_prover();
+            uintptr_t written_len = 0;
+            enum PQSigningError err = pq_aggregate_signatures(
+                (const struct PQSignatureSchemePublicKey *const *)pubkey_handles,
+                (const struct PQSignature *const *)sig_handles,
+                count,
+                message->bytes,
+                LANTERN_ROOT_SIZE,
+                epoch,
+                out_proof->data,
+                out_proof->length,
+                &written_len);
+            if (err != Success || written_len == 0 || written_len > out_proof->length) {
+                lantern_log_error(
+                    "signature",
+                    NULL,
+                    "aggregation failed err=%d written=%zu buffer=%zu count=%zu",
+                    (int)err,
+                    (size_t)written_len,
+                    (size_t)out_proof->length,
+                    count);
+                ok = false;
+            } else if (lantern_byte_list_resize(out_proof, (size_t)written_len) != 0) {
+                lantern_log_error(
+                    "signature",
+                    NULL,
+                    "aggregation resize failed written=%zu",
+                    (size_t)written_len);
+                ok = false;
+            }
         }
     }
 
@@ -459,6 +462,30 @@ bool lantern_signature_verify_aggregated(
         epoch,
         proof->length);
     log_agg_proof_preview(proof);
+
+    if (count == 1u && proof->length == LANTERN_SIGNATURE_SIZE) {
+        double start = get_time_seconds();
+        int verify_rc = pq_verify_ssz(
+            pubkeys[0],
+            LANTERN_VALIDATOR_PUBKEY_SIZE,
+            epoch,
+            message->bytes,
+            LANTERN_ROOT_SIZE,
+            proof->data,
+            proof->length);
+        double elapsed = get_time_seconds() - start;
+        lean_metrics_record_pq_aggregated_signature_verification(elapsed, verify_rc == 1);
+        if (verify_rc != 1) {
+            lantern_log_error(
+                "signature",
+                NULL,
+                "single-signature aggregation verify failed rc=%d count=%zu epoch=%" PRIu64,
+                verify_rc,
+                count,
+                epoch);
+        }
+        return verify_rc == 1;
+    }
 
     struct PQSignatureSchemePublicKey **pubkey_handles = calloc(count, sizeof(*pubkey_handles));
     if (!pubkey_handles) {

@@ -82,6 +82,63 @@ static bool sign_proposer_vote(
     return true;
 }
 
+static bool aggregated_proof_tamper_is_rejected(
+    const uint8_t *const *pubkeys,
+    size_t count,
+    const LanternRoot *message,
+    const LanternByteList *proof,
+    uint64_t epoch) {
+    LanternByteList tampered;
+    size_t candidate_count = 0;
+    size_t candidates[4];
+
+    if (!pubkeys || !message || !proof || proof->length == 0 || !proof->data) {
+        return false;
+    }
+
+    lantern_byte_list_init(&tampered);
+    if (lantern_byte_list_copy(&tampered, proof) != 0 || tampered.length == 0 || !tampered.data) {
+        lantern_byte_list_reset(&tampered);
+        return false;
+    }
+
+    candidates[candidate_count++] = 0u;
+    candidates[candidate_count++] = tampered.length / 4u;
+    candidates[candidate_count++] = tampered.length / 2u;
+    candidates[candidate_count++] = tampered.length - 1u;
+
+    for (size_t i = 0; i < candidate_count; ++i) {
+        size_t offset = candidates[i];
+        bool seen = false;
+        for (size_t j = 0; j < i; ++j) {
+            if (candidates[j] == offset) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+
+        tampered.data[offset] ^= 0xFFu;
+        if (!lantern_signature_verify_aggregated(pubkeys, count, message, &tampered, epoch)) {
+            lantern_byte_list_reset(&tampered);
+            return true;
+        }
+        tampered.data[offset] ^= 0xFFu;
+    }
+
+    if (tampered.length > 1u
+        && lantern_byte_list_resize(&tampered, tampered.length - 1u) == 0
+        && !lantern_signature_verify_aggregated(pubkeys, count, message, &tampered, epoch)) {
+        lantern_byte_list_reset(&tampered);
+        return true;
+    }
+
+    lantern_byte_list_reset(&tampered);
+    return false;
+}
+
 static int test_proposer_vote_signature_roundtrip(void) {
     struct PQSignatureSchemePublicKey *pubkey = NULL;
     struct PQSignatureSchemeSecretKey *secret = NULL;
@@ -194,7 +251,6 @@ static int test_aggregated_signature_roundtrip(void) {
     const uint8_t *pubkey_ptrs[kSignerCount];
     LanternSignature signatures[kSignerCount];
     LanternByteList proof;
-    LanternByteList tampered;
     LanternRoot message;
     uint64_t epoch = 1;
 
@@ -203,7 +259,6 @@ static int test_aggregated_signature_roundtrip(void) {
     memset(serialized_pubkeys, 0, sizeof(serialized_pubkeys));
     memset(signatures, 0, sizeof(signatures));
     lantern_byte_list_init(&proof);
-    lantern_byte_list_init(&tampered);
     fill_root(&message, 0xA1);
 
     for (size_t i = 0; i < kSignerCount; ++i) {
@@ -256,16 +311,11 @@ static int test_aggregated_signature_roundtrip(void) {
         goto fail;
     }
 
-    if (lantern_byte_list_copy(&tampered, &proof) != 0 || tampered.length == 0 || !tampered.data) {
-        fprintf(stderr, "aggregate: failed to copy proof\n");
-        goto fail;
-    }
-    tampered.data[0] ^= 0xFF;
-    if (lantern_signature_verify_aggregated(
+    if (!aggregated_proof_tamper_is_rejected(
             pubkey_ptrs,
             kSignerCount,
             &message,
-            &tampered,
+            &proof,
             epoch)) {
         fprintf(stderr, "aggregate: tampered proof unexpectedly verified\n");
         goto fail;
@@ -276,7 +326,6 @@ static int test_aggregated_signature_roundtrip(void) {
         pq_public_key_free(pubkeys[i]);
     }
     lantern_byte_list_reset(&proof);
-    lantern_byte_list_reset(&tampered);
     return 0;
 
 fail:
@@ -289,7 +338,6 @@ fail:
         }
     }
     lantern_byte_list_reset(&proof);
-    lantern_byte_list_reset(&tampered);
     return 1;
 }
 

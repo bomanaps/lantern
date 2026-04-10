@@ -139,6 +139,35 @@ static uint8_t *read_fixture_bytes(const char *relative_path, size_t *out_len) {
     return buffer;
 }
 
+static void maybe_write_fixture_bytes(
+    const char *env_var,
+    const char *relative_path,
+    const uint8_t *data,
+    size_t len) {
+    const char *enabled = getenv(env_var);
+    if (!enabled || enabled[0] == '\0') {
+        return;
+    }
+    CHECK(relative_path != NULL);
+    CHECK(data != NULL || len == 0);
+
+    char path[PATH_MAX];
+    int written = snprintf(path, sizeof(path), "%s/%s", LANTERN_TEST_FIXTURE_DIR, relative_path);
+    CHECK(written > 0);
+    CHECK((size_t)written < sizeof(path));
+
+    FILE *fp = fopen(path, "wb");
+    CHECK(fp != NULL);
+    if (len > 0) {
+        CHECK(fwrite(data, 1, len, fp) == len);
+    }
+    fclose(fp);
+
+    printf("wrote fixture %s (%zu bytes)\n", relative_path, len);
+    fflush(stdout);
+    exit(0);
+}
+
 struct mock_stream_ctx {
     uint8_t *data;
     size_t length;
@@ -956,6 +985,11 @@ static void test_signed_block_list_fixture(void) {
     check_zero(
         lantern_network_signed_block_list_encode(&resp, encoded, encoded_capacity, &written),
         "fixture response encode");
+    maybe_write_fixture_bytes(
+        "LANTERN_WRITE_BLOCKS_BY_ROOT_RESPONSE_FIXTURE",
+        "networking/blocks_by_root_response_leanspec.ssz",
+        encoded,
+        written);
 
     /* Decode back and verify */
     LanternSignedBlockList decoded;
@@ -1565,6 +1599,11 @@ static void test_gossip_signed_block_fixture_roundtrip(void) {
     size_t ssz_len = 0;
     CHECK(lantern_ssz_encode_signed_block(&original, ssz_bytes, max_ssz, &ssz_len) == 0);
     CHECK(ssz_len > 0);
+    maybe_write_fixture_bytes(
+        "LANTERN_WRITE_GOSSIP_SIGNED_BLOCK_FIXTURES",
+        "networking/gossip_signed_block_leanspec.ssz",
+        ssz_bytes,
+        ssz_len);
 
     /* Decode from SSZ and verify */
     LanternSignedBlock from_ssz;
@@ -1587,6 +1626,11 @@ static void test_gossip_signed_block_fixture_roundtrip(void) {
             &snappy_len)
         == 0);
     CHECK(snappy_len > 0);
+    maybe_write_fixture_bytes(
+        "LANTERN_WRITE_GOSSIP_SIGNED_BLOCK_SNAPPY_FIXTURE",
+        "networking/gossip_signed_block_leanspec.snappy",
+        snappy_bytes,
+        snappy_len);
 
     LanternSignedBlock from_snappy;
     lantern_signed_block_init(&from_snappy);
