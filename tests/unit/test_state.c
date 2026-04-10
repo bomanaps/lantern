@@ -2930,6 +2930,53 @@ static int test_compute_vote_checkpoints_basic(void) {
     return 0;
 }
 
+static int test_compute_vote_checkpoints_genesis_source_uses_head_root(void) {
+    LanternState state;
+    LanternForkChoice fork_choice;
+    LanternRoot genesis_root;
+    setup_state_and_fork_choice(&state, &fork_choice, 1525, 4, &genesis_root);
+
+    memset(state.latest_justified.root.bytes, 0, sizeof(state.latest_justified.root.bytes));
+    state.latest_justified.slot = 0;
+    fork_choice.head = genesis_root;
+    fork_choice.has_head = true;
+    fork_choice.safe_target = genesis_root;
+    fork_choice.has_safe_target = true;
+
+    LanternCheckpoint head;
+    LanternCheckpoint target;
+    LanternCheckpoint source;
+    int rc = lantern_state_compute_vote_checkpoints(&state, &head, &target, &source);
+    if (rc != 0) {
+        fprintf(stderr, "compute vote checkpoints genesis source failed (rc=%d)\n", rc);
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (head.slot != 0u || memcmp(head.root.bytes, genesis_root.bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "unexpected head checkpoint in genesis source test\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (!checkpoints_equal(&target, &head)) {
+        fprintf(stderr, "target mismatch in genesis source test\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (source.slot != 0u || memcmp(source.root.bytes, genesis_root.bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "source checkpoint should use head root at genesis\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+
+    lantern_state_reset(&state);
+    lantern_fork_choice_reset(&fork_choice);
+    return 0;
+}
+
 static int test_compute_vote_checkpoints_can_match_source(void) {
     LanternState state;
     LanternForkChoice fork_choice;
@@ -3062,7 +3109,7 @@ static int test_compute_vote_checkpoints_respects_safe_target(void) {
     return 0;
 }
 
-static int test_compute_vote_checkpoints_uses_store_source_when_store_ahead(void) {
+static int test_compute_vote_checkpoints_keeps_state_source_when_store_ahead(void) {
     LanternState state;
     LanternForkChoice fork_choice;
     LanternRoot genesis_root;
@@ -3105,19 +3152,19 @@ static int test_compute_vote_checkpoints_uses_store_source_when_store_ahead(void
     LanternCheckpoint source;
     int rc = lantern_state_compute_vote_checkpoints(&state, &head, &target, &source);
     if (rc != 0) {
-        fprintf(stderr, "compute vote checkpoints store source precedence failed (rc=%d)\n", rc);
+        fprintf(stderr, "compute vote checkpoints state source precedence failed (rc=%d)\n", rc);
         lantern_state_reset(&state);
         lantern_fork_choice_reset(&fork_choice);
         return 1;
     }
-    if (!checkpoints_equal(&source, &store_justified)) {
-        fprintf(stderr, "source checkpoint should follow fork-choice latest_justified when store is ahead\n");
+    if (!checkpoints_equal(&source, &state.latest_justified)) {
+        fprintf(stderr, "source checkpoint should stay on state latest_justified when store is ahead\n");
         lantern_state_reset(&state);
         lantern_fork_choice_reset(&fork_choice);
         return 1;
     }
-    if (checkpoints_equal(&source, &state.latest_justified)) {
-        fprintf(stderr, "source checkpoint incorrectly used state latest_justified while store is ahead\n");
+    if (checkpoints_equal(&source, &store_justified)) {
+        fprintf(stderr, "source checkpoint incorrectly used store latest_justified while store is ahead\n");
         lantern_state_reset(&state);
         lantern_fork_choice_reset(&fork_choice);
         return 1;
@@ -3754,10 +3801,13 @@ int main(void) {
     if (test_compute_vote_checkpoints_basic() != 0) {
         return 1;
     }
+    if (test_compute_vote_checkpoints_genesis_source_uses_head_root() != 0) {
+        return 1;
+    }
     if (test_compute_vote_checkpoints_can_match_source() != 0) {
         return 1;
     }
-    if (test_compute_vote_checkpoints_uses_store_source_when_store_ahead() != 0) {
+    if (test_compute_vote_checkpoints_keeps_state_source_when_store_ahead() != 0) {
         return 1;
     }
     if (test_compute_vote_checkpoints_respects_safe_target() != 0) {
