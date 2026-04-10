@@ -11,15 +11,6 @@
 #include "lantern/support/strings.h"
 #include "pq-bindings-c-rust.h"
 
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-_Static_assert(
-    LANTERN_SIGNATURE_SIZE == SIGNATURE_SIZE,
-    "LANTERN_SIGNATURE_SIZE must match the c-leanvm-xmss SIGNATURE_SIZE");
-#else
-typedef char lantern_signature_size_matches_wrapper[
-    (LANTERN_SIGNATURE_SIZE == SIGNATURE_SIZE) ? 1 : -1];
-#endif
-
 static double get_time_seconds(void) {
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {

@@ -1477,6 +1477,11 @@ static void test_gossip_signed_vote_fixture_roundtrip(void) {
     size_t ssz_len = 0;
     CHECK(lantern_ssz_encode_signed_vote(&original, ssz_bytes, sizeof(ssz_bytes), &ssz_len) == 0);
     CHECK(ssz_len == LANTERN_SIGNED_VOTE_SSZ_SIZE);
+    maybe_write_fixture_bytes(
+        "LANTERN_WRITE_GOSSIP_SIGNED_VOTE_FIXTURE",
+        "networking/gossip_signed_vote_leanspec.ssz",
+        ssz_bytes,
+        ssz_len);
 
     /* Decode from SSZ and verify */
     LanternSignedVote from_ssz;
@@ -1499,6 +1504,11 @@ static void test_gossip_signed_vote_fixture_roundtrip(void) {
             &snappy_len)
         == 0);
     CHECK(snappy_len > 0);
+    maybe_write_fixture_bytes(
+        "LANTERN_WRITE_GOSSIP_SIGNED_VOTE_SNAPPY_FIXTURE",
+        "networking/gossip_signed_vote_leanspec.snappy",
+        snappy_bytes,
+        snappy_len);
 
     LanternSignedVote from_snappy;
     memset(&from_snappy, 0, sizeof(from_snappy));

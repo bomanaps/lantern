@@ -9,7 +9,7 @@
 
 #include "lantern/consensus/hash.h"
 #include "lantern/support/strings.h"
-#include "external/c-leanvm-xmss/include/pq-bindings-c-rust.h"
+#include "pq-bindings-c-rust.h"
 #include "state_store_adapter.h"
 
 #define JSON_INITIAL_TOKENS 256
