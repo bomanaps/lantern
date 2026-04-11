@@ -103,52 +103,26 @@ static void test_disable_blocks_request_peer(struct lantern_client *client)
     client->connected_peers = 0u;
 }
 
-static int build_single_participant_aggregated_attestation(
+static int sign_single_participant_aggregated_attestation(
     struct lantern_client *client,
     struct PQSignatureSchemeSecretKey *secret,
-    const LanternRoot *anchor_root,
-    const LanternRoot *child_root,
+    const LanternAttestationData *data,
     LanternSignedAggregatedAttestation *out_attestation)
 {
-    if (!client || !secret || !anchor_root || !child_root || !out_attestation) {
+    if (!client || !secret || !data || !out_attestation) {
         return -1;
     }
 
     LanternSignedVote vote;
     memset(&vote, 0, sizeof(vote));
-    uint64_t child_slot = 0;
-    if (client_test_slot_for_root(client, child_root, &child_slot) != 0) {
-        return -1;
-    }
-
     vote.data.validator_id = 0u;
-    vote.data.slot = child_slot;
-    vote.data.head.slot = child_slot;
-    vote.data.head.root = *child_root;
-    LanternRoot state_root;
-    if (lantern_hash_tree_root_state(&client->state, &state_root) != 0) {
-        return -1;
-    }
-    LanternBlockHeader checkpoint_header = client->state.latest_block_header;
-    checkpoint_header.state_root = state_root;
-    LanternRoot checkpoint_root;
-    if (lantern_hash_tree_root_block_header(&checkpoint_header, &checkpoint_root) != 0) {
-        return -1;
-    }
-    /*
-     * Gossip verification resolves pubkeys via state lookup by target root.
-     * Use the client's current state header root so the lookup path is valid.
-     */
-    vote.data.target.slot = checkpoint_header.slot;
-    vote.data.target.root = checkpoint_root;
-    vote.data.source.slot = checkpoint_header.slot;
-    vote.data.source.root = checkpoint_root;
+    vote.data.data = *data;
     if (client_test_sign_vote_with_secret(&vote, secret) != 0) {
         return -1;
     }
 
     lantern_signed_aggregated_attestation_init(out_attestation);
-    out_attestation->data = vote.data.data;
+    out_attestation->data = *data;
     if (lantern_bitlist_resize(&out_attestation->proof.participants, 1u) != 0
         || lantern_bitlist_set(&out_attestation->proof.participants, 0u, true) != 0) {
         lantern_signed_aggregated_attestation_reset(out_attestation);
@@ -190,6 +164,49 @@ static int build_single_participant_aggregated_attestation(
     }
 
     return 0;
+}
+
+static int build_single_participant_aggregated_attestation(
+    struct lantern_client *client,
+    struct PQSignatureSchemeSecretKey *secret,
+    const LanternRoot *anchor_root,
+    const LanternRoot *child_root,
+    LanternSignedAggregatedAttestation *out_attestation)
+{
+    if (!client || !secret || !anchor_root || !child_root || !out_attestation) {
+        return -1;
+    }
+
+    LanternAttestationData data;
+    memset(&data, 0, sizeof(data));
+    uint64_t child_slot = 0;
+    if (client_test_slot_for_root(client, child_root, &child_slot) != 0) {
+        return -1;
+    }
+
+    data.slot = child_slot;
+    data.head.slot = child_slot;
+    data.head.root = *child_root;
+    LanternRoot state_root;
+    if (lantern_hash_tree_root_state(&client->state, &state_root) != 0) {
+        return -1;
+    }
+    LanternBlockHeader checkpoint_header = client->state.latest_block_header;
+    checkpoint_header.state_root = state_root;
+    LanternRoot checkpoint_root;
+    if (lantern_hash_tree_root_block_header(&checkpoint_header, &checkpoint_root) != 0) {
+        return -1;
+    }
+    /*
+     * Gossip verification resolves pubkeys via state lookup by target root.
+     * Use the client's current state header root so the lookup path is valid.
+     */
+    data.target.slot = checkpoint_header.slot;
+    data.target.root = checkpoint_root;
+    data.source.slot = checkpoint_header.slot;
+    data.source.root = checkpoint_root;
+
+    return sign_single_participant_aggregated_attestation(client, secret, &data, out_attestation);
 }
 
 static int test_idle_gossip_not_ignored(void)
@@ -463,6 +480,74 @@ cleanup:
     return rc;
 }
 
+static int test_gossip_aggregated_attestation_rejects_invalid_topology(void)
+{
+    struct lantern_client client;
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    LanternRoot anchor_root;
+    LanternRoot child_root;
+    LanternSignedAggregatedAttestation attestation;
+    int rc = 1;
+
+    if (client_test_setup_vote_validation_client(
+            &client,
+            "gossip_agg_invalid_topology",
+            &pub,
+            &secret,
+            &anchor_root,
+            &child_root)
+        != 0) {
+        return 1;
+    }
+
+    if (build_single_participant_aggregated_attestation(
+            &client,
+            secret,
+            &anchor_root,
+            &child_root,
+            &attestation)
+        != 0) {
+        fprintf(stderr, "failed to build base aggregated attestation fixture\n");
+        goto cleanup;
+    }
+
+    LanternAttestationData invalid_data = attestation.data;
+    lantern_signed_aggregated_attestation_reset(&attestation);
+    memset(&attestation, 0, sizeof(attestation));
+    invalid_data.head.slot = 0u;
+    invalid_data.head.root = anchor_root;
+
+    if (sign_single_participant_aggregated_attestation(
+            &client,
+            secret,
+            &invalid_data,
+            &attestation)
+        != 0) {
+        fprintf(stderr, "failed to build invalid-topology aggregated attestation fixture\n");
+        goto cleanup;
+    }
+
+    if (lantern_client_debug_gossip_aggregated_attestation(&client, &attestation) != LANTERN_CLIENT_ERR_IGNORED) {
+        fprintf(stderr, "invalid-topology aggregated attestation gossip should be ignored\n");
+        goto cleanup_attestation;
+    }
+    if (client.store.new_aggregated_payloads.length != 0
+        || client.store.known_aggregated_payloads.length != 0) {
+        fprintf(stderr, "invalid-topology aggregated attestation should not be cached\n");
+        goto cleanup_attestation;
+    }
+
+    rc = 0;
+
+cleanup_attestation:
+    lantern_signed_aggregated_attestation_reset(&attestation);
+cleanup:
+    reset_agg_cache(&client);
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
 int main(void)
 {
     if (test_idle_gossip_not_ignored() != 0)
@@ -478,6 +563,10 @@ int main(void)
         return 1;
     }
     if (test_gossip_aggregated_attestation_rejects_unknown_target() != 0)
+    {
+        return 1;
+    }
+    if (test_gossip_aggregated_attestation_rejects_invalid_topology() != 0)
     {
         return 1;
     }

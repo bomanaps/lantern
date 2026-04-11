@@ -190,6 +190,16 @@ static int lantern_state_validate_block_attestation_data_uniqueness(const Lanter
             rc = -1;
             break;
         }
+        if (seen_data_roots.length > (size_t)LANTERN_MAX_ATTESTATIONS_DATA) {
+            lantern_log_warn(
+                "state",
+                &meta,
+                "block rejected: distinct attestation data count=%zu exceeds limit=%u",
+                seen_data_roots.length,
+                (unsigned)LANTERN_MAX_ATTESTATIONS_DATA);
+            rc = -1;
+            break;
+        }
     }
 
     lantern_root_list_reset(&seen_data_roots);
@@ -453,6 +463,12 @@ static int collect_attestations_for_checkpoint(
     if (!payloads->entries || payloads->length == 0) {
         return 0;
     }
+    if (processed_data_roots->length >= (size_t)LANTERN_MAX_ATTESTATIONS_DATA) {
+        return 0;
+    }
+
+    size_t remaining_data_capacity =
+        (size_t)LANTERN_MAX_ATTESTATIONS_DATA - processed_data_roots->length;
 
     struct lantern_block_payload_group *groups =
         calloc(payloads->length, sizeof(*groups));
@@ -499,6 +515,9 @@ static int collect_attestations_for_checkpoint(
 
     if (group_count > 1u) {
         qsort(groups, group_count, sizeof(*groups), lantern_block_payload_group_compare);
+    }
+    if (group_count > remaining_data_capacity) {
+        group_count = remaining_data_capacity;
     }
 
     for (size_t group_index = 0; group_index < group_count; ++group_index) {

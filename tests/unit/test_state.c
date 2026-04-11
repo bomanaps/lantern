@@ -2395,6 +2395,56 @@ static int test_process_block_rejects_duplicate_attestation_data(void) {
     return 0;
 }
 
+static int test_process_block_rejects_too_many_attestation_data_entries(void) {
+    LanternState state;
+    LanternRoot parent_root;
+    LanternBlock block;
+
+    lantern_state_init(&state);
+    memset(&block, 0, sizeof(block));
+
+    expect_zero(
+        lantern_state_generate_genesis(&state, 906u, 1u),
+        "genesis for max attestation-data block test");
+    expect_zero(
+        lantern_state_select_block_parent(&state, &parent_root),
+        "select block parent for max attestation-data block test");
+
+    lantern_block_body_init(&block.body);
+    block.slot = 1u;
+    block.proposer_index = 0u;
+    block.parent_root = parent_root;
+
+    for (size_t i = 0; i <= (size_t)LANTERN_MAX_ATTESTATIONS_DATA; ++i) {
+        LanternVote vote;
+        LanternCheckpoint source;
+        LanternCheckpoint target;
+
+        memset(&vote, 0, sizeof(vote));
+        memset(&source, 0, sizeof(source));
+        memset(&target, 0, sizeof(target));
+        source.slot = 0u;
+        target.slot = (uint64_t)i + 1u;
+        fill_root(&source.root, 0x10u);
+        fill_root(&target.root, (uint8_t)(0x20u + i));
+        build_vote(&vote, NULL, 0u, target.slot, &source, &target, (uint8_t)(0x40u + i));
+        expect_zero(
+            append_aggregated_attestation_from_vote(&block.body.attestations, &vote),
+            "append max attestation-data block vote");
+    }
+
+    if (lantern_state_process_block(&state, &block, NULL, NULL) == 0) {
+        fprintf(stderr, "block with too many distinct attestation data entries was incorrectly accepted\n");
+        lantern_block_body_reset(&block.body);
+        lantern_state_reset(&state);
+        return 1;
+    }
+
+    lantern_block_body_reset(&block.body);
+    lantern_state_reset(&state);
+    return 0;
+}
+
 static int test_process_attestations_preserves_signed_votes(void) {
     LanternState state;
     lantern_state_init(&state);
@@ -2738,6 +2788,93 @@ cleanup:
     lantern_attestation_signatures_reset(&collected_signatures);
     lantern_state_reset(&state);
     return rc;
+}
+
+static int test_collect_attestations_respects_max_attestation_data(void) {
+    LanternState state;
+    LanternRoot parent_root;
+    LanternAggregatedAttestations collected;
+    LanternAttestationSignatures collected_signatures;
+
+    lantern_state_init(&state);
+    lantern_aggregated_attestations_init(&collected);
+    lantern_attestation_signatures_init(&collected_signatures);
+
+    expect_zero(
+        lantern_state_generate_genesis(&state, 907u, 1u),
+        "genesis for max attestation-data collection test");
+    mark_slot_justified_for_tests(&state, state.latest_justified.slot);
+    expect_zero(
+        lantern_state_select_block_parent(&state, &parent_root),
+        "select block parent for max attestation-data collection test");
+    populate_historical_hashes_for_tests(&state, (uint64_t)LANTERN_MAX_ATTESTATIONS_DATA + 1u);
+    state.historical_block_hashes.items[0] = parent_root;
+
+    for (size_t i = 0; i <= (size_t)LANTERN_MAX_ATTESTATIONS_DATA; ++i) {
+        LanternVote vote;
+        LanternCheckpoint source;
+        LanternCheckpoint target;
+
+        memset(&vote, 0, sizeof(vote));
+        source.slot = 0u;
+        source.root = parent_root;
+        target.slot = (uint64_t)i + 1u;
+        target.root = state.historical_block_hashes.items[target.slot];
+        build_vote(&vote, NULL, 0u, target.slot, &source, &target, 0u);
+        expect_zero(
+            seed_known_payload_for_vote(&state, &vote, (uint8_t)(0x50u + i)),
+            "seed max attestation-data payload");
+    }
+
+    uint64_t block_slot = (uint64_t)LANTERN_MAX_ATTESTATIONS_DATA + 2u;
+    uint64_t proposer_index = 0u;
+    expect_zero(
+        lantern_proposer_for_slot(block_slot, state.config.num_validators, &proposer_index),
+        "max attestation-data proposer lookup");
+
+    expect_zero(
+        lantern_state_collect_attestations_for_block(
+            &state,
+            block_slot,
+            proposer_index,
+            &parent_root,
+            &collected,
+            &collected_signatures),
+        "collect max attestation-data block");
+
+    if (collected.length != (size_t)LANTERN_MAX_ATTESTATIONS_DATA
+        || collected_signatures.length != collected.length) {
+        fprintf(
+            stderr,
+            "expected %u collected attestation-data entries, got %zu\n",
+            (unsigned)LANTERN_MAX_ATTESTATIONS_DATA,
+            collected.length);
+        goto fail;
+    }
+
+    for (size_t i = 0; i < collected.length; ++i) {
+        uint64_t expected_target_slot = (uint64_t)i + 1u;
+        if (collected.data[i].data.target.slot != expected_target_slot) {
+            fprintf(
+                stderr,
+                "collected attestation target slot mismatch index=%zu expected=%" PRIu64 " actual=%" PRIu64 "\n",
+                i,
+                expected_target_slot,
+                collected.data[i].data.target.slot);
+            goto fail;
+        }
+    }
+
+    lantern_aggregated_attestations_reset(&collected);
+    lantern_attestation_signatures_reset(&collected_signatures);
+    lantern_state_reset(&state);
+    return 0;
+
+fail:
+    lantern_aggregated_attestations_reset(&collected);
+    lantern_attestation_signatures_reset(&collected_signatures);
+    lantern_state_reset(&state);
+    return 1;
 }
 
 static int test_collect_attestations_fixed_point_deep_chain(void) {
@@ -3934,6 +4071,9 @@ int main(void) {
     if (test_collect_attestations_for_block() != 0) {
         return 1;
     }
+    if (test_process_block_rejects_too_many_attestation_data_entries() != 0) {
+        return 1;
+    }
     if (test_process_attestations_preserves_signed_votes() != 0) {
         return 1;
     }
@@ -3941,6 +4081,9 @@ int main(void) {
         return 1;
     }
     if (test_collect_attestations_fixed_point() != 0) {
+        return 1;
+    }
+    if (test_collect_attestations_respects_max_attestation_data() != 0) {
         return 1;
     }
     if (test_collect_attestations_fixed_point_deep_chain() != 0) {

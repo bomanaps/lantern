@@ -178,6 +178,63 @@ static bool state_has_genesis_shape(const LanternState *state)
     return true;
 }
 
+static bool validate_gossip_aggregated_attestation_data_locked(
+    struct lantern_client *client,
+    const LanternAttestationData *data,
+    LanternRoot *out_missing_root)
+{
+    if (!client || !data || !client->has_fork_choice) {
+        return false;
+    }
+    if (out_missing_root) {
+        memset(out_missing_root, 0, sizeof(*out_missing_root));
+    }
+
+    uint64_t source_block_slot = 0u;
+    if (!lantern_client_block_known_locked(client, &data->source.root, &source_block_slot)) {
+        if (out_missing_root) {
+            *out_missing_root = data->source.root;
+        }
+        return false;
+    }
+
+    uint64_t target_block_slot = 0u;
+    if (!lantern_client_block_known_locked(client, &data->target.root, &target_block_slot)) {
+        if (out_missing_root) {
+            *out_missing_root = data->target.root;
+        }
+        return false;
+    }
+
+    uint64_t head_block_slot = 0u;
+    if (!lantern_client_block_known_locked(client, &data->head.root, &head_block_slot)) {
+        if (out_missing_root) {
+            *out_missing_root = data->head.root;
+        }
+        return false;
+    }
+
+    if (data->source.slot > data->target.slot || data->head.slot < data->target.slot) {
+        return false;
+    }
+    if (source_block_slot != data->source.slot
+        || target_block_slot != data->target.slot
+        || head_block_slot != data->head.slot) {
+        return false;
+    }
+
+    uint64_t current_slot = 0u;
+    if (!lantern_client_current_slot(client, &current_slot)) {
+        return false;
+    }
+    uint64_t allowed_slot = current_slot == UINT64_MAX ? UINT64_MAX : current_slot + 1u;
+    if (data->slot > allowed_slot) {
+        return false;
+    }
+
+    return true;
+}
+
 
 /**
  * Handle a block received via gossip.
@@ -277,6 +334,12 @@ static bool verify_and_cache_aggregated_attestation_locked(
         || !attestation->proof.participants.bytes
         || attestation->proof.proof_data.length == 0
         || !attestation->proof.proof_data.data) {
+        return false;
+    }
+    if (!validate_gossip_aggregated_attestation_data_locked(
+            client,
+            &attestation->data,
+            out_missing_root)) {
         return false;
     }
 
