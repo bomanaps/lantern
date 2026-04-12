@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #include "lantern/consensus/containers.h"
+#include "lantern/consensus/state.h"
 
 struct PQSignatureSchemeSecretKey;
 struct PQSignatureSchemePublicKey;
@@ -40,6 +41,7 @@ bool lantern_signature_aggregate(
     uint64_t epoch,
     LanternByteList *out_proof);
 bool lantern_aggregated_signature_proof_aggregate(
+    const LanternState *state,
     const struct lantern_bitlist *xmss_participants,
     const LanternAggregatedSignatureProof *children,
     size_t child_count,
