@@ -62,6 +62,7 @@
 #include "lantern/encoding/snappy.h"
 #include "lantern/http/server.h"
 #include "lantern/metrics/lean_metrics.h"
+#include "lantern/networking/gossip.h"
 #include "lantern/networking/messages.h"
 #include "lantern/networking/reqresp_service.h"
 #include "lantern/storage/storage.h"
@@ -81,6 +82,38 @@ static const size_t CHECKPOINT_SYNC_MAX_RESPONSE_BYTES =
     + (LANTERN_JUSTIFICATION_VALIDATORS_LIMIT / 8u);
 static const size_t LANTERN_DEFAULT_ATTESTATION_COMMITTEE_COUNT = 1u;
 static const uint64_t LANTERN_CHECKPOINT_SYNC_STALE_PERSISTED_STATE_SLOT_THRESHOLD = 2u * 32u;
+
+static int client_resolve_gossip_fork_digest(
+    const struct lantern_client *client,
+    uint8_t out_fork_digest[4])
+{
+    if (!client || !out_fork_digest || !client->genesis.enrs.records)
+    {
+        return -1;
+    }
+
+    bool have_digest = false;
+    for (size_t i = 0; i < client->genesis.enrs.count; ++i)
+    {
+        struct lantern_enr_eth2_data eth2;
+        if (lantern_enr_record_eth2(&client->genesis.enrs.records[i], &eth2) != 0)
+        {
+            continue;
+        }
+        if (!have_digest)
+        {
+            memcpy(out_fork_digest, eth2.fork_digest, 4u);
+            have_digest = true;
+            continue;
+        }
+        if (memcmp(out_fork_digest, eth2.fork_digest, 4u) != 0)
+        {
+            return -1;
+        }
+    }
+
+    return have_digest ? 0 : -1;
+}
 
 bool lantern_client_persisted_state_is_stale_for_checkpoint_sync(
     const LanternState *persisted_state,
@@ -2987,7 +3020,33 @@ static lantern_client_error client_start_protocols(
     uint8_t node_key[NODE_PRIVATE_KEY_SIZE])
 {
     size_t attestation_committee_count = lantern_client_attestation_committee_count(client);
+    uint8_t fork_digest[4] = {0};
+    char topic_network_name[32];
     size_t subnet_id = 0;
+    bool have_fork_digest = client_resolve_gossip_fork_digest(client, fork_digest) == 0;
+    if (have_fork_digest) {
+        if (lantern_gossip_fork_digest_to_hex(fork_digest, topic_network_name) != 0) {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to format gossip fork digest for topic strings");
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
+    } else {
+        lantern_log_warn(
+            "client",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "gossip fork digest missing from genesis ENRs; falling back to --devnet topic slot '%s'",
+            client->devnet ? client->devnet : "-");
+        if (!client->devnet || client->devnet[0] == '\0') {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "gossip topic fallback requires a non-empty --devnet value");
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
+        snprintf(topic_network_name, sizeof(topic_network_name), "%s", client->devnet);
+    }
     if (client->local_validators && client->local_validator_count > 0) {
         if (lantern_validator_index_compute_subnet_id(
                 client->local_validators[0].global_index,
@@ -3006,6 +3065,8 @@ static lantern_client_error client_start_protocols(
         .host = client->network.host,
         .devnet = client->devnet,
         .data_dir = client->data_dir,
+        .topic_network_name = topic_network_name,
+        .fork_digest = {fork_digest[0], fork_digest[1], fork_digest[2], fork_digest[3]},
         .attestation_subnet_id = subnet_id,
         .subscribe_attestation_subnet = 1,
     };
