@@ -22,7 +22,6 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1609,10 +1608,6 @@ static void adopt_state_locked(struct lantern_client *client, LanternState *stat
         return;
     }
     LanternState previous = client->state;
-    fprintf(stderr,
-            "[DBG adopt_state] overwriting client->state prev.slot=%" PRIu64 " new.slot=%" PRIu64 "\n",
-            previous.slot,
-            state->slot);
     client->state = *state;
     if (client->has_fork_choice)
     {
@@ -2467,10 +2462,6 @@ static bool apply_state_transition_locked(
     }
 
     LanternSignedBlock import_block = *block;
-    fprintf(stderr,
-            "[DBG apply_state_transition_locked] ENTER client.state.slot=%" PRIu64 " block.slot=%" PRIu64 "\n",
-            client->state.slot,
-            block->block.slot);
     if (lantern_state_transition(&client->state, &client->store, &import_block) != 0)
     {
         lantern_log_warn(
@@ -2478,16 +2469,8 @@ static bool apply_state_transition_locked(
             meta,
             "state transition failed for slot=%" PRIu64,
             block->block.slot);
-        fprintf(stderr,
-                "[DBG apply_state_transition_locked] FAIL client.state.slot=%" PRIu64 " block.slot=%" PRIu64 "\n",
-                client->state.slot,
-                block->block.slot);
         return false;
     }
-    fprintf(stderr,
-            "[DBG apply_state_transition_locked] OK client.state.slot=%" PRIu64 " block.slot=%" PRIu64 "\n",
-            client->state.slot,
-            block->block.slot);
 
     return true;
 }
@@ -3102,9 +3085,6 @@ static bool lantern_client_import_block_internal(
     if (parent_off_head)
     {
         LanternRoot parent_root = block->block.parent_root;
-        fprintf(stderr,
-                "[DBG off_head] ENTER block.slot=%" PRIu64 " client.state.slot=%" PRIu64 "\n",
-                block->block.slot, client->state.slot);
         LanternState replay_state;
         lantern_state_init(&replay_state);
         bool have_replay_state = false;
@@ -3122,9 +3102,6 @@ static bool lantern_client_import_block_internal(
                 &missing_count))
         {
             have_replay_state = true;
-            fprintf(stderr,
-                    "[DBG off_head] rebuild_state OK replay_state.slot=%" PRIu64 " for parent of block.slot=%" PRIu64 "\n",
-                    replay_state.slot, block->block.slot);
             LanternStore replay_store;
             lantern_store_init(&replay_store);
             bool replay_store_ready =
@@ -3132,9 +3109,6 @@ static bool lantern_client_import_block_internal(
             if (replay_store_ready
                 && lantern_state_transition(&replay_state, &replay_store, block) == 0)
             {
-                fprintf(stderr,
-                        "[DBG off_head] replay state_transition OK replay_state.slot=%" PRIu64 "\n",
-                        replay_state.slot);
                 processed = add_competing_fork_block_locked(
                     client,
                     block,
@@ -3213,22 +3187,12 @@ static bool lantern_client_import_block_internal(
                 client,
                 &state_head);
 
-            bool heads_differ = have_fork_head && have_state_head
-                && memcmp(fork_head.bytes, state_head.bytes, LANTERN_ROOT_SIZE) != 0;
-            fprintf(stderr,
-                    "[DBG off_head] adopt decision processed=%d have_fc=%d have_sh=%d differ=%d\n",
-                    (int)processed,
-                    (int)have_fork_head,
-                    (int)have_state_head,
-                    (int)heads_differ);
-            if (heads_differ)
+            if (have_fork_head && have_state_head
+                && memcmp(fork_head.bytes, state_head.bytes, LANTERN_ROOT_SIZE) != 0)
             {
                 if (have_replay_state
                     && memcmp(fork_head.bytes, block_root_local.bytes, LANTERN_ROOT_SIZE) == 0)
                 {
-                    fprintf(stderr,
-                            "[DBG off_head] ADOPTING replay_state.slot=%" PRIu64 " (fork head == this block)\n",
-                            replay_state.slot);
                     adopt_state_locked(client, &replay_state);
                     have_replay_state = false;
                     adopted_state = true;
@@ -3245,16 +3209,11 @@ static bool lantern_client_import_block_internal(
                             0,
                             NULL))
                     {
-                        fprintf(stderr,
-                                "[DBG off_head] ADOPTING rebuilt head_state.slot=%" PRIu64 " (fork head != this block)\n",
-                                head_state.slot);
                         adopt_state_locked(client, &head_state);
                         adopted_state = true;
                     }
                     else
                     {
-                        fprintf(stderr,
-                                "[DBG off_head] could NOT rebuild head_state for fork_head; skipping adopt\n");
                         lantern_state_reset(&head_state);
                     }
                 }
