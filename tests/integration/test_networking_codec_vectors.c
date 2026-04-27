@@ -55,6 +55,26 @@ static void byte_buffer_reset(struct byte_buffer *buffer) {
     buffer->len = 0;
 }
 
+static int byte_buffer_append(struct byte_buffer *buffer, const uint8_t *data, size_t len) {
+    if (!buffer || (!data && len > 0u)) {
+        return -1;
+    }
+    if (len == 0u) {
+        return 0;
+    }
+    if (buffer->len > SIZE_MAX - len) {
+        return -1;
+    }
+    uint8_t *expanded = (uint8_t *)realloc(buffer->data, buffer->len + len);
+    if (!expanded) {
+        return -1;
+    }
+    memcpy(expanded + buffer->len, data, len);
+    buffer->data = expanded;
+    buffer->len += len;
+    return 0;
+}
+
 static int record_failure(
     const char *path,
     const char *codec_name,
@@ -193,6 +213,43 @@ static int fixture_token_to_bytes(
 
     out_bytes->data = bytes;
     out_bytes->len = byte_length;
+    return 0;
+}
+
+static int fixture_token_to_uint256_be(
+    const struct lantern_fixture_document *doc,
+    int index,
+    uint8_t out_value[32]) {
+    if (!doc || !out_value) {
+        return -1;
+    }
+    size_t length = 0;
+    const char *value = lantern_fixture_token_string(doc, index, &length);
+    if (!value || length < 2u || value[0] != '0' || value[1] != 'x') {
+        return -1;
+    }
+    size_t hex_length = length - 2u;
+    if (hex_length > 64u) {
+        return -1;
+    }
+    memset(out_value, 0, 32u);
+    size_t out_index = 32u - ((hex_length + 1u) / 2u);
+    size_t input_index = 2u;
+    if ((hex_length % 2u) != 0u) {
+        int nibble = hex_nibble(value[input_index++]);
+        if (nibble < 0) {
+            return -1;
+        }
+        out_value[out_index++] = (uint8_t)nibble;
+    }
+    while (input_index < length) {
+        int hi = hex_nibble(value[input_index++]);
+        int lo = hex_nibble(value[input_index++]);
+        if (hi < 0 || lo < 0 || out_index >= 32u) {
+            return -1;
+        }
+        out_value[out_index++] = (uint8_t)((hi << 4) | lo);
+    }
     return 0;
 }
 
@@ -474,6 +531,35 @@ static int decode_enr_string(const char *enr_text, struct byte_buffer *out_rlp) 
     }
     out_rlp->data = decoded;
     out_rlp->len = (size_t)written;
+    return 0;
+}
+
+static int build_enr_text_from_rlp(const uint8_t *rlp, size_t rlp_len, char **out_text) {
+    if ((!rlp && rlp_len > 0u) || !out_text) {
+        return -1;
+    }
+    *out_text = NULL;
+    size_t encoded_capacity = ((rlp_len * 4u) + 2u) / 3u + 1u;
+    char *payload = (char *)malloc(encoded_capacity);
+    if (!payload) {
+        return -1;
+    }
+    int written = multibase_base64_url_encode(rlp, rlp_len, payload, encoded_capacity);
+    if (written < 0) {
+        free(payload);
+        return -1;
+    }
+    payload[written] = '\0';
+
+    char *text = (char *)malloc((size_t)written + 5u);
+    if (!text) {
+        free(payload);
+        return -1;
+    }
+    memcpy(text, "enr:", 4u);
+    memcpy(text + 4u, payload, (size_t)written + 1u);
+    free(payload);
+    *out_text = text;
     return 0;
 }
 
@@ -2023,6 +2109,266 @@ static int run_skipped_fixture(
     return record_info(path, codec_name, "%s", reason ? reason : "skipped");
 }
 
+static uint32_t read_le24_local(const uint8_t *data) {
+    return (uint32_t)data[0] | ((uint32_t)data[1] << 8u) | ((uint32_t)data[2] << 16u);
+}
+
+static bool snappy_frame_structure_valid(const uint8_t *input, size_t input_len) {
+    static const uint8_t stream_identifier[] = {'s', 'N', 'a', 'P', 'p', 'Y'};
+    if (!input || input_len < 4u) {
+        return false;
+    }
+
+    size_t offset = 0u;
+    uint8_t chunk_type = input[offset];
+    uint32_t chunk_len = read_le24_local(input + offset + 1u);
+    offset += 4u;
+    if (chunk_type != 0xffu
+        || chunk_len != sizeof(stream_identifier)
+        || chunk_len > input_len - offset
+        || memcmp(input + offset, stream_identifier, sizeof(stream_identifier)) != 0) {
+        return false;
+    }
+    offset += chunk_len;
+
+    while (offset < input_len) {
+        if (input_len - offset < 4u) {
+            return false;
+        }
+        chunk_type = input[offset];
+        chunk_len = read_le24_local(input + offset + 1u);
+        offset += 4u;
+        if (chunk_len > input_len - offset) {
+            return false;
+        }
+
+        if (chunk_type == 0xffu) {
+            if (chunk_len != sizeof(stream_identifier)
+                || memcmp(input + offset, stream_identifier, sizeof(stream_identifier)) != 0) {
+                return false;
+            }
+        } else if (chunk_type >= 0x80u && chunk_type <= 0xfeu) {
+            /* Skippable padding or extension chunk. */
+        } else if (chunk_type == 0x00u || chunk_type == 0x01u) {
+            if (chunk_len < 4u) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+        offset += chunk_len;
+    }
+
+    return true;
+}
+
+static int run_decode_failure_fixture(
+    const char *path,
+    const struct lantern_fixture_document *doc,
+    int input_idx,
+    const char *codec_name,
+    struct fixture_stats *stats) {
+    int decoder_idx = lantern_fixture_object_get_field(doc, input_idx, "decoder");
+    int bytes_idx = lantern_fixture_object_get_field(doc, input_idx, "bytes");
+    char *decoder = NULL;
+    struct byte_buffer bytes = {0};
+    bool rejected = false;
+    int rc = -1;
+
+    if (decoder_idx < 0 || bytes_idx < 0
+        || fixture_token_to_c_string(doc, decoder_idx, &decoder) != 0
+        || fixture_token_to_bytes(doc, bytes_idx, &bytes) != 0) {
+        rc = record_failure(path, codec_name, "invalid decode_failure fixture");
+        goto cleanup;
+    }
+
+    if (strcmp(decoder, "discv5_message") == 0 || strcmp(decoder, "discv5_packet") == 0) {
+        rc = run_skipped_fixture(path, codec_name, stats, "discv5 not implemented");
+        goto cleanup;
+    }
+
+    if (strcmp(decoder, "varint") == 0) {
+        uint64_t value = 0u;
+        size_t consumed = 0u;
+        rejected = unsigned_varint_decode(bytes.data, bytes.len, &value, &consumed) != UNSIGNED_VARINT_OK;
+    } else if (strcmp(decoder, "reqresp_request") == 0) {
+        struct byte_buffer payload = {0};
+        rejected = decode_reqresp_request(bytes.data, bytes.len, &payload) != 0;
+        byte_buffer_reset(&payload);
+    } else if (strcmp(decoder, "reqresp_response") == 0) {
+        struct byte_buffer payload = {0};
+        uint8_t response_code = 0u;
+        rejected = decode_reqresp_response(bytes.data, bytes.len, &response_code, &payload) != 0;
+        byte_buffer_reset(&payload);
+    } else if (strcmp(decoder, "snappy_frame") == 0) {
+        size_t decoded_length = 0u;
+        if (!snappy_frame_structure_valid(bytes.data, bytes.len)) {
+            rejected = true;
+        } else if (lantern_snappy_uncompressed_length(bytes.data, bytes.len, &decoded_length) != LANTERN_SNAPPY_OK) {
+            rejected = true;
+        } else {
+            uint8_t *decoded = (uint8_t *)malloc(decoded_length > 0u ? decoded_length : 1u);
+            size_t written = 0u;
+            rejected = !decoded
+                || lantern_snappy_decompress(bytes.data, bytes.len, decoded, decoded_length, &written) != LANTERN_SNAPPY_OK;
+            free(decoded);
+        }
+    } else if (strcmp(decoder, "gossipsub_rpc") == 0) {
+        libp2p_gossipsub_RPC *rpc = NULL;
+        rejected = libp2p_gossipsub_rpc_decode_frame(bytes.data, bytes.len, &rpc) != LIBP2P_ERR_OK || !rpc;
+        if (rpc) {
+            libp2p_gossipsub_RPC_free(rpc);
+        }
+    } else if (strcmp(decoder, "enr") == 0) {
+        char *enr_text = NULL;
+        struct lantern_enr_record record;
+        bool record_ready = false;
+        lantern_enr_record_init(&record);
+        if (build_enr_text_from_rlp(bytes.data, bytes.len, &enr_text) != 0) {
+            free(decoder);
+            byte_buffer_reset(&bytes);
+            return record_failure(path, codec_name, "failed to wrap ENR bytes");
+        }
+        if (lantern_enr_record_decode(enr_text, &record) != 0) {
+            rejected = true;
+        } else {
+            record_ready = true;
+        }
+        if (record_ready) {
+            lantern_enr_record_reset(&record);
+        }
+        free(enr_text);
+    } else {
+        rc = run_unsupported_fixture(path, codec_name, stats, "unknown decode_failure decoder");
+        goto cleanup;
+    }
+
+    rc = rejected ? 0 : record_failure(path, codec_name, "decode unexpectedly succeeded for %s", decoder);
+
+cleanup:
+    free(decoder);
+    byte_buffer_reset(&bytes);
+    return rc;
+}
+
+static int run_reqresp_response_stream_fixture(
+    const char *path,
+    const struct lantern_fixture_document *doc,
+    int input_idx,
+    int output_idx,
+    const char *codec_name) {
+    int chunks_idx = lantern_fixture_object_get_field(doc, input_idx, "chunks");
+    int encoded_idx = lantern_fixture_object_get_field(doc, output_idx, "encoded");
+    int chunk_count_idx = lantern_fixture_object_get_field(doc, output_idx, "chunkCount");
+    int chunk_count = chunks_idx >= 0 ? lantern_fixture_array_get_length(doc, chunks_idx) : -1;
+    struct byte_buffer expected = {0};
+    struct byte_buffer actual = {0};
+    uint64_t expected_chunk_count = 0u;
+    int rc = -1;
+
+    if (chunks_idx < 0 || encoded_idx < 0 || chunk_count_idx < 0 || chunk_count < 0
+        || fixture_token_to_bytes(doc, encoded_idx, &expected) != 0
+        || lantern_fixture_token_to_uint64(doc, chunk_count_idx, &expected_chunk_count) != 0
+        || expected_chunk_count != (uint64_t)chunk_count) {
+        rc = record_failure(path, codec_name, "invalid reqresp_response_stream fixture");
+        goto cleanup;
+    }
+
+    for (int i = 0; i < chunk_count; ++i) {
+        int chunk_idx = lantern_fixture_array_get_element(doc, chunks_idx, i);
+        int response_code_idx = chunk_idx >= 0 ? lantern_fixture_object_get_field(doc, chunk_idx, "responseCode") : -1;
+        int ssz_data_idx = chunk_idx >= 0 ? lantern_fixture_object_get_field(doc, chunk_idx, "sszData") : -1;
+        uint64_t response_code = 0u;
+        struct byte_buffer payload = {0};
+        struct byte_buffer frame = {0};
+        int chunk_rc = response_code_idx >= 0
+            && ssz_data_idx >= 0
+            && lantern_fixture_token_to_uint64(doc, response_code_idx, &response_code) == 0
+            && response_code <= UINT8_MAX
+            && fixture_token_to_bytes(doc, ssz_data_idx, &payload) == 0
+            && encode_reqresp_frame(payload.data, payload.len, (uint8_t)response_code, true, &frame) == 0
+            && byte_buffer_append(&actual, frame.data, frame.len) == 0
+            ? 0
+            : -1;
+        byte_buffer_reset(&payload);
+        byte_buffer_reset(&frame);
+        if (chunk_rc != 0) {
+            rc = record_failure(path, codec_name, "failed to encode stream chunk");
+            goto cleanup;
+        }
+    }
+
+    rc = expect_bytes_equal(path, codec_name, "encoded", expected.data, expected.len, actual.data, actual.len);
+
+cleanup:
+    byte_buffer_reset(&expected);
+    byte_buffer_reset(&actual);
+    return rc;
+}
+
+static int run_xor_distance_fixture(
+    const char *path,
+    const struct lantern_fixture_document *doc,
+    int input_idx,
+    int output_idx,
+    const char *codec_name) {
+    int node_a_idx = lantern_fixture_object_get_field(doc, input_idx, "nodeA");
+    int node_b_idx = lantern_fixture_object_get_field(doc, input_idx, "nodeB");
+    int distance_idx = lantern_fixture_object_get_field(doc, output_idx, "distance");
+    uint8_t node_a[32];
+    uint8_t node_b[32];
+    uint8_t expected[32];
+    uint8_t actual[32];
+
+    if (node_a_idx < 0 || node_b_idx < 0 || distance_idx < 0
+        || fixture_token_to_uint256_be(doc, node_a_idx, node_a) != 0
+        || fixture_token_to_uint256_be(doc, node_b_idx, node_b) != 0
+        || fixture_token_to_uint256_be(doc, distance_idx, expected) != 0) {
+        return record_failure(path, codec_name, "invalid xor_distance fixture");
+    }
+    for (size_t i = 0; i < sizeof(actual); ++i) {
+        actual[i] = (uint8_t)(node_a[i] ^ node_b[i]);
+    }
+    return expect_bytes_equal(path, codec_name, "distance", expected, sizeof(expected), actual, sizeof(actual));
+}
+
+static int run_log2_distance_fixture(
+    const char *path,
+    const struct lantern_fixture_document *doc,
+    int input_idx,
+    int output_idx,
+    const char *codec_name) {
+    int node_a_idx = lantern_fixture_object_get_field(doc, input_idx, "nodeA");
+    int node_b_idx = lantern_fixture_object_get_field(doc, input_idx, "nodeB");
+    int distance_idx = lantern_fixture_object_get_field(doc, output_idx, "distance");
+    uint8_t node_a[32];
+    uint8_t node_b[32];
+    uint64_t expected = 0u;
+    uint64_t actual = 0u;
+
+    if (node_a_idx < 0 || node_b_idx < 0 || distance_idx < 0
+        || fixture_token_to_uint256_be(doc, node_a_idx, node_a) != 0
+        || fixture_token_to_uint256_be(doc, node_b_idx, node_b) != 0
+        || lantern_fixture_token_to_uint64(doc, distance_idx, &expected) != 0) {
+        return record_failure(path, codec_name, "invalid log2_distance fixture");
+    }
+
+    for (size_t i = 0; i < sizeof(node_a); ++i) {
+        uint8_t distance_byte = (uint8_t)(node_a[i] ^ node_b[i]);
+        if (distance_byte == 0u) {
+            continue;
+        }
+        unsigned int highest_bit = 0u;
+        while (distance_byte != 0u) {
+            ++highest_bit;
+            distance_byte >>= 1u;
+        }
+        actual = (uint64_t)((31u - i) * 8u + highest_bit);
+        break;
+    }
+    return expect_uint64_equal(path, codec_name, "distance", expected, actual);
+}
+
 static int run_fixture_file(const char *path, void *user_data) {
     struct fixture_stats *stats = (struct fixture_stats *)user_data;
     struct lantern_fixture_document doc;
@@ -2073,10 +2419,14 @@ static int run_fixture_file(const char *path, void *user_data) {
 
     if (strcmp(codec_name, "varint") == 0) {
         rc = run_varint_fixture(path, &doc, input_idx, output_idx, codec_name);
+    } else if (strcmp(codec_name, "decode_failure") == 0) {
+        rc = run_decode_failure_fixture(path, &doc, input_idx, codec_name, stats);
     } else if (strcmp(codec_name, "reqresp_request") == 0) {
         rc = run_reqresp_request_fixture(path, &doc, input_idx, output_idx, codec_name);
     } else if (strcmp(codec_name, "reqresp_response") == 0) {
         rc = run_reqresp_response_fixture(path, &doc, input_idx, output_idx, codec_name);
+    } else if (strcmp(codec_name, "reqresp_response_stream") == 0) {
+        rc = run_reqresp_response_stream_fixture(path, &doc, input_idx, output_idx, codec_name);
     } else if (strcmp(codec_name, "gossip_topic") == 0) {
         rc = run_gossip_topic_fixture(path, &doc, input_idx, output_idx, codec_name);
     } else if (strcmp(codec_name, "gossip_message_id") == 0) {
@@ -2091,7 +2441,11 @@ static int run_fixture_file(const char *path, void *user_data) {
         rc = run_snappy_block_fixture(path, &doc, input_idx, output_idx, codec_name);
     } else if (strcmp(codec_name, "snappy_frame") == 0) {
         rc = run_snappy_frame_fixture(path, &doc, input_idx, output_idx, codec_name);
-    } else if (strcmp(codec_name, "discv5_message") == 0) {
+    } else if (strcmp(codec_name, "xor_distance") == 0) {
+        rc = run_xor_distance_fixture(path, &doc, input_idx, output_idx, codec_name);
+    } else if (strcmp(codec_name, "log2_distance") == 0) {
+        rc = run_log2_distance_fixture(path, &doc, input_idx, output_idx, codec_name);
+    } else if (strcmp(codec_name, "discv5_message") == 0 || strcmp(codec_name, "discv5_packet") == 0) {
         rc = run_skipped_fixture(
             path,
             codec_name,

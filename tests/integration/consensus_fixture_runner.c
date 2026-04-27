@@ -511,8 +511,8 @@ struct stored_vote_entry {
 
 struct stored_state_entry {
     LanternRoot root;
-    uint8_t *data;
-    size_t length;
+    LanternState state;
+    bool has_state;
     struct stored_vote_entry *votes;
     size_t vote_count;
 };
@@ -524,9 +524,10 @@ static void stored_state_entries_reset(struct stored_state_entry **entries_ptr, 
     struct stored_state_entry *entries = *entries_ptr;
     if (entries) {
         for (size_t i = 0; i < *count_ptr; ++i) {
-            free(entries[i].data);
-            entries[i].data = NULL;
-            entries[i].length = 0;
+            if (entries[i].has_state) {
+                lantern_state_reset(&entries[i].state);
+                entries[i].has_state = false;
+            }
             free(entries[i].votes);
             entries[i].votes = NULL;
             entries[i].vote_count = 0;
@@ -558,12 +559,10 @@ static int stored_state_add(
     size_t *count_ptr,
     size_t *cap_ptr,
     const LanternRoot *root,
-    uint8_t *data,
-    size_t length,
+    const LanternState *state,
     struct stored_vote_entry *votes,
     size_t vote_count) {
-    if (!entries_ptr || !count_ptr || !cap_ptr || !root || !data) {
-        free(data);
+    if (!entries_ptr || !count_ptr || !cap_ptr || !root || !state) {
         free(votes);
         return -1;
     }
@@ -573,9 +572,15 @@ static int stored_state_add(
 
     struct stored_state_entry *existing = stored_state_find(entries, count, root);
     if (existing) {
-        free(existing->data);
-        existing->data = data;
-        existing->length = length;
+        if (existing->has_state) {
+            lantern_state_reset(&existing->state);
+        }
+        if (lantern_state_clone(state, &existing->state) != 0) {
+            free(votes);
+            existing->has_state = false;
+            return -1;
+        }
+        existing->has_state = true;
         free(existing->votes);
         existing->votes = votes;
         existing->vote_count = vote_count;
@@ -585,13 +590,11 @@ static int stored_state_add(
     if (count == cap) {
         size_t new_cap = cap == 0 ? 8u : cap * 2u;
         if (new_cap < cap) {
-            free(data);
             free(votes);
             return -1;
         }
         struct stored_state_entry *expanded = realloc(entries, new_cap * sizeof(*expanded));
         if (!expanded) {
-            free(data);
             free(votes);
             return -1;
         }
@@ -600,55 +603,17 @@ static int stored_state_add(
         *cap_ptr = new_cap;
     }
 
+    memset(&entries[count], 0, sizeof(entries[count]));
     entries[count].root = *root;
-    entries[count].data = data;
-    entries[count].length = length;
+    if (lantern_state_clone(state, &entries[count].state) != 0) {
+        free(votes);
+        return -1;
+    }
+    entries[count].has_state = true;
     entries[count].votes = votes;
     entries[count].vote_count = vote_count;
     *count_ptr = count + 1u;
     return 0;
-}
-
-static int encode_state_to_buffer(const LanternState *state, uint8_t **out_data, size_t *out_len) {
-    if (!state || !out_data || !out_len) {
-        return -1;
-    }
-    size_t buffer_size = 1u << 18; /* 256 KiB initial */
-    uint8_t *buffer = malloc(buffer_size);
-    if (!buffer) {
-        return -1;
-    }
-    int rc = -1;
-    while (true) {
-        size_t written = 0;
-        int status = lantern_ssz_encode_state(state, buffer, buffer_size, &written);
-        if (status == 0) {
-            uint8_t *copy = malloc(written);
-            if (!copy) {
-                free(buffer);
-                break;
-            }
-            memcpy(copy, buffer, written);
-            free(buffer);
-            *out_data = copy;
-            *out_len = written;
-            rc = 0;
-            break;
-        }
-        if (buffer_size > (1u << 24)) { /* 16 MiB cap to avoid runaway */
-            free(buffer);
-            break;
-        }
-        size_t new_size = buffer_size * 2u;
-        uint8_t *resized = realloc(buffer, new_size);
-        if (!resized) {
-            free(buffer);
-            break;
-        }
-        buffer = resized;
-        buffer_size = new_size;
-    }
-    return rc;
 }
 
 static int stored_state_save(
@@ -660,19 +625,13 @@ static int stored_state_save(
     if (!entries_ptr || !count_ptr || !cap_ptr || !root || !state) {
         return -1;
     }
-    uint8_t *encoded = NULL;
-    size_t encoded_len = 0;
     int rc = -1;
-    if (encode_state_to_buffer(state, &encoded, &encoded_len) != 0) {
-        goto done;
-    }
 
     size_t vote_capacity = lantern_state_validator_capacity(state);
     struct stored_vote_entry *votes = NULL;
     if (vote_capacity > 0) {
         votes = calloc(vote_capacity, sizeof(*votes));
         if (!votes) {
-            free(encoded);
             return -1;
         }
         for (size_t i = 0; i < vote_capacity; ++i) {
@@ -682,7 +641,6 @@ static int stored_state_save(
             LanternVote vote;
             if (lantern_state_get_validator_vote(state, i, &vote) != 0) {
                 free(votes);
-                free(encoded);
                 return -1;
             }
             votes[i].has_vote = true;
@@ -690,10 +648,8 @@ static int stored_state_save(
         }
     }
 
-    int add_status = stored_state_add(entries_ptr, count_ptr, cap_ptr, root, encoded, encoded_len, votes, vote_capacity);
+    int add_status = stored_state_add(entries_ptr, count_ptr, cap_ptr, root, state, votes, vote_capacity);
     if (add_status != 0) {
-        free(votes);
-        free(encoded);
         goto done;
     }
     rc = 0;
@@ -711,11 +667,12 @@ static int stored_state_restore(
         return -1;
     }
     struct stored_state_entry *entry = stored_state_find(entries, count, root);
-    if (!entry) {
+    if (!entry || !entry->has_state) {
         return -1;
     }
     int rc = -1;
-    if (lantern_ssz_decode_state(state, entry->data, entry->length) != 0) {
+    lantern_state_reset(state);
+    if (lantern_state_clone(&entry->state, state) != 0) {
         goto done;
     }
     uint64_t validator_count = state->config.num_validators;
@@ -1483,8 +1440,12 @@ static int run_fork_choice_fixture(const char *path) {
         hash_mapping_reset(&hash_mapping, &hash_mapping_count, &hash_mapping_cap);
         return -1;
     }
+    LanternCheckpoint anchor_checkpoint = {
+        .root = anchor_root,
+        .slot = anchor_block.slot,
+    };
 
-    if (lantern_fork_choice_set_anchor(&store, &anchor_block, &latest_justified, &latest_finalized, &anchor_root) != 0) {
+    if (lantern_fork_choice_set_anchor(&store, &anchor_block, &anchor_checkpoint, &anchor_checkpoint, &anchor_root) != 0) {
         reset_block(&anchor_block);
         lantern_fork_choice_reset(&store);
         lantern_state_reset(&state);
@@ -1495,6 +1456,7 @@ static int run_fork_choice_fixture(const char *path) {
     }
 
     if (stored_state_save(&stored_states, &stored_states_count, &stored_states_cap, &anchor_root, &state) != 0) {
+        fprintf(stderr, "failed to save anchor state for %s\n", path);
         reset_block(&anchor_block);
         lantern_fork_choice_reset(&store);
         lantern_state_reset(&state);
@@ -1507,6 +1469,7 @@ static int run_fork_choice_fixture(const char *path) {
 
     /* For the anchor block, LeanSpec and C hashes are the same (no patching needed) */
     if (hash_mapping_add(&hash_mapping, &hash_mapping_count, &hash_mapping_cap, &anchor_root, &anchor_root) != 0) {
+        fprintf(stderr, "failed to record anchor hash mapping for %s\n", path);
         reset_block(&anchor_block);
         lantern_fork_choice_reset(&store);
         lantern_state_reset(&state);
@@ -1521,6 +1484,7 @@ static int run_fork_choice_fixture(const char *path) {
 
     int step_count = lantern_fixture_array_get_length(&doc, steps_idx);
     if (step_count < 0) {
+        fprintf(stderr, "invalid fork_choice steps array in %s\n", path);
         reset_block(&anchor_block);
         lantern_fork_choice_reset(&store);
         lantern_state_reset(&state);
@@ -1529,10 +1493,10 @@ static int run_fork_choice_fixture(const char *path) {
         hash_mapping_reset(&hash_mapping, &hash_mapping_count, &hash_mapping_cap);
         return -1;
     }
-
     for (int i = 0; i < step_count; ++i) {
         int step_idx = lantern_fixture_array_get_element(&doc, steps_idx, i);
         if (step_idx < 0) {
+            fprintf(stderr, "invalid fork_choice step in %s step %d\n", path, i);
             reset_block(&anchor_block);
             lantern_fork_choice_reset(&store);
             lantern_state_reset(&state);
@@ -1742,6 +1706,7 @@ static int run_fork_choice_fixture(const char *path) {
             if (is_tick_step || time_idx >= 0) {
                 continue;
             }
+            fprintf(stderr, "fork_choice step missing block/time in %s step %d\n", path, i);
             reset_block(&anchor_block);
             lantern_fork_choice_reset(&store);
             lantern_state_reset(&state);
@@ -1753,6 +1718,7 @@ static int run_fork_choice_fixture(const char *path) {
 
         LanternSignedBlock signed_block;
         if (lantern_fixture_parse_signed_block(&doc, block_idx, &signed_block) != 0) {
+            fprintf(stderr, "failed to parse fork_choice block in %s step %d\n", path, i);
             reset_block(&anchor_block);
             lantern_fork_choice_reset(&store);
             lantern_state_reset(&state);
@@ -1775,6 +1741,7 @@ static int run_fork_choice_fixture(const char *path) {
         uint64_t now = (genesis_time * 1000u) + (signed_block.block.slot * store.seconds_per_slot * 1000u);
         uint64_t previous_intervals = store.time_intervals;
         if (lantern_fork_choice_advance_time(&store, now, true) != 0) {
+            fprintf(stderr, "failed to advance fork_choice time in %s step %d\n", path, i);
             reset_block(&signed_block.block);
             reset_block(&anchor_block);
             lantern_fork_choice_reset(&store);
@@ -1911,6 +1878,7 @@ static int run_fork_choice_fixture(const char *path) {
                         reset_block(&signed_block.block);
                         continue;
                     }
+                    fprintf(stderr, "state transition failed in fork_choice %s step %d\n", path, i);
                     reset_block(&signed_block.block);
                     reset_block(&anchor_block);
                     lantern_fork_choice_reset(&store);
@@ -2030,6 +1998,7 @@ static int run_fork_choice_fixture(const char *path) {
                     reset_block(&signed_block.block);
                     continue;
                 }
+                fprintf(stderr, "branch state transition failed in fork_choice %s step %d\n", path, i);
                 lantern_state_reset(&branch_state);
                 reset_block(&signed_block.block);
                 reset_block(&anchor_block);

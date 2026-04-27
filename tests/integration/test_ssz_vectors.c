@@ -412,6 +412,24 @@ static int root_from_fixed_serialized_bytes(
     return merkleize_bytes_with_optional_length(bytes, byte_len, 0u, false, 0u, out_root);
 }
 
+static int parse_size_suffix(const char *text, const char *prefix, size_t *out_value) {
+    if (!text || !prefix || !out_value) {
+        return -1;
+    }
+    size_t prefix_len = strlen(prefix);
+    if (strncmp(text, prefix, prefix_len) != 0 || text[prefix_len] == '\0') {
+        return -1;
+    }
+    errno = 0;
+    char *end = NULL;
+    unsigned long value = strtoul(text + prefix_len, &end, 10);
+    if (errno != 0 || !end || *end != '\0') {
+        return -1;
+    }
+    *out_value = (size_t)value;
+    return 0;
+}
+
 static int parse_bool_data_array(
     const struct lantern_fixture_document *doc,
     int object_index,
@@ -1264,20 +1282,22 @@ static int run_bool_vector_fixture(
     }
 
     bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(bool));
-    uint8_t encoded[32];
-    size_t encoded_len = sizeof(encoded);
-    if (!decoded
+    uint8_t *encoded = (uint8_t *)malloc(expected_serialized->len > 0u ? expected_serialized->len : 1u);
+    size_t encoded_len = expected_serialized->len;
+    if (!decoded || !encoded
         || ssz_serialize_bitvector(bits, bit_count, encoded, &encoded_len) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || ssz_deserialize_bitvector(expected_serialized->data, expected_serialized->len, bit_count, decoded) != SSZ_SUCCESS) {
         free(bits);
         free(decoded);
+        free(encoded);
         return record_failure(path, type_name, "bitvector roundtrip failed");
     }
     for (size_t i = 0; i < bit_count; ++i) {
         if (decoded[i] != bits[i]) {
             free(bits);
             free(decoded);
+            free(encoded);
             return record_failure(path, type_name, "decoded bitvector differs from fixture value");
         }
     }
@@ -1286,11 +1306,13 @@ static int run_bool_vector_fixture(
     if (root_from_fixed_serialized_bytes(expected_serialized->data, expected_serialized->len, &root) != 0) {
         free(bits);
         free(decoded);
+        free(encoded);
         return record_failure(path, type_name, "failed to compute bitvector root");
     }
 
     free(bits);
     free(decoded);
+    free(encoded);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
 
@@ -1322,11 +1344,11 @@ static int run_bitlist_fixture(
         }
     }
 
-    uint8_t encoded[32];
-    size_t encoded_len = sizeof(encoded);
+    uint8_t *encoded = (uint8_t *)malloc(expected_serialized->len > 0u ? expected_serialized->len : 1u);
+    size_t encoded_len = expected_serialized->len;
     bool *decoded = (bool *)calloc(max_bits > 0u ? max_bits : 1u, sizeof(bool));
     size_t actual_bits = 0u;
-    if (bit_count == 0u) {
+    if (encoded && bit_count == 0u) {
         encoded[0] = 0x01u;
         encoded_len = 1u;
     }
@@ -1334,13 +1356,14 @@ static int run_bitlist_fixture(
     int deserialize_rc = bit_count == 0u
         ? SSZ_SUCCESS
         : ssz_deserialize_bitlist(expected_serialized->data, expected_serialized->len, max_bits, decoded, &actual_bits);
-    if (!decoded
+    if (!decoded || !encoded
         || serialize_rc != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || deserialize_rc != SSZ_SUCCESS
         || actual_bits != bit_count) {
         free(bits);
         free(decoded);
+        free(encoded);
         lantern_bitlist_reset(&bitlist);
         return record_failure(path, type_name, "bitlist roundtrip failed");
     }
@@ -1348,6 +1371,7 @@ static int run_bitlist_fixture(
         if (decoded[i] != bits[i]) {
             free(bits);
             free(decoded);
+            free(encoded);
             lantern_bitlist_reset(&bitlist);
             return record_failure(path, type_name, "decoded bitlist differs from fixture value");
         }
@@ -1358,12 +1382,14 @@ static int run_bitlist_fixture(
     if (lantern_merkleize_bitlist(&bitlist, chunk_limit == 0u ? 1u : chunk_limit, &root) != 0) {
         free(bits);
         free(decoded);
+        free(encoded);
         lantern_bitlist_reset(&bitlist);
         return record_failure(path, type_name, "failed to compute bitlist root");
     }
 
     free(bits);
     free(decoded);
+    free(encoded);
     lantern_bitlist_reset(&bitlist);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
@@ -1507,6 +1533,83 @@ static int run_uint32_list_fixture(
 
     free(values);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
+}
+
+static int run_uint64_list_fixture(
+    const char *path,
+    const char *type_name,
+    const struct lantern_fixture_document *doc,
+    int value_idx,
+    size_t max_count,
+    const struct byte_buffer *expected_serialized,
+    const LanternRoot *expected_root) {
+    uint64_t *values = NULL;
+    uint64_t *decoded = NULL;
+    uint8_t *encoded = NULL;
+    size_t count = 0u;
+    size_t actual_count = 0u;
+    int rc = -1;
+
+    if (parse_u64_data_array(doc, value_idx, &values, &count) != 0 || count > max_count) {
+        rc = record_failure(path, type_name, "invalid uint64 list value");
+        goto cleanup;
+    }
+
+    decoded = (uint64_t *)calloc(max_count > 0u ? max_count : 1u, sizeof(*decoded));
+    encoded = (uint8_t *)malloc(expected_serialized->len > 0u ? expected_serialized->len : 1u);
+    if (!decoded || !encoded) {
+        rc = record_failure(path, type_name, "allocation failed");
+        goto cleanup;
+    }
+
+    size_t encoded_len = expected_serialized->len;
+    if (count == 0u) {
+        encoded_len = 0u;
+    }
+    int serialize_rc = count == 0u ? SSZ_SUCCESS : ssz_serialize_list_uint64(values, count, encoded, &encoded_len);
+    int deserialize_rc = count == 0u
+        ? SSZ_SUCCESS
+        : ssz_deserialize_list_uint64(
+              expected_serialized->data,
+              expected_serialized->len,
+              max_count,
+              decoded,
+              &actual_count);
+    if (serialize_rc != SSZ_SUCCESS
+        || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
+        || deserialize_rc != SSZ_SUCCESS
+        || actual_count != count) {
+        rc = record_failure(path, type_name, "uint64 list roundtrip failed");
+        goto cleanup;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (decoded[i] != values[i]) {
+            rc = record_failure(path, type_name, "decoded uint64 list differs from fixture value");
+            goto cleanup;
+        }
+    }
+
+    LanternRoot root;
+    size_t chunk_limit = ((max_count * sizeof(uint64_t)) + SSZ_BYTES_PER_CHUNK - 1u) / SSZ_BYTES_PER_CHUNK;
+    if (merkleize_bytes_with_optional_length(
+            expected_serialized->data,
+            expected_serialized->len,
+            chunk_limit,
+            true,
+            count,
+            &root)
+        != 0) {
+        rc = record_failure(path, type_name, "failed to compute uint64 list root");
+        goto cleanup;
+    }
+
+    rc = expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
+
+cleanup:
+    free(values);
+    free(decoded);
+    free(encoded);
+    return rc;
 }
 
 static int run_bytes32_list_fixture(
@@ -2422,6 +2525,62 @@ static int run_blocks_by_root_request_fixture(
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
 
+static int run_decode_rejection_fixture(
+    const char *path,
+    const char *type_name,
+    const struct lantern_fixture_document *doc,
+    int case_idx) {
+    int raw_idx = lantern_fixture_object_get_field(doc, case_idx, "rawBytes");
+    int serialized_idx = lantern_fixture_object_get_field(doc, case_idx, "serialized");
+    struct byte_buffer bytes = {0};
+    ssz_error_t decode_status = SSZ_ERROR_DESERIALIZATION;
+
+    if ((raw_idx < 0 && serialized_idx < 0)
+        || fixture_token_to_bytes(doc, raw_idx >= 0 ? raw_idx : serialized_idx, &bytes) != 0) {
+        return record_failure(path, type_name, "invalid decode-rejection fixture");
+    }
+
+    if (strcmp(type_name, "Uint32") == 0) {
+        uint32_t decoded = 0u;
+        decode_status = ssz_deserialize_uint32(bytes.data, bytes.len, &decoded);
+    } else if (strcmp(type_name, "Bytes4") == 0) {
+        uint8_t decoded[4];
+        decode_status = ssz_deserialize_vector_uint8(bytes.data, bytes.len, sizeof(decoded), decoded);
+    } else {
+        size_t bit_count = 0u;
+        if (parse_size_suffix(type_name, "DecodeBitvector", &bit_count) == 0
+            || parse_size_suffix(type_name, "BoundaryBitvector", &bit_count) == 0) {
+            bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(*decoded));
+            if (!decoded) {
+                byte_buffer_reset(&bytes);
+                return record_failure(path, type_name, "allocation failed");
+            }
+            decode_status = ssz_deserialize_bitvector(bytes.data, bytes.len, bit_count, decoded);
+            free(decoded);
+        } else if (parse_size_suffix(type_name, "DecodeBitlist", &bit_count) == 0
+            || parse_size_suffix(type_name, "SmokeBitlist", &bit_count) == 0
+            || parse_size_suffix(type_name, "BoundaryBitlist", &bit_count) == 0) {
+            bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(*decoded));
+            size_t actual_bits = 0u;
+            if (!decoded) {
+                byte_buffer_reset(&bytes);
+                return record_failure(path, type_name, "allocation failed");
+            }
+            decode_status = ssz_deserialize_bitlist(bytes.data, bytes.len, bit_count, decoded, &actual_bits);
+            free(decoded);
+        } else {
+            byte_buffer_reset(&bytes);
+            return record_failure(path, type_name, "decode-rejection type not supported by runner");
+        }
+    }
+
+    byte_buffer_reset(&bytes);
+    if (decode_status == SSZ_SUCCESS) {
+        return record_failure(path, type_name, "decode unexpectedly succeeded");
+    }
+    return 0;
+}
+
 static int run_fixture_case(
     const char *path,
     const char *type_name,
@@ -2472,8 +2631,15 @@ static int run_fixture_case(
     if (strcmp(type_name, "SyncCommitteeSubnets") == 0) {
         return run_bool_vector_fixture(path, type_name, doc, value_idx, 4u, expected_serialized, expected_root);
     }
+    size_t boundary_count = 0u;
+    if (parse_size_suffix(type_name, "BoundaryBitvector", &boundary_count) == 0) {
+        return run_bool_vector_fixture(path, type_name, doc, value_idx, boundary_count, expected_serialized, expected_root);
+    }
     if (strcmp(type_name, "SampleBitlist16") == 0) {
         return run_bitlist_fixture(path, type_name, doc, value_idx, SAMPLE_BITLIST_LIMIT_BITS, expected_serialized, expected_root);
+    }
+    if (parse_size_suffix(type_name, "BoundaryBitlist", &boundary_count) == 0) {
+        return run_bitlist_fixture(path, type_name, doc, value_idx, boundary_count, expected_serialized, expected_root);
     }
     if (strcmp(type_name, "SampleUint16Vector3") == 0) {
         return run_uint_vector_fixture(path, type_name, doc, value_idx, 16u, 3u, expected_serialized, expected_root);
@@ -2483,6 +2649,9 @@ static int run_fixture_case(
     }
     if (strcmp(type_name, "SampleUint32List16") == 0) {
         return run_uint32_list_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
+    }
+    if (parse_size_suffix(type_name, "BoundaryUint64List", &boundary_count) == 0) {
+        return run_uint64_list_fixture(path, type_name, doc, value_idx, boundary_count, expected_serialized, expected_root);
     }
     if (strcmp(type_name, "SampleBytes32List8") == 0) {
         return run_bytes32_list_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
@@ -2589,6 +2758,7 @@ static int run_fixture_file(const char *path, void *user_data) {
     int value_idx = case_idx >= 0 ? lantern_fixture_object_get_field(&doc, case_idx, "value") : -1;
     int serialized_idx = case_idx >= 0 ? lantern_fixture_object_get_field(&doc, case_idx, "serialized") : -1;
     int root_idx = case_idx >= 0 ? lantern_fixture_object_get_field(&doc, case_idx, "root") : -1;
+    int expect_exception_idx = case_idx >= 0 ? lantern_fixture_object_get_field(&doc, case_idx, "expectException") : -1;
     char *type_name = NULL;
     struct byte_buffer expected_serialized = {0};
     LanternRoot expected_root;
@@ -2599,9 +2769,11 @@ static int run_fixture_file(const char *path, void *user_data) {
     }
 
     int rc = -1;
-    if (type_idx < 0
-        || fixture_token_to_c_string(&doc, type_idx, &type_name) != 0
-        || value_idx < 0 || serialized_idx < 0 || root_idx < 0
+    if (type_idx < 0 || fixture_token_to_c_string(&doc, type_idx, &type_name) != 0) {
+        rc = record_failure(path, NULL, "fixture missing typeName");
+    } else if (expect_exception_idx >= 0) {
+        rc = run_decode_rejection_fixture(path, type_name, &doc, case_idx);
+    } else if (value_idx < 0 || serialized_idx < 0 || root_idx < 0
         || fixture_token_to_bytes(&doc, serialized_idx, &expected_serialized) != 0
         || lantern_fixture_token_to_root(&doc, root_idx, &expected_root) != 0) {
         rc = record_failure(path, NULL, "fixture missing typeName/value/serialized/root");
