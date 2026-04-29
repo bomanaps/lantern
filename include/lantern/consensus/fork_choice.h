@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "lantern/consensus/containers.h"
 #include "lantern/consensus/state.h"
@@ -43,6 +44,14 @@ struct lantern_fork_choice_root_index_entry {
     bool tombstone;
 };
 
+struct lantern_fork_choice_checkpoint_snapshot {
+    atomic_uint_fast64_t sequence;
+    atomic_uint_fast64_t justified_slot;
+    atomic_uchar justified_root[LANTERN_ROOT_SIZE];
+    atomic_uint_fast64_t finalized_slot;
+    atomic_uchar finalized_root[LANTERN_ROOT_SIZE];
+};
+
 typedef struct lantern_fork_choice {
     bool initialized;
     bool has_anchor;
@@ -55,6 +64,7 @@ typedef struct lantern_fork_choice {
     uint64_t time_intervals;
     LanternCheckpoint latest_justified;
     LanternCheckpoint latest_finalized;
+    struct lantern_fork_choice_checkpoint_snapshot checkpoint_snapshot;
     LanternRoot head;
     bool has_head;
     LanternRoot safe_target;
@@ -196,6 +206,10 @@ const LanternRoot *lantern_fork_choice_anchor_root(const LanternForkChoice *stor
 int lantern_fork_choice_anchor_slot(const LanternForkChoice *store, uint64_t *out_slot);
 const LanternCheckpoint *lantern_fork_choice_latest_justified(const LanternForkChoice *store);
 const LanternCheckpoint *lantern_fork_choice_latest_finalized(const LanternForkChoice *store);
+bool lantern_fork_choice_read_checkpoint_snapshot(
+    const LanternForkChoice *store,
+    LanternCheckpoint *out_justified,
+    LanternCheckpoint *out_finalized);
 const LanternRoot *lantern_fork_choice_safe_target(const LanternForkChoice *store);
 void lantern_fork_choice_tree_snapshot_reset(struct lantern_fork_choice_tree_snapshot *snapshot);
 int lantern_fork_choice_snapshot_tree(

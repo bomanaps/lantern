@@ -38,6 +38,53 @@ static bool root_is_zero(const LanternRoot *root) {
     return true;
 }
 
+static void checkpoint_snapshot_init(struct lantern_fork_choice_checkpoint_snapshot *snapshot) {
+    if (!snapshot) {
+        return;
+    }
+    atomic_init(&snapshot->sequence, 0u);
+    atomic_init(&snapshot->justified_slot, 0u);
+    atomic_init(&snapshot->finalized_slot, 0u);
+    for (size_t i = 0; i < LANTERN_ROOT_SIZE; ++i) {
+        atomic_init(&snapshot->justified_root[i], 0u);
+        atomic_init(&snapshot->finalized_root[i], 0u);
+    }
+}
+
+static void checkpoint_snapshot_publish_one(
+    atomic_uint_fast64_t *slot,
+    atomic_uchar *root,
+    const LanternCheckpoint *checkpoint) {
+    uint64_t checkpoint_slot = checkpoint ? checkpoint->slot : 0u;
+    atomic_store_explicit(slot, checkpoint_slot, memory_order_relaxed);
+    for (size_t i = 0; i < LANTERN_ROOT_SIZE; ++i) {
+        uint8_t byte = checkpoint ? checkpoint->root.bytes[i] : 0u;
+        atomic_store_explicit(&root[i], byte, memory_order_relaxed);
+    }
+}
+
+static void fork_choice_publish_current_checkpoints(LanternForkChoice *store) {
+    if (!store) {
+        return;
+    }
+    struct lantern_fork_choice_checkpoint_snapshot *snapshot = &store->checkpoint_snapshot;
+    uint64_t sequence = atomic_load_explicit(&snapshot->sequence, memory_order_relaxed);
+    if ((sequence & 1u) != 0u) {
+        sequence += 1u;
+    }
+
+    atomic_store_explicit(&snapshot->sequence, sequence + 1u, memory_order_release);
+    checkpoint_snapshot_publish_one(
+        &snapshot->justified_slot,
+        snapshot->justified_root,
+        &store->latest_justified);
+    checkpoint_snapshot_publish_one(
+        &snapshot->finalized_slot,
+        snapshot->finalized_root,
+        &store->latest_finalized);
+    atomic_store_explicit(&snapshot->sequence, sequence + 2u, memory_order_release);
+}
+
 static int root_compare(const LanternRoot *a, const LanternRoot *b) {
     return memcmp(a->bytes, b->bytes, sizeof(a->bytes));
 }
@@ -426,6 +473,7 @@ void lantern_fork_choice_init(LanternForkChoice *store) {
         return;
     }
     memset(store, 0, sizeof(*store));
+    checkpoint_snapshot_init(&store->checkpoint_snapshot);
     store->seconds_per_slot = LANTERN_FORK_CHOICE_DEFAULT_SECONDS_PER_SLOT;
     store->intervals_per_slot = LANTERN_FORK_CHOICE_DEFAULT_INTERVALS_PER_SLOT;
     store->milliseconds_per_interval =
@@ -463,6 +511,7 @@ void lantern_fork_choice_reset(LanternForkChoice *store) {
     zero_root(&store->safe_target);
     memset(&store->latest_justified, 0, sizeof(store->latest_justified));
     memset(&store->latest_finalized, 0, sizeof(store->latest_finalized));
+    checkpoint_snapshot_init(&store->checkpoint_snapshot);
     store->time_intervals = 0;
     store->seconds_per_slot = LANTERN_FORK_CHOICE_DEFAULT_SECONDS_PER_SLOT;
     store->intervals_per_slot = LANTERN_FORK_CHOICE_DEFAULT_INTERVALS_PER_SLOT;
@@ -771,6 +820,7 @@ int lantern_fork_choice_set_anchor_with_state(
         }
         return -1;
     }
+    fork_choice_publish_current_checkpoints(store);
     return 0;
 }
 
@@ -865,7 +915,8 @@ static bool should_replace_checkpoint(
 static int update_latest_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *post_justified,
-    const LanternCheckpoint *post_finalized) {
+    const LanternCheckpoint *post_finalized,
+    bool publish_snapshot) {
     if (!store) {
         return -1;
     }
@@ -916,6 +967,9 @@ static int update_latest_checkpoints(
 
     store->latest_justified = latest_justified;
     store->latest_finalized = latest_finalized;
+    if (publish_snapshot) {
+        fork_choice_publish_current_checkpoints(store);
+    }
     return 0;
 }
 
@@ -1041,7 +1095,7 @@ int lantern_fork_choice_add_block_with_state(
         vote_undo_reset(&undo);
         return -1;
     }
-    if (update_latest_checkpoints(store, post_justified, post_finalized) != 0) {
+    if (update_latest_checkpoints(store, post_justified, post_finalized, false) != 0) {
         char justified_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
         char finalized_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
         char anchor_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -1165,6 +1219,7 @@ int lantern_fork_choice_add_block_with_state(
     }
     free(touched);
     vote_undo_reset(&undo);
+    fork_choice_publish_current_checkpoints(store);
     return 0;
 
 rollback_attestations:
@@ -1251,7 +1306,7 @@ int lantern_fork_choice_update_checkpoints(
     if (!store || !store->initialized) {
         return -1;
     }
-    return update_latest_checkpoints(store, latest_justified, latest_finalized);
+    return update_latest_checkpoints(store, latest_justified, latest_finalized, true);
 }
 
 int lantern_fork_choice_restore_checkpoints(
@@ -1350,6 +1405,7 @@ int lantern_fork_choice_restore_checkpoints(
         return -1;
     }
 
+    fork_choice_publish_current_checkpoints(store);
     return 0;
 }
 
@@ -2110,6 +2166,50 @@ const LanternCheckpoint *lantern_fork_choice_latest_finalized(const LanternForkC
         return NULL;
     }
     return &store->latest_finalized;
+}
+
+bool lantern_fork_choice_read_checkpoint_snapshot(
+    const LanternForkChoice *store,
+    LanternCheckpoint *out_justified,
+    LanternCheckpoint *out_finalized) {
+    if (!store || (!out_justified && !out_finalized)) {
+        return false;
+    }
+
+    const struct lantern_fork_choice_checkpoint_snapshot *snapshot = &store->checkpoint_snapshot;
+    for (;;) {
+        uint64_t before = atomic_load_explicit(&snapshot->sequence, memory_order_acquire);
+        if (before == 0u) {
+            return false;
+        }
+        if ((before & 1u) != 0u) {
+            continue;
+        }
+
+        LanternCheckpoint justified;
+        LanternCheckpoint finalized;
+        memset(&justified, 0, sizeof(justified));
+        memset(&finalized, 0, sizeof(finalized));
+        justified.slot = atomic_load_explicit(&snapshot->justified_slot, memory_order_relaxed);
+        finalized.slot = atomic_load_explicit(&snapshot->finalized_slot, memory_order_relaxed);
+        for (size_t i = 0; i < LANTERN_ROOT_SIZE; ++i) {
+            justified.root.bytes[i] =
+                atomic_load_explicit(&snapshot->justified_root[i], memory_order_relaxed);
+            finalized.root.bytes[i] =
+                atomic_load_explicit(&snapshot->finalized_root[i], memory_order_relaxed);
+        }
+
+        uint64_t after = atomic_load_explicit(&snapshot->sequence, memory_order_acquire);
+        if (before == after && (after & 1u) == 0u) {
+            if (out_justified) {
+                *out_justified = justified;
+            }
+            if (out_finalized) {
+                *out_finalized = finalized;
+            }
+            return true;
+        }
+    }
 }
 
 const LanternRoot *lantern_fork_choice_safe_target(const LanternForkChoice *store) {
