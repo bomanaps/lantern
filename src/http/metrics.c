@@ -616,6 +616,17 @@ static int append_lean_chain_metrics(
 
     rc = append_metric_uint64(
         buf,
+        "lean_gossip_validation_worker_count",
+        "Number of gossip validation workers",
+        "gauge",
+        lean->gossip_validation_worker_count);
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    rc = append_metric_uint64(
+        buf,
         "lean_fork_choice_reorgs_total",
         "Total number of fork choice reorgs",
         "counter",

@@ -180,6 +180,7 @@ static int test_prometheus_metric_names(void) {
     lean_metrics_record_peer_disconnection(
         LEAN_METRICS_DIR_OUTBOUND,
         LEAN_METRICS_DISCONNECT_REMOTE_CLOSE);
+    lean_metrics_set_gossip_validation_worker_count(8);
     lean_metrics_record_gossip_block_size(12000);
     lean_metrics_record_gossip_attestation_size(1024);
     lean_metrics_record_gossip_aggregation_size(4096);
@@ -234,6 +235,7 @@ static int test_prometheus_metric_names(void) {
         "lean_block_building_time_seconds",
         "lean_block_building_success_total",
         "lean_block_building_failures_total",
+        "lean_gossip_validation_worker_count",
         "lean_head_slot",
         "lean_current_slot",
         "lean_safe_target_slot",
@@ -276,6 +278,7 @@ static int test_prometheus_metric_names(void) {
 
     assert(strstr(body, "lean_node_info{name=\"lantern\"") != NULL);
     assert(strstr(body, "lean_connected_peers{client=\"lantern\"}") != NULL);
+    assert(strstr(body, "lean_gossip_validation_worker_count 8") != NULL);
     assert(strstr(body, "lean_finalizations_total{result=\"success\"}") != NULL);
     assert(strstr(body, "lean_finalizations_total{result=\"error\"}") != NULL);
     assert(strstr(body, "lean_committee_signatures_aggregation_time_seconds_bucket{le=\"2\"}") != NULL);

@@ -56,6 +56,7 @@ struct lean_metrics_snapshot {
     uint64_t finalizations_error_total;
     uint64_t block_building_success_total;
     uint64_t block_building_failures_total;
+    uint64_t gossip_validation_worker_count;
     uint64_t peer_connection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_CONN_RESULT_COUNT];
     uint64_t peer_disconnection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_DISCONNECT_REASON_COUNT];
     uint64_t state_transition_slots_processed_total;
@@ -88,6 +89,7 @@ void lean_metrics_record_block_building_time(double seconds);
 void lean_metrics_record_attestations_production_time(double seconds);
 void lean_metrics_record_block_building_success(void);
 void lean_metrics_record_block_building_failure(void);
+void lean_metrics_set_gossip_validation_worker_count(size_t count);
 void lean_metrics_record_fork_choice_block_time(double seconds);
 void lean_metrics_record_fork_choice_reorg(size_t depth);
 void lean_metrics_record_attestation_validation(double seconds, bool valid);

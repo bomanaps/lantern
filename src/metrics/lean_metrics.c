@@ -42,6 +42,7 @@ static uint64_t g_finalizations_success_total = 0;
 static uint64_t g_finalizations_error_total = 0;
 static uint64_t g_block_building_success_total = 0;
 static uint64_t g_block_building_failures_total = 0;
+static uint64_t g_gossip_validation_worker_count = 0;
 static uint64_t g_peer_connection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_CONN_RESULT_COUNT];
 static uint64_t g_peer_disconnection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_DISCONNECT_REASON_COUNT];
 static uint64_t g_state_slots_processed_total = 0;
@@ -200,6 +201,7 @@ void lean_metrics_reset(void) {
     g_finalizations_error_total = 0;
     g_block_building_success_total = 0;
     g_block_building_failures_total = 0;
+    g_gossip_validation_worker_count = 0;
     memset(g_peer_connection_events_total, 0, sizeof(g_peer_connection_events_total));
     memset(g_peer_disconnection_events_total, 0, sizeof(g_peer_disconnection_events_total));
     g_state_slots_processed_total = 0;
@@ -259,6 +261,12 @@ void lean_metrics_record_block_building_success(void) {
 void lean_metrics_record_block_building_failure(void) {
     pthread_mutex_lock(&g_metrics_lock);
     g_block_building_failures_total += 1;
+    pthread_mutex_unlock(&g_metrics_lock);
+}
+
+void lean_metrics_set_gossip_validation_worker_count(size_t count) {
+    pthread_mutex_lock(&g_metrics_lock);
+    g_gossip_validation_worker_count = (uint64_t)count;
     pthread_mutex_unlock(&g_metrics_lock);
 }
 
@@ -434,6 +442,7 @@ void lean_metrics_snapshot(struct lean_metrics_snapshot *out) {
     out->finalizations_error_total = g_finalizations_error_total;
     out->block_building_success_total = g_block_building_success_total;
     out->block_building_failures_total = g_block_building_failures_total;
+    out->gossip_validation_worker_count = g_gossip_validation_worker_count;
     for (size_t dir = 0; dir < LEAN_METRICS_DIR_COUNT; ++dir) {
         for (size_t res = 0; res < LEAN_METRICS_CONN_RESULT_COUNT; ++res) {
             out->peer_connection_events_total[dir][res] = g_peer_connection_events_total[dir][res];
