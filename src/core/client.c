@@ -208,6 +208,12 @@ static void sync_aggregated_payload_pools_after_time_advance(
             size_t new_before = client->store.new_aggregated_payloads.length;
             size_t known_before = client->store.known_aggregated_payloads.length;
             size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
+            if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+                lantern_log_warn(
+                    "forkchoice",
+                    &(struct lantern_log_metadata){.validator = client->node_id},
+                    "failed to recompute head after aggregated payload promotion");
+            }
             log_aggregated_payload_interval_transition(
                 client,
                 interval_index == 4u ? "accept_new" : "proposal_accept_new",
@@ -378,10 +384,13 @@ int lantern_client_skip_fork_choice_intervals_locked(
         } else if (phase == 4u) {
             size_t new_before = client->store.new_aggregated_payloads.length;
             size_t known_before = client->store.known_aggregated_payloads.length;
-            if (lantern_fork_choice_accept_new_votes(&client->fork_choice) != 0) {
+            if (lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
                 return -1;
             }
             size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
+            if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+                return -1;
+            }
             log_aggregated_payload_interval_transition(
                 client,
                 "skip_accept_new",
@@ -1363,10 +1372,6 @@ static lantern_client_error client_finalize_genesis_state(struct lantern_client 
     if (lantern_store_prepare_validator_votes(
             &client->store,
             client->state.config.num_validators)
-        != 0
-        || lantern_store_prepare_fork_choice_votes(
-               &client->store,
-               client->state.config.num_validators)
         != 0)
     {
         lantern_log_error(
@@ -2437,10 +2442,6 @@ static lantern_client_error client_load_state_from_checkpoint(
     if (lantern_store_prepare_validator_votes(
             &client->store,
             decoded.config.num_validators)
-        != 0
-        || lantern_store_prepare_fork_choice_votes(
-               &client->store,
-               decoded.config.num_validators)
         != 0)
     {
         lantern_log_error(

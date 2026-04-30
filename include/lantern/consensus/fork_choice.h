@@ -13,12 +13,6 @@
 extern "C" {
 #endif
 
-struct lantern_fork_choice_vote_entry {
-    bool has_checkpoint;
-    LanternCheckpoint checkpoint;
-    uint64_t slot;
-};
-
 struct lantern_aggregated_payload_pool;
 struct lantern_attestation_data_by_root;
 
@@ -81,8 +75,6 @@ typedef struct lantern_fork_choice {
     size_t index_cap;
     size_t index_len;
 
-    struct lantern_fork_choice_vote_entry *known_votes;
-    struct lantern_fork_choice_vote_entry *new_votes;
     size_t validator_count;
 
     /*
@@ -149,11 +141,6 @@ int lantern_fork_choice_add_block_with_state(
     const LanternRoot *block_root_hint,
     const LanternState *post_state);
 
-int lantern_fork_choice_add_vote(
-    LanternForkChoice *store,
-    const LanternSignedVote *vote,
-    bool from_block);
-
 int lantern_fork_choice_update_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *latest_justified,
@@ -175,7 +162,7 @@ int lantern_fork_choice_restore_checkpoints(
     const LanternCheckpoint *latest_finalized);
 int lantern_fork_choice_prune_states(LanternForkChoice *store);
 
-int lantern_fork_choice_accept_new_votes(LanternForkChoice *store);
+int lantern_fork_choice_accept_new_aggregated_payloads(LanternForkChoice *store);
 int lantern_fork_choice_update_safe_target(LanternForkChoice *store);
 int lantern_fork_choice_recompute_head(LanternForkChoice *store);
 

@@ -20,6 +20,12 @@
 #define LANTERN_FORK_CHOICE_LOAD_NUMERATOR 7u
 #define LANTERN_FORK_CHOICE_LOAD_DENOMINATOR 10u
 
+struct fork_choice_latest_vote {
+    bool has_checkpoint;
+    LanternCheckpoint checkpoint;
+    uint64_t slot;
+};
+
 static void zero_root(LanternRoot *root) {
     if (root) {
         memset(root->bytes, 0, sizeof(root->bytes));
@@ -286,110 +292,6 @@ static bool map_remove(LanternForkChoice *store, const LanternRoot *root) {
     }
 }
 
-static void votes_reset(struct lantern_fork_choice_vote_entry *entries, size_t count) {
-    if (!entries) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        entries[i].has_checkpoint = false;
-        memset(&entries[i].checkpoint, 0, sizeof(entries[i].checkpoint));
-    }
-}
-
-/*
- * Defensive copy-on-write guard for vote staging arrays.
- *
- * The forkchoice flow expects `known_votes` and `new_votes` to be independent
- * tables. If they alias, a gossip vote update can accidentally mutate known
- * votes in-place. Split the tables before mutating either one.
- */
-static int ensure_vote_tables_disjoint(LanternForkChoice *store) {
-    if (!store || !store->known_votes || !store->new_votes) {
-        return -1;
-    }
-    return store->known_votes != store->new_votes ? 0 : -1;
-}
-
-struct vote_undo_entry {
-    size_t validator_index;
-    struct lantern_fork_choice_vote_entry previous_known;
-    struct lantern_fork_choice_vote_entry previous_new;
-};
-
-struct vote_undo_list {
-    struct vote_undo_entry *entries;
-    size_t length;
-    size_t capacity;
-};
-
-static void vote_undo_reset(struct vote_undo_list *undo) {
-    if (!undo) {
-        return;
-    }
-    free(undo->entries);
-    undo->entries = NULL;
-    undo->length = 0;
-    undo->capacity = 0;
-}
-
-static int vote_undo_save(
-    struct vote_undo_list *undo,
-    uint8_t *touched,
-    size_t touched_bytes,
-    LanternForkChoice *store,
-    size_t validator_index) {
-    if (!undo || !store) {
-        return -1;
-    }
-    if (!touched || touched_bytes == 0) {
-        return 0;
-    }
-    if (validator_index >= store->validator_count) {
-        return 0;
-    }
-    size_t byte = validator_index / 8u;
-    if (byte >= touched_bytes) {
-        return -1;
-    }
-    uint8_t bit = (uint8_t)(1u << (validator_index % 8u));
-    if ((touched[byte] & bit) != 0) {
-        return 0;
-    }
-    touched[byte] |= bit;
-
-    if (undo->length == undo->capacity) {
-        size_t next = undo->capacity == 0 ? 8u : (undo->capacity + (undo->capacity / 2u));
-        if (next < undo->capacity) {
-            return -1;
-        }
-        struct vote_undo_entry *expanded = realloc(undo->entries, next * sizeof(*expanded));
-        if (!expanded) {
-            return -1;
-        }
-        undo->entries = expanded;
-        undo->capacity = next;
-    }
-    undo->entries[undo->length].validator_index = validator_index;
-    undo->entries[undo->length].previous_known = store->known_votes[validator_index];
-    undo->entries[undo->length].previous_new = store->new_votes[validator_index];
-    undo->length += 1;
-    return 0;
-}
-
-static void vote_undo_restore(const struct vote_undo_list *undo, LanternForkChoice *store) {
-    if (!undo || !store) {
-        return;
-    }
-    for (size_t i = 0; i < undo->length; ++i) {
-        size_t validator_index = undo->entries[i].validator_index;
-        if (validator_index >= store->validator_count) {
-            continue;
-        }
-        store->known_votes[validator_index] = undo->entries[i].previous_known;
-        store->new_votes[validator_index] = undo->entries[i].previous_new;
-    }
-}
-
 static int ensure_block_capacity(LanternForkChoice *store, size_t required) {
     if (!store) {
         return -1;
@@ -484,8 +386,6 @@ void lantern_fork_choice_reset(LanternForkChoice *store) {
     if (!store) {
         return;
     }
-    struct lantern_fork_choice_vote_entry *known_votes = store->known_votes;
-    struct lantern_fork_choice_vote_entry *new_votes = store->new_votes;
     size_t validator_count = store->validator_count;
     const struct lantern_aggregated_payload_pool *new_aggregated_payloads =
         store->new_aggregated_payloads;
@@ -517,8 +417,6 @@ void lantern_fork_choice_reset(LanternForkChoice *store) {
     store->intervals_per_slot = LANTERN_FORK_CHOICE_DEFAULT_INTERVALS_PER_SLOT;
     store->milliseconds_per_interval =
         ((uint64_t)store->seconds_per_slot * LANTERN_FORK_CHOICE_MILLISECONDS_PER_SECOND) / store->intervals_per_slot;
-    store->known_votes = known_votes;
-    store->new_votes = new_votes;
     store->validator_count = validator_count;
     store->new_aggregated_payloads = new_aggregated_payloads;
     store->known_aggregated_payloads = known_aggregated_payloads;
@@ -536,19 +434,11 @@ int lantern_fork_choice_configure(LanternForkChoice *store, const LanternConfig 
 
     store->config = *config;
     store->validator_count = (size_t)config->num_validators;
-    if (!store->known_votes || !store->new_votes) {
-        return -1;
-    }
-    if (store->known_votes == store->new_votes) {
-        return -1;
-    }
     store->seconds_per_slot = LANTERN_FORK_CHOICE_DEFAULT_SECONDS_PER_SLOT;
     store->intervals_per_slot = LANTERN_FORK_CHOICE_DEFAULT_INTERVALS_PER_SLOT;
     store->milliseconds_per_interval =
         ((uint64_t)store->seconds_per_slot * LANTERN_FORK_CHOICE_MILLISECONDS_PER_SECOND) / store->intervals_per_slot;
     store->initialized = true;
-    votes_reset(store->known_votes, store->validator_count);
-    votes_reset(store->new_votes, store->validator_count);
     return 0;
 }
 
@@ -1099,18 +989,6 @@ int lantern_fork_choice_add_block_with_state(
 
     size_t previous_block_len = store->block_len;
 
-    size_t validator_count = store->validator_count;
-    size_t touched_bytes = validator_count / 8u + (validator_count % 8u != 0 ? 1u : 0u);
-    uint8_t *touched = NULL;
-    if (touched_bytes > 0) {
-        touched = calloc(touched_bytes, 1);
-        if (!touched) {
-            return -1;
-        }
-    }
-
-    struct vote_undo_list undo = {0};
-
     if (trace_finalization) {
         format_root_hex(&block_root, block_hex, sizeof(block_hex));
         format_root_hex(&block->parent_root, parent_hex, sizeof(parent_hex));
@@ -1135,8 +1013,6 @@ int lantern_fork_choice_add_block_with_state(
             block->slot,
             block_hex[0] ? block_hex : "0x0",
             parent_hex[0] ? parent_hex : "0x0");
-        free(touched);
-        vote_undo_reset(&undo);
         return -1;
     }
     if (update_latest_checkpoints(store, post_justified, post_finalized, false) != 0) {
@@ -1183,37 +1059,6 @@ int lantern_fork_choice_add_block_with_state(
         goto rollback;
     }
 
-    LanternAttestations expanded;
-    lantern_attestations_init(&expanded);
-    if (lantern_expand_aggregated_attestations(
-            &block->body.attestations,
-            store->validator_count,
-            &expanded)
-        != 0) {
-        format_root_hex(&block_root, block_hex, sizeof(block_hex));
-        lantern_log_warn(
-            "forkchoice",
-            &diag_meta,
-            "add_block attestation expansion failed slot=%" PRIu64 " root=%s attestations=%zu",
-            block->slot,
-            block_hex[0] ? block_hex : "0x0",
-            block->body.attestations.length);
-        goto rollback_attestations;
-    }
-    for (size_t i = 0; i < expanded.length; ++i) {
-        size_t validator_index = (size_t)expanded.data[i].validator_id;
-        if (vote_undo_save(&undo, touched, touched_bytes, store, validator_index) != 0) {
-            lantern_attestations_reset(&expanded);
-            goto rollback;
-        }
-        LanternSignedVote wrapped_vote;
-        memset(&wrapped_vote, 0, sizeof(wrapped_vote));
-        wrapped_vote.data = expanded.data[i];
-        if (lantern_fork_choice_add_vote(store, &wrapped_vote, true) != 0) {
-            continue;
-        }
-    }
-    lantern_attestations_reset(&expanded);
     if (lantern_fork_choice_recompute_head(store) != 0) {
         char justified_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
         char finalized_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -1261,21 +1106,14 @@ int lantern_fork_choice_add_block_with_state(
             post_justified ? post_justified->slot : 0u,
             post_finalized ? post_finalized->slot : 0u);
     }
-    free(touched);
-    vote_undo_reset(&undo);
     fork_choice_publish_current_checkpoints(store);
     return 0;
-
-rollback_attestations:
-    lantern_attestations_reset(&expanded);
 
 rollback:
     store->latest_justified = previous_latest_justified;
     store->latest_finalized = previous_latest_finalized;
     store->head = previous_head;
     store->has_head = had_head;
-
-    vote_undo_restore(&undo, store);
 
     if (existed) {
         store->blocks[existing_index] = previous_entry;
@@ -1291,56 +1129,7 @@ rollback:
         store->block_len = previous_block_len;
     }
 
-    free(touched);
-    vote_undo_reset(&undo);
     return -1;
-}
-
-int lantern_fork_choice_add_vote(
-    LanternForkChoice *store,
-    const LanternSignedVote *vote,
-    bool from_block) {
-    if (!store || !vote || !store->initialized) {
-        return -1;
-    }
-    if (vote->data.validator_id >= store->validator_count) {
-        return -1;
-    }
-    /* LMD GHOST weights by head, not target (per leanSpec store.py:703
-     * and ethereum/research 3sf-mini consensus.py get_fork_choice_head). */
-    const LanternCheckpoint *head = &vote->data.head;
-    size_t block_index = 0;
-    if (!map_lookup(store, &head->root, &block_index)) {
-        return 0;
-    }
-    struct lantern_fork_choice_block_entry *head_block = &store->blocks[block_index];
-    if (head_block->slot != head->slot) {
-        return -1;
-    }
-    if (ensure_vote_tables_disjoint(store) != 0) {
-        return -1;
-    }
-
-    size_t validator = (size_t)vote->data.validator_id;
-    struct lantern_fork_choice_vote_entry *table = from_block ? store->known_votes : store->new_votes;
-    struct lantern_fork_choice_vote_entry *entry = &table[validator];
-    if (!entry->has_checkpoint || vote->data.slot > entry->slot) {
-        entry->checkpoint = *head;
-        entry->slot = vote->data.slot;
-        entry->has_checkpoint = true;
-    } else if (vote->data.slot == entry->slot) {
-        if (root_compare(&entry->checkpoint.root, &head->root) != 0) {
-            return -1;
-        }
-    }
-
-    if (from_block) {
-        struct lantern_fork_choice_vote_entry *pending = &store->new_votes[validator];
-        if (pending->has_checkpoint && pending->slot <= entry->slot) {
-            pending->has_checkpoint = false;
-        }
-    }
-    return 0;
 }
 
 int lantern_fork_choice_update_checkpoints(
@@ -1567,7 +1356,7 @@ static int find_start_index(
 static int lmd_ghost_compute(
     const LanternForkChoice *store,
     const LanternRoot *start_root,
-    const struct lantern_fork_choice_vote_entry *votes,
+    const struct fork_choice_latest_vote *votes,
     size_t vote_count,
     uint64_t min_score,
     LanternRoot *out_head) {
@@ -1590,7 +1379,7 @@ static int lmd_ghost_compute(
     }
 
     for (size_t i = 0; i < vote_count; ++i) {
-        const struct lantern_fork_choice_vote_entry *vote = &votes[i];
+        const struct fork_choice_latest_vote *vote = &votes[i];
         if (!vote->has_checkpoint) {
             continue;
         }
@@ -1656,7 +1445,7 @@ static int lmd_ghost_compute(
 }
 
 static void safe_target_consider_vote(
-    struct lantern_fork_choice_vote_entry *merged_votes,
+    struct fork_choice_latest_vote *merged_votes,
     uint64_t *latest_slots,
     size_t vote_count,
     size_t validator_index,
@@ -1665,34 +1454,11 @@ static void safe_target_consider_vote(
     if (!merged_votes || !latest_slots || !head || validator_index >= vote_count) {
         return;
     }
-    struct lantern_fork_choice_vote_entry *merged = &merged_votes[validator_index];
+    struct fork_choice_latest_vote *merged = &merged_votes[validator_index];
     if (!merged->has_checkpoint || attestation_slot > latest_slots[validator_index]) {
         merged->checkpoint = *head;
         merged->has_checkpoint = true;
         latest_slots[validator_index] = attestation_slot;
-    }
-}
-
-static void safe_target_merge_vote_table(
-    const struct lantern_fork_choice_vote_entry *source_votes,
-    size_t vote_count,
-    struct lantern_fork_choice_vote_entry *merged_votes,
-    uint64_t *latest_slots) {
-    if (!source_votes || !merged_votes || !latest_slots) {
-        return;
-    }
-    for (size_t i = 0; i < vote_count; ++i) {
-        const struct lantern_fork_choice_vote_entry *vote = &source_votes[i];
-        if (!vote->has_checkpoint) {
-            continue;
-        }
-        safe_target_consider_vote(
-            merged_votes,
-            latest_slots,
-            vote_count,
-            i,
-            &vote->checkpoint,
-            vote->checkpoint.slot);
     }
 }
 
@@ -1714,7 +1480,7 @@ static const LanternAttestationData *safe_target_lookup_attestation_data(
 static void safe_target_merge_payload_pool(
     const LanternForkChoice *store,
     const struct lantern_aggregated_payload_pool *pool,
-    struct lantern_fork_choice_vote_entry *merged_votes,
+    struct fork_choice_latest_vote *merged_votes,
     uint64_t *latest_slots,
     size_t vote_count) {
     if (!store || !pool || !merged_votes || !latest_slots || !pool->entries) {
@@ -1759,7 +1525,7 @@ static bool fork_choice_has_attached_payload_views(const LanternForkChoice *stor
 
 static int collect_known_weight_votes(
     const LanternForkChoice *store,
-    struct lantern_fork_choice_vote_entry **out_votes,
+    struct fork_choice_latest_vote **out_votes,
     size_t *out_vote_count) {
     if (!store || !out_votes || !out_vote_count) {
         return -1;
@@ -1768,7 +1534,7 @@ static int collect_known_weight_votes(
     *out_vote_count = 0;
 
     size_t vote_count = store->validator_count;
-    struct lantern_fork_choice_vote_entry *votes = NULL;
+    struct fork_choice_latest_vote *votes = NULL;
     uint64_t *latest_slots = NULL;
     if (vote_count > 0) {
         votes = calloc(vote_count, sizeof(*votes));
@@ -1782,17 +1548,6 @@ static int collect_known_weight_votes(
         if (!latest_slots) {
             free(votes);
             return -1;
-        }
-    }
-
-    if (votes && store->known_votes) {
-        memcpy(votes, store->known_votes, vote_count * sizeof(*votes));
-        if (latest_slots) {
-            for (size_t i = 0; i < vote_count; ++i) {
-                if (store->known_votes[i].has_checkpoint) {
-                    latest_slots[i] = store->known_votes[i].slot;
-                }
-            }
         }
     }
 
@@ -1823,7 +1578,7 @@ static int compute_known_block_weights(
         return 0;
     }
 
-    struct lantern_fork_choice_vote_entry *votes = NULL;
+    struct fork_choice_latest_vote *votes = NULL;
     size_t vote_count = 0;
     if (collect_known_weight_votes(store, &votes, &vote_count) != 0) {
         return -1;
@@ -1831,7 +1586,7 @@ static int compute_known_block_weights(
 
     uint64_t start_slot = store->latest_finalized.slot;
     for (size_t i = 0; i < vote_count; ++i) {
-        const struct lantern_fork_choice_vote_entry *vote = &votes[i];
+        const struct fork_choice_latest_vote *vote = &votes[i];
         if (!vote->has_checkpoint) {
             continue;
         }
@@ -1855,40 +1610,6 @@ static int compute_known_block_weights(
     }
 
     free(votes);
-    return 0;
-}
-
-static int materialize_attached_payload_votes(LanternForkChoice *store) {
-    if (!store || !fork_choice_has_attached_payload_views(store)) {
-        return 0;
-    }
-
-    uint64_t *latest_slots = calloc(store->validator_count, sizeof(*latest_slots));
-    if (!latest_slots) {
-        return -1;
-    }
-
-    for (size_t i = 0; i < store->validator_count; ++i) {
-        if (!store->known_votes[i].has_checkpoint) {
-            continue;
-        }
-        latest_slots[i] = store->known_votes[i].slot;
-    }
-
-    safe_target_merge_payload_pool(
-        store,
-        store->known_aggregated_payloads,
-        store->known_votes,
-        latest_slots,
-        store->validator_count);
-    safe_target_merge_payload_pool(
-        store,
-        store->new_aggregated_payloads,
-        store->known_votes,
-        latest_slots,
-        store->validator_count);
-
-    free(latest_slots);
     return 0;
 }
 
@@ -1947,7 +1668,7 @@ int lantern_fork_choice_recompute_head(LanternForkChoice *store) {
     LanternRoot previous_head = store->head;
     bool had_head = store->has_head;
     LanternRoot head;
-    struct lantern_fork_choice_vote_entry *votes = NULL;
+    struct fork_choice_latest_vote *votes = NULL;
     size_t vote_count = 0;
     if (collect_known_weight_votes(store, &votes, &vote_count) != 0) {
         return -1;
@@ -1955,8 +1676,8 @@ int lantern_fork_choice_recompute_head(LanternForkChoice *store) {
     if (lmd_ghost_compute(
             store,
             &store->latest_justified.root,
-            votes ? votes : store->known_votes,
-            votes ? vote_count : store->validator_count,
+            votes,
+            vote_count,
             0,
             &head)
         != 0) {
@@ -1982,25 +1703,8 @@ int lantern_fork_choice_recompute_head(LanternForkChoice *store) {
     return 0;
 }
 
-int lantern_fork_choice_accept_new_votes(LanternForkChoice *store) {
+int lantern_fork_choice_accept_new_aggregated_payloads(LanternForkChoice *store) {
     if (!store || !store->initialized) {
-        return -1;
-    }
-    if (ensure_vote_tables_disjoint(store) != 0) {
-        return -1;
-    }
-    for (size_t i = 0; i < store->validator_count; ++i) {
-        struct lantern_fork_choice_vote_entry *pending = &store->new_votes[i];
-        if (!pending->has_checkpoint) {
-            continue;
-        }
-        struct lantern_fork_choice_vote_entry *known = &store->known_votes[i];
-        if (!known->has_checkpoint || pending->checkpoint.slot >= known->checkpoint.slot) {
-            *known = *pending;
-        }
-        pending->has_checkpoint = false;
-    }
-    if (materialize_attached_payload_votes(store) != 0) {
         return -1;
     }
     return lantern_fork_choice_recompute_head(store);
@@ -2021,7 +1725,7 @@ int lantern_fork_choice_update_safe_target(LanternForkChoice *store) {
         }
     }
     uint64_t threshold = lantern_consensus_quorum_threshold(validator_count);
-    struct lantern_fork_choice_vote_entry *safe_votes =
+    struct fork_choice_latest_vote *safe_votes =
         calloc(store->validator_count, sizeof(*safe_votes));
     uint64_t *latest_slots = calloc(store->validator_count, sizeof(*latest_slots));
     if (!safe_votes || !latest_slots) {
@@ -2029,20 +1733,12 @@ int lantern_fork_choice_update_safe_target(LanternForkChoice *store) {
         free(latest_slots);
         return -1;
     }
-    if (fork_choice_has_attached_payload_views(store)) {
-        safe_target_merge_payload_pool(
-            store,
-            store->new_aggregated_payloads,
-            safe_votes,
-            latest_slots,
-            store->validator_count);
-    } else {
-        safe_target_merge_vote_table(
-            store->new_votes,
-            store->validator_count,
-            safe_votes,
-            latest_slots);
-    }
+    safe_target_merge_payload_pool(
+        store,
+        store->new_aggregated_payloads,
+        safe_votes,
+        latest_slots,
+        store->validator_count);
     LanternRoot safe;
     if (lmd_ghost_compute(
             store,
@@ -2072,7 +1768,7 @@ static int tick_interval(LanternForkChoice *store, bool has_proposal) {
     switch (current_interval) {
     case 0:
         if (has_proposal) {
-            return lantern_fork_choice_accept_new_votes(store);
+            return lantern_fork_choice_accept_new_aggregated_payloads(store);
         }
         return 0;
     case 1:
@@ -2084,7 +1780,7 @@ static int tick_interval(LanternForkChoice *store, bool has_proposal) {
     case 3:
         return lantern_fork_choice_update_safe_target(store);
     case 4:
-        return lantern_fork_choice_accept_new_votes(store);
+        return lantern_fork_choice_accept_new_aggregated_payloads(store);
     default:
         return 0;
     }
