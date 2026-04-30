@@ -747,11 +747,6 @@ static int test_import_block_parent_mismatch(void) {
         .num_validators = 8,
         .genesis_time = 0,
     };
-    if (lantern_store_prepare_fork_choice_votes(&client.store, fork_cfg.num_validators) != 0) {
-        fprintf(stderr, "failed to prepare fork choice votes\n");
-        rc = 1;
-        goto cleanup;
-    }
     if (lantern_fork_choice_configure(&client.fork_choice, &fork_cfg) != 0) {
         fprintf(stderr, "failed to configure fork choice\n");
         rc = 1;

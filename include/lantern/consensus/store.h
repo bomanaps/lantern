@@ -12,7 +12,6 @@ extern "C" {
 #endif
 
 struct lantern_fork_choice;
-struct lantern_fork_choice_vote_entry;
 
 struct lantern_vote_record {
     LanternVote vote;
@@ -66,10 +65,6 @@ typedef struct lantern_store {
     struct lantern_vote_record *validator_votes;
     size_t validator_votes_len;
 
-    struct lantern_fork_choice_vote_entry *known_votes;
-    struct lantern_fork_choice_vote_entry *new_votes;
-    size_t fork_choice_vote_count;
-
     struct lantern_attestation_signature_map attestation_signatures;
     struct lantern_aggregated_payload_pool new_aggregated_payloads;
     struct lantern_aggregated_payload_pool known_aggregated_payloads;
@@ -97,8 +92,6 @@ int lantern_store_set_signed_validator_vote(
     const LanternSignedVote *vote);
 int lantern_store_set_validator_vote(LanternStore *store, size_t index, const LanternVote *vote);
 void lantern_store_clear_validator_vote(LanternStore *store, size_t index);
-
-int lantern_store_prepare_fork_choice_votes(LanternStore *store, uint64_t validator_count);
 
 int lantern_store_set_attestation_signature(
     LanternStore *store,

@@ -616,6 +616,17 @@ static int append_lean_chain_metrics(
 
     rc = append_metric_uint64(
         buf,
+        "lean_gossip_validation_worker_count",
+        "Number of gossip validation workers",
+        "gauge",
+        lean->gossip_validation_worker_count);
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    rc = append_metric_uint64(
+        buf,
         "lean_fork_choice_reorgs_total",
         "Total number of fork choice reorgs",
         "counter",
@@ -1149,6 +1160,16 @@ static int append_lean_histograms(
         "lean_pq_sig_aggregated_signatures_verification_time_seconds",
         "Time taken to verify an aggregated attestation signature",
         &lean->pq_sig_aggregated_signatures_verification_time);
+    if (rc != 0)
+    {
+        return rc;
+    }
+
+    rc = append_histogram_metrics(
+        buf,
+        "lean_pq_sig_block_aggregated_signatures_verification_time_seconds",
+        "Wall-clock time spent verifying aggregated attestation signatures in a block",
+        &lean->pq_sig_block_aggregated_signatures_verification_time);
     if (rc != 0)
     {
         return rc;

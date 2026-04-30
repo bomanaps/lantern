@@ -894,26 +894,19 @@ static uint64_t *fork_choice_compute_known_weights(const LanternForkChoice *stor
     if (anchor_index != SIZE_MAX) {
         anchor_slot = store->blocks[anchor_index].slot;
     }
-    for (size_t i = 0; i < store->validator_count; ++i) {
-        const struct lantern_fork_choice_vote_entry *vote = &store->known_votes[i];
-        if (!vote->has_checkpoint) {
-            continue;
-        }
-        size_t node_index = fork_choice_find_block_index(store, &vote->checkpoint.root);
-        while (node_index != SIZE_MAX) {
-            const struct lantern_fork_choice_block_entry *node = &store->blocks[node_index];
-            if (node->slot <= anchor_slot) {
-                break;
-            }
-            if (weights[node_index] < UINT64_MAX) {
-                weights[node_index] += 1;
-            }
-            if (node->parent_index == SIZE_MAX || node->parent_index >= store->block_len) {
-                break;
-            }
-            node_index = node->parent_index;
+    struct lantern_fork_choice_tree_snapshot snapshot;
+    memset(&snapshot, 0, sizeof(snapshot));
+    if (lantern_fork_choice_snapshot_tree(store, &snapshot) != 0) {
+        free(weights);
+        return NULL;
+    }
+    for (size_t i = 0; i < snapshot.node_count; ++i) {
+        size_t block_index = fork_choice_find_block_index(store, &snapshot.nodes[i].root);
+        if (block_index != SIZE_MAX) {
+            weights[block_index] = snapshot.nodes[i].weight;
         }
     }
+    lantern_fork_choice_tree_snapshot_reset(&snapshot);
     if (out_anchor_slot) {
         *out_anchor_slot = anchor_slot;
     }
@@ -1409,14 +1402,6 @@ static int run_fork_choice_fixture(const char *path) {
     lantern_fork_choice_init(&store);
     lantern_store_init(&fork_choice_store);
     lantern_store_attach_fork_choice(&fork_choice_store, &store);
-    if (lantern_store_prepare_fork_choice_votes(&fork_choice_store, validator_count) != 0) {
-        reset_block(&anchor_block);
-        lantern_state_reset(&state);
-        lantern_fixture_document_reset(&doc);
-        stored_state_entries_reset(&stored_states, &stored_states_count, &stored_states_cap);
-        hash_mapping_reset(&hash_mapping, &hash_mapping_count, &hash_mapping_cap);
-        return -1;
-    }
     LanternConfig config = {
         .num_validators = validator_count,
         .genesis_time = genesis_time,

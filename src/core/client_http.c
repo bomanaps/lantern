@@ -107,11 +107,9 @@ int find_local_validator_index(
  *
  * @return 0 on success
  * @return LANTERN_HTTP_CB_ERR_INVALID_PARAM if context or out_snapshot is NULL
- * @return LANTERN_HTTP_CB_ERR_INVALID_STATE if client has no state
- * @return LANTERN_HTTP_CB_ERR_LOCK_FAILED if state_lock is initialized but cannot be acquired
- * @return LANTERN_HTTP_CB_ERR_HASH_FAILED if head root cannot be computed
+ * @return LANTERN_HTTP_CB_ERR_INVALID_STATE if checkpoint snapshot is unavailable
  *
- * @note Thread safety: This function may acquire state_lock
+ * @note Thread safety: Reads fork-choice checkpoint snapshots without acquiring state_lock.
  */
 int http_snapshot_head(void *context, struct lantern_http_head_snapshot *out_snapshot)
 {
@@ -122,47 +120,24 @@ int http_snapshot_head(void *context, struct lantern_http_head_snapshot *out_sna
     struct lantern_client *client = context;
     memset(out_snapshot, 0, sizeof(*out_snapshot));
 
-    const bool expect_state_lock = client->state_lock_initialized;
-    bool state_locked = lantern_client_lock_state(client);
-    if (expect_state_lock && !state_locked)
+    if (!client->has_fork_choice)
     {
-        return LANTERN_HTTP_CB_ERR_LOCK_FAILED;
-    }
-
-    if (!client->has_state)
-    {
-        lantern_client_unlock_state(client, state_locked);
         return LANTERN_HTTP_CB_ERR_INVALID_STATE;
     }
 
-    LanternBlockHeader head_header = client->state.latest_block_header;
-    LanternCheckpoint justified = client->state.latest_justified;
-    LanternCheckpoint finalized = client->state.latest_finalized;
-    if (client->has_fork_choice)
+    LanternCheckpoint justified;
+    LanternCheckpoint finalized;
+    if (!lantern_fork_choice_read_checkpoint_snapshot(
+            &client->fork_choice,
+            &justified,
+            &finalized))
     {
-        const LanternCheckpoint *fork_justified =
-            lantern_fork_choice_latest_justified(&client->fork_choice);
-        const LanternCheckpoint *fork_finalized =
-            lantern_fork_choice_latest_finalized(&client->fork_choice);
-        if (fork_justified && !lantern_root_is_zero(&fork_justified->root))
-        {
-            justified = *fork_justified;
-        }
-        if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
-        {
-            finalized = *fork_finalized;
-        }
+        return LANTERN_HTTP_CB_ERR_INVALID_STATE;
     }
-    lantern_client_unlock_state(client, state_locked);
 
-    out_snapshot->slot = head_header.slot;
+    out_snapshot->slot = justified.slot;
     out_snapshot->justified = justified;
     out_snapshot->finalized = finalized;
-    if (lantern_hash_tree_root_block_header(&head_header, &out_snapshot->head_root) != 0)
-    {
-        return LANTERN_HTTP_CB_ERR_HASH_FAILED;
-    }
-
     return LANTERN_HTTP_CB_OK;
 }
 
@@ -641,12 +616,13 @@ int metrics_snapshot_cb(void *context, struct lantern_metrics_snapshot *out_snap
  *
  * @return 0 on success
  * @return LANTERN_HTTP_CB_ERR_INVALID_PARAM if inputs are NULL
- * @return LANTERN_HTTP_CB_ERR_INVALID_STATE if client has no state or data dir
+ * @return LANTERN_HTTP_CB_ERR_INVALID_STATE if client has no snapshot or data dir
  * @return LANTERN_HTTP_CB_ERR_NOT_FOUND if finalized state is unavailable
- * @return LANTERN_HTTP_CB_ERR_LOCK_FAILED if state_lock cannot be acquired
  * @return LANTERN_HTTP_CB_ERR_IO on storage read failure
  *
- * @note Thread safety: This function may acquire state_lock
+ * @note Thread safety: Reads the finalized checkpoint from fork-choice's
+ *       lock-free snapshot. Loading the full state still depends on persisted
+ *       storage for that finalized root and may perform blocking I/O.
  */
 int http_finalized_state_ssz_cb(void *context, uint8_t **out_bytes, size_t *out_len)
 {
@@ -664,30 +640,19 @@ int http_finalized_state_ssz_cb(void *context, uint8_t **out_bytes, size_t *out_
         return LANTERN_HTTP_CB_ERR_INVALID_STATE;
     }
 
-    const bool expect_state_lock = client->state_lock_initialized;
-    bool state_locked = lantern_client_lock_state(client);
-    if (expect_state_lock && !state_locked)
+    if (!client->has_fork_choice)
     {
-        return LANTERN_HTTP_CB_ERR_LOCK_FAILED;
-    }
-
-    if (!client->has_state)
-    {
-        lantern_client_unlock_state(client, state_locked);
         return LANTERN_HTTP_CB_ERR_INVALID_STATE;
     }
 
-    LanternCheckpoint finalized = client->state.latest_finalized;
-    if (client->has_fork_choice)
+    LanternCheckpoint finalized;
+    if (!lantern_fork_choice_read_checkpoint_snapshot(
+            &client->fork_choice,
+            NULL,
+            &finalized))
     {
-        const LanternCheckpoint *fork_finalized =
-            lantern_fork_choice_latest_finalized(&client->fork_choice);
-        if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
-        {
-            finalized = *fork_finalized;
-        }
+        return LANTERN_HTTP_CB_ERR_INVALID_STATE;
     }
-    lantern_client_unlock_state(client, state_locked);
 
     if (lantern_root_is_zero(&finalized.root))
     {

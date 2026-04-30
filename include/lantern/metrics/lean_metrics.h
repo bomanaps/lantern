@@ -56,6 +56,7 @@ struct lean_metrics_snapshot {
     uint64_t finalizations_error_total;
     uint64_t block_building_success_total;
     uint64_t block_building_failures_total;
+    uint64_t gossip_validation_worker_count;
     uint64_t peer_connection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_CONN_RESULT_COUNT];
     uint64_t peer_disconnection_events_total[LEAN_METRICS_DIR_COUNT][LEAN_METRICS_DISCONNECT_REASON_COUNT];
     uint64_t state_transition_slots_processed_total;
@@ -75,6 +76,7 @@ struct lean_metrics_snapshot {
     struct lean_metrics_histogram_snapshot pq_sig_attestation_verification_time;
     struct lean_metrics_histogram_snapshot pq_sig_aggregated_signatures_building_time;
     struct lean_metrics_histogram_snapshot pq_sig_aggregated_signatures_verification_time;
+    struct lean_metrics_histogram_snapshot pq_sig_block_aggregated_signatures_verification_time;
     struct lean_metrics_histogram_snapshot committee_signatures_aggregation_time;
     struct lean_metrics_histogram_snapshot gossip_block_size_bytes;
     struct lean_metrics_histogram_snapshot gossip_attestation_size_bytes;
@@ -88,6 +90,7 @@ void lean_metrics_record_block_building_time(double seconds);
 void lean_metrics_record_attestations_production_time(double seconds);
 void lean_metrics_record_block_building_success(void);
 void lean_metrics_record_block_building_failure(void);
+void lean_metrics_set_gossip_validation_worker_count(size_t count);
 void lean_metrics_record_fork_choice_block_time(double seconds);
 void lean_metrics_record_fork_choice_reorg(size_t depth);
 void lean_metrics_record_attestation_validation(double seconds, bool valid);
@@ -101,6 +104,7 @@ void lean_metrics_record_pq_signature_verification(double seconds);
 void lean_metrics_record_pq_signature_verification_result(bool valid);
 void lean_metrics_record_pq_aggregated_signature_build(size_t attestation_count, double seconds);
 void lean_metrics_record_pq_aggregated_signature_verification(double seconds, bool valid);
+void lean_metrics_record_pq_block_aggregated_signatures_verification(double seconds);
 void lean_metrics_record_committee_signature_aggregation(double seconds, uint64_t aggregated_attestations);
 void lean_metrics_record_peer_connection(
     lean_metrics_direction_t direction,

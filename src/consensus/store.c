@@ -27,23 +27,10 @@ static void lantern_vote_record_reset(struct lantern_vote_record *record) {
     memset(record, 0, sizeof(*record));
 }
 
-static void fork_choice_votes_reset(struct lantern_fork_choice_vote_entry *entries, size_t count) {
-    if (!entries) {
-        return;
-    }
-    for (size_t i = 0; i < count; ++i) {
-        entries[i].has_checkpoint = false;
-        memset(&entries[i].checkpoint, 0, sizeof(entries[i].checkpoint));
-    }
-}
-
 static void sync_attached_fork_choice(LanternStore *store) {
     if (!store || !store->fork_choice) {
         return;
     }
-    store->fork_choice->known_votes = store->known_votes;
-    store->fork_choice->new_votes = store->new_votes;
-    store->fork_choice->validator_count = store->fork_choice_vote_count;
     store->fork_choice->new_aggregated_payloads = &store->new_aggregated_payloads;
     store->fork_choice->known_aggregated_payloads = &store->known_aggregated_payloads;
     store->fork_choice->attestation_data_by_root = &store->attestation_data_by_root;
@@ -53,9 +40,6 @@ static void detach_attached_fork_choice(LanternStore *store) {
     if (!store || !store->fork_choice) {
         return;
     }
-    store->fork_choice->known_votes = NULL;
-    store->fork_choice->new_votes = NULL;
-    store->fork_choice->validator_count = 0;
     store->fork_choice->new_aggregated_payloads = NULL;
     store->fork_choice->known_aggregated_payloads = NULL;
     store->fork_choice->attestation_data_by_root = NULL;
@@ -424,11 +408,6 @@ void lantern_store_reset(LanternStore *store) {
     free(store->validator_votes);
     store->validator_votes = NULL;
     store->validator_votes_len = 0;
-    free(store->known_votes);
-    store->known_votes = NULL;
-    free(store->new_votes);
-    store->new_votes = NULL;
-    store->fork_choice_vote_count = 0;
     attestation_signature_map_reset(&store->attestation_signatures);
     aggregated_payload_pool_reset(&store->new_aggregated_payloads);
     aggregated_payload_pool_reset(&store->known_aggregated_payloads);
@@ -579,43 +558,6 @@ void lantern_store_clear_validator_vote(LanternStore *store, size_t index) {
         return;
     }
     lantern_vote_record_reset(&store->validator_votes[index]);
-}
-
-int lantern_store_prepare_fork_choice_votes(LanternStore *store, uint64_t validator_count) {
-    if (!store || validator_count == 0) {
-        return -1;
-    }
-    if (validator_count > (uint64_t)LANTERN_VALIDATOR_REGISTRY_LIMIT || validator_count > SIZE_MAX) {
-        return -1;
-    }
-    size_t count = (size_t)validator_count;
-    if (store->known_votes && store->fork_choice_vote_count != count) {
-        free(store->known_votes);
-        store->known_votes = NULL;
-    }
-    if (store->new_votes && store->fork_choice_vote_count != count) {
-        free(store->new_votes);
-        store->new_votes = NULL;
-    }
-    if (!store->known_votes) {
-        store->known_votes = calloc(count, sizeof(*store->known_votes));
-        if (!store->known_votes) {
-            return -1;
-        }
-    }
-    if (!store->new_votes) {
-        store->new_votes = calloc(count, sizeof(*store->new_votes));
-        if (!store->new_votes) {
-            free(store->known_votes);
-            store->known_votes = NULL;
-            return -1;
-        }
-    }
-    fork_choice_votes_reset(store->known_votes, count);
-    fork_choice_votes_reset(store->new_votes, count);
-    store->fork_choice_vote_count = count;
-    sync_attached_fork_choice(store);
-    return 0;
 }
 
 int lantern_store_set_attestation_signature(

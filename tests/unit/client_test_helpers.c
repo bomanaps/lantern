@@ -186,8 +186,7 @@ static int client_test_setup_vote_validation_client_common(
     }
     client->has_state = true;
 
-    if (lantern_store_prepare_validator_votes(&client->store, (uint64_t)validator_count) != 0
-        || lantern_store_prepare_fork_choice_votes(&client->store, (uint64_t)validator_count) != 0) {
+    if (lantern_store_prepare_validator_votes(&client->store, (uint64_t)validator_count) != 0) {
         fprintf(stderr, "failed to prepare store caches for vote test\n");
         goto finish;
     }

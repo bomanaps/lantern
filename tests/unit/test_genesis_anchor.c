@@ -382,6 +382,126 @@ cleanup:
     return rc;
 }
 
+static int test_http_checkpoint_callbacks_do_not_take_state_lock(void)
+{
+    struct lantern_client client;
+    memset(&client, 0, sizeof(client));
+
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    LanternRoot anchor_root = {0};
+    LanternRoot child_root = {0};
+    char dir_template[] = "/tmp/lantern_http_checkpoint_snapshotXXXXXX";
+    char *data_dir = NULL;
+    uint8_t *state_bytes = NULL;
+    size_t state_len = 0;
+    bool state_locked = false;
+    int rc = 1;
+
+    if (client_test_setup_vote_validation_client(
+            &client,
+            "http_checkpoint_snapshot_regression",
+            &pub,
+            &secret,
+            &anchor_root,
+            &child_root)
+        != 0)
+    {
+        fprintf(stderr, "failed to set up HTTP checkpoint snapshot regression client\n");
+        goto cleanup;
+    }
+
+    LanternCheckpoint justified;
+    LanternCheckpoint finalized;
+    memset(&justified, 0, sizeof(justified));
+    memset(&finalized, 0, sizeof(finalized));
+    if (!lantern_fork_choice_read_checkpoint_snapshot(
+            &client.fork_choice,
+            &justified,
+            &finalized))
+    {
+        fprintf(stderr, "checkpoint snapshot was not initialized by fork choice setup\n");
+        goto cleanup;
+    }
+
+    char *temp_dir = mkdtemp(dir_template);
+    if (!temp_dir)
+    {
+        fprintf(stderr, "failed to create temp data dir for HTTP checkpoint snapshot regression\n");
+        goto cleanup;
+    }
+    data_dir = strdup(temp_dir);
+    if (!data_dir)
+    {
+        fprintf(stderr, "failed to copy temp data dir for HTTP checkpoint snapshot regression\n");
+        goto cleanup;
+    }
+    client.data_dir = data_dir;
+
+    if (lantern_storage_store_state_for_root(data_dir, &finalized.root, &client.state) != 0)
+    {
+        fprintf(stderr, "failed to store finalized state for HTTP checkpoint snapshot regression\n");
+        goto cleanup;
+    }
+
+    state_locked = lantern_client_lock_state(&client);
+    if (!state_locked)
+    {
+        fprintf(stderr, "failed to lock state for HTTP checkpoint snapshot regression\n");
+        goto cleanup;
+    }
+
+    struct lantern_http_head_snapshot head_snapshot;
+    memset(&head_snapshot, 0, sizeof(head_snapshot));
+    if (http_snapshot_head(&client, &head_snapshot) != LANTERN_HTTP_CB_OK)
+    {
+        fprintf(stderr, "http_snapshot_head should not need state_lock\n");
+        goto cleanup;
+    }
+    if (!roots_equal(&head_snapshot.justified.root, &justified.root)
+        || head_snapshot.justified.slot != justified.slot)
+    {
+        fprintf(stderr, "http_snapshot_head did not read the justified checkpoint snapshot\n");
+        goto cleanup;
+    }
+
+    if (http_finalized_state_ssz_cb(&client, &state_bytes, &state_len) != LANTERN_HTTP_CB_OK)
+    {
+        fprintf(stderr, "http_finalized_state_ssz_cb should not need state_lock\n");
+        goto cleanup;
+    }
+    if (!state_bytes || state_len == 0)
+    {
+        fprintf(stderr, "http finalized state callback returned empty state bytes\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (state_locked)
+    {
+        lantern_client_unlock_state(&client, state_locked);
+    }
+    free(state_bytes);
+    if (data_dir)
+    {
+        cleanup_storage_root_file(data_dir, "states", &finalized.root, "ssz");
+        cleanup_storage_root_file(data_dir, "states", &finalized.root, "meta");
+        char states_dir[PATH_MAX];
+        int states_written = snprintf(states_dir, sizeof(states_dir), "%s/states", data_dir);
+        if (states_written > 0 && (size_t)states_written < sizeof(states_dir))
+        {
+            cleanup_dir(states_dir);
+        }
+        cleanup_dir(data_dir);
+    }
+    client.data_dir = NULL;
+    free(data_dir);
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
 static int test_checkpoint_sync_parse_url_scheme_handling(void)
 {
     char *host = NULL;
@@ -1010,6 +1130,12 @@ int main(void)
     }
 
     if (test_checkpoint_consumers_use_fork_choice_store() != 0)
+    {
+        lantern_state_reset(&client.state);
+        lantern_fork_choice_reset(&client.fork_choice);
+        return 1;
+    }
+    if (test_http_checkpoint_callbacks_do_not_take_state_lock() != 0)
     {
         lantern_state_reset(&client.state);
         lantern_fork_choice_reset(&client.fork_choice);

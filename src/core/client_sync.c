@@ -782,17 +782,6 @@ int initialize_fork_choice(struct lantern_client *client)
      */
     lantern_store_attach_fork_choice(&client->store, &client->fork_choice);
     lantern_fork_choice_reset(&client->fork_choice);
-    if (lantern_store_prepare_fork_choice_votes(
-            &client->store,
-            client->state.config.num_validators)
-        != 0)
-    {
-        lantern_log_error(
-            "forkchoice",
-            &meta,
-            "failed to prepare fork choice votes");
-        return LANTERN_CLIENT_ERR_RUNTIME;
-    }
     if (lantern_fork_choice_configure(&client->fork_choice, &client->state.config) != 0)
     {
         lantern_log_error(

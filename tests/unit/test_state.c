@@ -324,11 +324,6 @@ static void setup_state_and_fork_choice(
 
     lantern_fork_choice_init(fork_choice);
     lantern_state_attach_fork_choice(state, fork_choice);
-    expect_zero(
-        lantern_store_prepare_fork_choice_votes(
-            lantern_test_state_store_ensure(state),
-            validator_count),
-        "prepare fork choice votes for setup");
     expect_zero(lantern_fork_choice_configure(fork_choice, &state->config), "configure fork choice for setup");
 
     LanternRoot state_root;
@@ -2616,11 +2611,6 @@ static int test_process_block_defers_proposer_attestation(void) {
     assert(store->attestation_signatures.length == 0u);
     assert(store->attestation_data_by_root.length == 0u);
 
-    assert(fork_choice.new_votes != NULL);
-    assert(fork_choice.known_votes != NULL);
-    assert(!fork_choice.new_votes[block->proposer_index].has_checkpoint);
-    assert(!fork_choice.known_votes[block->proposer_index].has_checkpoint);
-
     LanternRoot head;
     expect_zero(lantern_fork_choice_current_head(&fork_choice, &head), "fork choice head after proposer import");
     assert(memcmp(head.bytes, anchor_root.bytes, LANTERN_ROOT_SIZE) == 0);
@@ -3096,11 +3086,6 @@ static int test_select_block_parent_uses_fork_choice(void) {
     LanternForkChoice fork_choice;
     lantern_fork_choice_init(&fork_choice);
     lantern_state_attach_fork_choice(&state, &fork_choice);
-    expect_zero(
-        lantern_store_prepare_fork_choice_votes(
-            lantern_test_state_store_ensure(&state),
-            state.config.num_validators),
-        "prepare fork choice votes");
     expect_zero(lantern_fork_choice_configure(&fork_choice, &state.config), "configure fork choice");
     LanternRoot genesis_state_root;
     expect_zero(lantern_hash_tree_root_state(&state, &genesis_state_root), "hash genesis state root");

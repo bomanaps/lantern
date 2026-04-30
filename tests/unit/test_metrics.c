@@ -119,6 +119,7 @@ static int test_pq_signature_metrics(void) {
     lean_metrics_record_pq_aggregated_signature_build(4, 0.03);
     lean_metrics_record_pq_aggregated_signature_verification(0.04, true);
     lean_metrics_record_pq_aggregated_signature_verification(0.05, false);
+    lean_metrics_record_pq_block_aggregated_signatures_verification(0.06);
 
     struct lean_metrics_snapshot snapshot;
     memset(&snapshot, 0, sizeof(snapshot));
@@ -135,8 +136,10 @@ static int test_pq_signature_metrics(void) {
     assert(snapshot.pq_sig_attestation_verification_time.total == 1);
     assert(snapshot.pq_sig_aggregated_signatures_building_time.total == 1);
     assert(snapshot.pq_sig_aggregated_signatures_verification_time.total == 2);
+    assert(snapshot.pq_sig_block_aggregated_signatures_verification_time.total == 1);
     assert(snapshot.pq_sig_aggregated_signatures_building_time.bucket_count == 9);
     assert(snapshot.pq_sig_aggregated_signatures_verification_time.bucket_count == 9);
+    assert(snapshot.pq_sig_block_aggregated_signatures_verification_time.bucket_count == 9);
     return 0;
 }
 
@@ -175,11 +178,13 @@ static int test_prometheus_metric_names(void) {
     lean_metrics_record_pq_aggregated_signature_build(4, 0.25);
     lean_metrics_record_pq_aggregated_signature_verification(0.5, true);
     lean_metrics_record_pq_aggregated_signature_verification(0.75, false);
+    lean_metrics_record_pq_block_aggregated_signatures_verification(0.8);
     lean_metrics_record_committee_signature_aggregation(0.3, 3);
     lean_metrics_record_peer_connection(LEAN_METRICS_DIR_INBOUND, LEAN_METRICS_CONN_RESULT_SUCCESS);
     lean_metrics_record_peer_disconnection(
         LEAN_METRICS_DIR_OUTBOUND,
         LEAN_METRICS_DISCONNECT_REMOTE_CLOSE);
+    lean_metrics_set_gossip_validation_worker_count(8);
     lean_metrics_record_gossip_block_size(12000);
     lean_metrics_record_gossip_attestation_size(1024);
     lean_metrics_record_gossip_aggregation_size(4096);
@@ -229,11 +234,13 @@ static int test_prometheus_metric_names(void) {
         "lean_pq_sig_attestations_in_aggregated_signatures_total",
         "lean_pq_sig_aggregated_signatures_building_time_seconds",
         "lean_pq_sig_aggregated_signatures_verification_time_seconds",
+        "lean_pq_sig_block_aggregated_signatures_verification_time_seconds",
         "lean_block_aggregated_payloads",
         "lean_block_building_payload_aggregation_time_seconds",
         "lean_block_building_time_seconds",
         "lean_block_building_success_total",
         "lean_block_building_failures_total",
+        "lean_gossip_validation_worker_count",
         "lean_head_slot",
         "lean_current_slot",
         "lean_safe_target_slot",
@@ -276,6 +283,7 @@ static int test_prometheus_metric_names(void) {
 
     assert(strstr(body, "lean_node_info{name=\"lantern\"") != NULL);
     assert(strstr(body, "lean_connected_peers{client=\"lantern\"}") != NULL);
+    assert(strstr(body, "lean_gossip_validation_worker_count 8") != NULL);
     assert(strstr(body, "lean_finalizations_total{result=\"success\"}") != NULL);
     assert(strstr(body, "lean_finalizations_total{result=\"error\"}") != NULL);
     assert(strstr(body, "lean_committee_signatures_aggregation_time_seconds_bucket{le=\"2\"}") != NULL);

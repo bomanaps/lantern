@@ -826,15 +826,6 @@ static int test_record_vote_buffers_unknown_head(void) {
         goto cleanup;
     }
 
-    if (client.fork_choice.new_votes && client.fork_choice.validator_count > 0) {
-        for (size_t i = 0; i < client.fork_choice.validator_count; ++i) {
-            if (client.fork_choice.new_votes[i].has_checkpoint) {
-                fprintf(stderr, "unknown head vote updated fork choice new_votes\n");
-                goto cleanup;
-            }
-        }
-    }
-
     rc = 0;
 
 cleanup:
@@ -1023,15 +1014,6 @@ static int test_record_vote_rejects_slot_mismatch(void) {
         goto cleanup;
     }
 
-    if (client.fork_choice.new_votes && client.fork_choice.validator_count > 0) {
-        for (size_t i = 0; i < client.fork_choice.validator_count; ++i) {
-            if (client.fork_choice.new_votes[i].has_checkpoint) {
-                fprintf(stderr, "slot mismatch vote updated fork choice cache\n");
-                goto cleanup;
-            }
-        }
-    }
-
     rc = 0;
 
 cleanup:
@@ -1084,15 +1066,6 @@ static int test_record_vote_rejects_head_older_than_target(void) {
     if (lantern_store_validator_has_vote(&client.store, 0)) {
         fprintf(stderr, "head older than target vote should have been rejected\n");
         goto cleanup;
-    }
-
-    if (client.fork_choice.new_votes && client.fork_choice.validator_count > 0) {
-        for (size_t i = 0; i < client.fork_choice.validator_count; ++i) {
-            if (client.fork_choice.new_votes[i].has_checkpoint) {
-                fprintf(stderr, "head older than target vote updated fork choice cache\n");
-                goto cleanup;
-            }
-        }
     }
 
     rc = 0;
@@ -1808,20 +1781,6 @@ static int test_record_vote_defers_interval_pipeline(void) {
         goto cleanup;
     }
 
-    struct lantern_fork_choice_vote_entry *new_entry = client.fork_choice.new_votes;
-    struct lantern_fork_choice_vote_entry *known_entry = client.fork_choice.known_votes;
-    if (!new_entry || !known_entry) {
-        fprintf(stderr, "fork choice vote tables unavailable for interval pipeline test\n");
-        goto cleanup;
-    }
-    if (new_entry->has_checkpoint) {
-        fprintf(stderr, "gossip vote should not bypass aggregation via new_votes\n");
-        goto cleanup;
-    }
-    if (known_entry->has_checkpoint) {
-        fprintf(stderr, "known_votes updated before interval pipeline advanced\n");
-        goto cleanup;
-    }
     if (client.store.new_aggregated_payloads.length != 0
         || client.store.known_aggregated_payloads.length != 0) {
         fprintf(stderr, "aggregated payload pools should be empty before interval 2 aggregation\n");
@@ -1838,14 +1797,6 @@ static int test_record_vote_defers_interval_pipeline(void) {
         fprintf(stderr, "failed to advance fork choice to interval 1\n");
         goto cleanup;
     }
-    if (new_entry->has_checkpoint) {
-        fprintf(stderr, "new_votes updated before interval 2 aggregation\n");
-        goto cleanup;
-    }
-    if (known_entry->has_checkpoint) {
-        fprintf(stderr, "known_votes filled before interval 2\n");
-        goto cleanup;
-    }
     if (had_safe_before) {
         if (memcmp(client.fork_choice.safe_target.bytes, safe_before.bytes, LANTERN_ROOT_SIZE) != 0) {
             fprintf(stderr, "safe target changed during interval 1\n");
@@ -1855,14 +1806,6 @@ static int test_record_vote_defers_interval_pipeline(void) {
 
     if (advance_client_fork_choice_intervals(&client, 1, false) != 0) {
         fprintf(stderr, "failed to advance fork choice to interval 2\n");
-        goto cleanup;
-    }
-    if (new_entry->has_checkpoint) {
-        fprintf(stderr, "new_votes updated before local aggregation proof exists\n");
-        goto cleanup;
-    }
-    if (known_entry->has_checkpoint) {
-        fprintf(stderr, "known_votes filled before interval 3\n");
         goto cleanup;
     }
     client.validator_duty.slot_attested = true;
@@ -1895,35 +1838,20 @@ static int test_record_vote_defers_interval_pipeline(void) {
         fprintf(stderr, "safe target did not reflect gossip vote after interval 3\n");
         goto cleanup;
     }
-    if (new_entry->has_checkpoint) {
-        fprintf(stderr, "new_votes should stay empty until proof acceptance\n");
-        goto cleanup;
-    }
-    if (known_entry->has_checkpoint) {
-        fprintf(stderr, "known_votes filled before interval 4\n");
-        goto cleanup;
-    }
 
     if (advance_client_fork_choice_intervals(&client, 1, false) != 0) {
         fprintf(stderr, "failed to advance fork choice to interval 4\n");
         goto cleanup;
     }
-    if (!known_entry->has_checkpoint) {
-        fprintf(stderr, "known_votes missing checkpoint after interval 4\n");
-        goto cleanup;
-    }
-    if (known_entry->checkpoint.slot != vote.data.target.slot
-        || memcmp(known_entry->checkpoint.root.bytes, child_root.bytes, LANTERN_ROOT_SIZE) != 0) {
-        fprintf(stderr, "known_votes checkpoint mismatch after interval 4\n");
-        goto cleanup;
-    }
-    if (new_entry->has_checkpoint) {
-        fprintf(stderr, "new_votes retained checkpoint after migration\n");
-        goto cleanup;
-    }
     if (client.store.new_aggregated_payloads.length != 0
         || client.store.known_aggregated_payloads.length != 1) {
         fprintf(stderr, "aggregated payload pools diverged after interval 4\n");
+        goto cleanup;
+    }
+    LanternRoot head_after_accept;
+    if (lantern_fork_choice_current_head(&client.fork_choice, &head_after_accept) != 0
+        || memcmp(head_after_accept.bytes, child_root.bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "head did not update from known aggregated payloads after interval 4\n");
         goto cleanup;
     }
 
@@ -2010,28 +1938,34 @@ static int test_skip_fork_choice_intervals_replays_interval_side_effects(void) {
         fprintf(stderr, "unexpected initial interval %" PRIu64 " for skip replay test\n", client.fork_choice.time_intervals);
         goto cleanup;
     }
-    if (!client.fork_choice.new_votes || !client.fork_choice.known_votes) {
-        fprintf(stderr, "fork choice vote tables unavailable for skip replay test\n");
-        goto cleanup;
-    }
-    client.fork_choice.new_aggregated_payloads = NULL;
-    client.fork_choice.known_aggregated_payloads = NULL;
-    client.fork_choice.attestation_data_by_root = NULL;
-
     LanternSignedVote vote;
     memset(&vote, 0, sizeof(vote));
     if (make_signed_vote_for_validator(&client, secret, 0u, &anchor_root, &child_root, &vote) != 0) {
         fprintf(stderr, "failed to build signed vote for skip replay test\n");
         goto cleanup;
     }
-    if (lantern_fork_choice_add_vote(&client.fork_choice, &vote, false) != 0) {
-        fprintf(stderr, "failed to stage fork choice vote for skip replay test\n");
+    LanternRoot data_root;
+    if (lantern_hash_tree_root_attestation_data(&vote.data.data, &data_root) != 0) {
+        fprintf(stderr, "failed to hash skip replay vote data\n");
         goto cleanup;
     }
-    if (!client.fork_choice.new_votes[0].has_checkpoint || client.fork_choice.known_votes[0].has_checkpoint) {
-        fprintf(stderr, "skip replay test did not stage vote in new_votes as expected\n");
+    LanternAggregatedSignatureProof proof;
+    if (test_make_dummy_proof(&proof, vote.data.validator_id, 0xA6) != 0) {
+        fprintf(stderr, "failed to build skip replay proof\n");
         goto cleanup;
     }
+    if (lantern_client_add_new_aggregated_payload(
+            &client,
+            &data_root,
+            &vote.data.data,
+            &proof,
+            vote.data.target.slot)
+        != 0) {
+        lantern_aggregated_signature_proof_reset(&proof);
+        fprintf(stderr, "failed to stage skip replay aggregated payload\n");
+        goto cleanup;
+    }
+    lantern_aggregated_signature_proof_reset(&proof);
 
     if (lantern_client_skip_fork_choice_intervals_locked(&client, 4u) != 0) {
         fprintf(stderr, "skip replay helper failed to advance intervals\n");
@@ -2047,18 +1981,9 @@ static int test_skip_fork_choice_intervals_replays_interval_side_effects(void) {
         fprintf(stderr, "skip replay helper did not update safe target at skipped interval 3\n");
         goto cleanup;
     }
-    if (!client.fork_choice.known_votes[0].has_checkpoint
-        || client.fork_choice.known_votes[0].slot != vote.data.slot
-        || memcmp(
-               client.fork_choice.known_votes[0].checkpoint.root.bytes,
-               child_root.bytes,
-               LANTERN_ROOT_SIZE)
-            != 0) {
-        fprintf(stderr, "skip replay helper did not accept votes at skipped interval 4\n");
-        goto cleanup;
-    }
-    if (client.fork_choice.new_votes[0].has_checkpoint) {
-        fprintf(stderr, "skip replay helper left pending vote entries after skipped interval 4\n");
+    if (client.store.new_aggregated_payloads.length != 0
+        || client.store.known_aggregated_payloads.length != 1) {
+        fprintf(stderr, "skip replay helper did not promote payload at skipped interval 4\n");
         goto cleanup;
     }
 

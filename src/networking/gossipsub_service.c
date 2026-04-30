@@ -1,3 +1,7 @@
+#ifndef _DARWIN_C_SOURCE
+#define _DARWIN_C_SOURCE
+#endif
+
 #include "lantern/networking/gossipsub_service.h"
 
 #include <limits.h>
@@ -6,9 +10,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
 
 #include "lantern/consensus/ssz.h"
 #include "lantern/encoding/snappy.h"
+#include "lantern/metrics/lean_metrics.h"
 #include "lantern/networking/gossip.h"
 #include "lantern/networking/gossip_payloads.h"
 #include "lantern/storage/storage.h"
@@ -33,7 +39,8 @@
 #define LANTERN_LEANSPEC_SECONDS_PER_SLOT 4u
 #define LANTERN_LEANSPEC_JUSTIFICATION_LOOKBACK 3u
 #define LANTERN_LEANSPEC_SEEN_TTL_FACTOR 2u
-#define LANTERN_GOSSIPSUB_VALIDATION_WORKER_COUNT 4u
+#define LANTERN_GOSSIPSUB_VALIDATION_WORKER_FALLBACK 4u
+#define LANTERN_GOSSIPSUB_VALIDATION_WORKER_MAX 64u
 #define LANTERN_GOSSIPSUB_VALIDATION_QUEUE_CAPACITY 128u
 
 static const char *const k_leanspec_gossipsub_protocols[] = {
@@ -126,6 +133,17 @@ static uint32_t lantern_leanspec_seen_ttl_ms(void) {
         * (uint64_t)LANTERN_LEANSPEC_SEEN_TTL_FACTOR;
     const uint64_t ttl_ms = ttl_seconds * 1000u;
     return ttl_ms > UINT32_MAX ? UINT32_MAX : (uint32_t)ttl_ms;
+}
+
+static size_t lantern_gossipsub_validation_worker_count(void) {
+    long processors = sysconf(_SC_NPROCESSORS_ONLN);
+    if (processors <= 0) {
+        return LANTERN_GOSSIPSUB_VALIDATION_WORKER_FALLBACK;
+    }
+    if ((unsigned long)processors > LANTERN_GOSSIPSUB_VALIDATION_WORKER_MAX) {
+        return LANTERN_GOSSIPSUB_VALIDATION_WORKER_MAX;
+    }
+    return (size_t)processors;
 }
 
 static size_t bitlist_encoded_size_bits(size_t bit_length) {
@@ -877,7 +895,7 @@ static int lantern_gossipsub_validation_pool_start(struct lantern_gossipsub_serv
         return -1;
     }
     pool->service = service;
-    pool->worker_count = LANTERN_GOSSIPSUB_VALIDATION_WORKER_COUNT;
+    pool->worker_count = lantern_gossipsub_validation_worker_count();
     pool->queue_capacity = LANTERN_GOSSIPSUB_VALIDATION_QUEUE_CAPACITY;
     pool->threads = calloc(pool->worker_count, sizeof(*pool->threads));
     pool->queue = calloc(pool->queue_capacity, sizeof(*pool->queue));
@@ -920,6 +938,7 @@ static int lantern_gossipsub_validation_pool_start(struct lantern_gossipsub_serv
 
     pool->started = 1;
     service->validation_pool = pool;
+    lean_metrics_set_gossip_validation_worker_count(pool->worker_count);
     return 0;
 }
 

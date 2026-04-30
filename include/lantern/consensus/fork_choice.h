@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 #include "lantern/consensus/containers.h"
 #include "lantern/consensus/state.h"
@@ -11,12 +12,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-struct lantern_fork_choice_vote_entry {
-    bool has_checkpoint;
-    LanternCheckpoint checkpoint;
-    uint64_t slot;
-};
 
 struct lantern_aggregated_payload_pool;
 struct lantern_attestation_data_by_root;
@@ -43,6 +38,14 @@ struct lantern_fork_choice_root_index_entry {
     bool tombstone;
 };
 
+struct lantern_fork_choice_checkpoint_snapshot {
+    atomic_uint_fast64_t sequence;
+    atomic_uint_fast64_t justified_slot;
+    atomic_uchar justified_root[LANTERN_ROOT_SIZE];
+    atomic_uint_fast64_t finalized_slot;
+    atomic_uchar finalized_root[LANTERN_ROOT_SIZE];
+};
+
 typedef struct lantern_fork_choice {
     bool initialized;
     bool has_anchor;
@@ -55,6 +58,7 @@ typedef struct lantern_fork_choice {
     uint64_t time_intervals;
     LanternCheckpoint latest_justified;
     LanternCheckpoint latest_finalized;
+    struct lantern_fork_choice_checkpoint_snapshot checkpoint_snapshot;
     LanternRoot head;
     bool has_head;
     LanternRoot safe_target;
@@ -71,8 +75,6 @@ typedef struct lantern_fork_choice {
     size_t index_cap;
     size_t index_len;
 
-    struct lantern_fork_choice_vote_entry *known_votes;
-    struct lantern_fork_choice_vote_entry *new_votes;
     size_t validator_count;
 
     /*
@@ -139,11 +141,6 @@ int lantern_fork_choice_add_block_with_state(
     const LanternRoot *block_root_hint,
     const LanternState *post_state);
 
-int lantern_fork_choice_add_vote(
-    LanternForkChoice *store,
-    const LanternSignedVote *vote,
-    bool from_block);
-
 int lantern_fork_choice_update_checkpoints(
     LanternForkChoice *store,
     const LanternCheckpoint *latest_justified,
@@ -165,7 +162,7 @@ int lantern_fork_choice_restore_checkpoints(
     const LanternCheckpoint *latest_finalized);
 int lantern_fork_choice_prune_states(LanternForkChoice *store);
 
-int lantern_fork_choice_accept_new_votes(LanternForkChoice *store);
+int lantern_fork_choice_accept_new_aggregated_payloads(LanternForkChoice *store);
 int lantern_fork_choice_update_safe_target(LanternForkChoice *store);
 int lantern_fork_choice_recompute_head(LanternForkChoice *store);
 
@@ -196,6 +193,10 @@ const LanternRoot *lantern_fork_choice_anchor_root(const LanternForkChoice *stor
 int lantern_fork_choice_anchor_slot(const LanternForkChoice *store, uint64_t *out_slot);
 const LanternCheckpoint *lantern_fork_choice_latest_justified(const LanternForkChoice *store);
 const LanternCheckpoint *lantern_fork_choice_latest_finalized(const LanternForkChoice *store);
+bool lantern_fork_choice_read_checkpoint_snapshot(
+    const LanternForkChoice *store,
+    LanternCheckpoint *out_justified,
+    LanternCheckpoint *out_finalized);
 const LanternRoot *lantern_fork_choice_safe_target(const LanternForkChoice *store);
 void lantern_fork_choice_tree_snapshot_reset(struct lantern_fork_choice_tree_snapshot *snapshot);
 int lantern_fork_choice_snapshot_tree(
