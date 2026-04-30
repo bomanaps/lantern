@@ -39,23 +39,34 @@ struct lantern_block_attestation_signature_job {
     bool valid;
 };
 
-struct lantern_block_attestation_signature_worker_ctx {
+struct lantern_block_attestation_signature_pool {
     pthread_mutex_t mutex;
+    pthread_cond_t work_available;
+    pthread_cond_t batch_done;
+    pthread_t *threads;
+    size_t worker_count;
     struct lantern_block_attestation_signature_job *jobs;
     size_t job_count;
     size_t next_job;
+    size_t in_progress;
+    bool active;
     bool failed;
+    bool stopping;
+    bool started;
+    bool start_failed;
+};
+
+static struct lantern_block_attestation_signature_pool block_signature_pool = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .work_available = PTHREAD_COND_INITIALIZER,
+    .batch_done = PTHREAD_COND_INITIALIZER,
 };
 
 static void record_attestation_validation_metric(double start_seconds, bool valid) {
     lean_metrics_record_attestation_validation(lantern_time_now_seconds() - start_seconds, valid);
 }
 
-static size_t block_signature_worker_count(size_t job_count) {
-    if (job_count <= 1u) {
-        return job_count;
-    }
-
+static size_t block_signature_cpu_worker_count(void) {
     long processors = -1;
 #ifdef _SC_NPROCESSORS_ONLN
     processors = sysconf(_SC_NPROCESSORS_ONLN);
@@ -67,6 +78,15 @@ static size_t block_signature_worker_count(size_t job_count) {
     if (workers > LANTERN_BLOCK_SIGNATURE_WORKER_MAX) {
         workers = LANTERN_BLOCK_SIGNATURE_WORKER_MAX;
     }
+    return workers == 0u ? 1u : workers;
+}
+
+static size_t block_signature_worker_count(size_t job_count) {
+    if (job_count <= 1u) {
+        return job_count;
+    }
+
+    size_t workers = block_signature_cpu_worker_count();
     if (workers > job_count) {
         workers = job_count;
     }
@@ -85,36 +105,122 @@ static void block_attestation_signature_jobs_reset(
     free(jobs);
 }
 
-static void *block_attestation_signature_worker(void *arg) {
-    struct lantern_block_attestation_signature_worker_ctx *ctx = arg;
-    if (!ctx) {
-        return NULL;
-    }
+static void *block_attestation_signature_pool_worker(void *arg) {
+    (void)arg;
+    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
 
+    pthread_mutex_lock(&pool->mutex);
     for (;;) {
-        pthread_mutex_lock(&ctx->mutex);
-        if (ctx->failed || ctx->next_job >= ctx->job_count) {
-            pthread_mutex_unlock(&ctx->mutex);
+        while (!pool->stopping
+            && (!pool->active || pool->failed || pool->next_job >= pool->job_count)) {
+            pthread_cond_wait(&pool->work_available, &pool->mutex);
+        }
+        if (pool->stopping) {
             break;
         }
-        size_t index = ctx->next_job++;
-        pthread_mutex_unlock(&ctx->mutex);
 
-        struct lantern_block_attestation_signature_job *job = &ctx->jobs[index];
+        size_t index = pool->next_job++;
+        pool->in_progress++;
+        struct lantern_block_attestation_signature_job *job = &pool->jobs[index];
+        pthread_mutex_unlock(&pool->mutex);
+
         job->valid = lantern_signature_verify_aggregated(
             job->pubkeys,
             job->pubkey_count,
             &job->message,
             job->proof,
             job->epoch);
+
+        pthread_mutex_lock(&pool->mutex);
         if (!job->valid) {
-            pthread_mutex_lock(&ctx->mutex);
-            ctx->failed = true;
-            pthread_mutex_unlock(&ctx->mutex);
+            pool->failed = true;
+        }
+        pool->in_progress--;
+        if ((pool->failed || pool->next_job >= pool->job_count) && pool->in_progress == 0u) {
+            pool->active = false;
+            pthread_cond_broadcast(&pool->work_available);
+            pthread_cond_signal(&pool->batch_done);
         }
     }
-
+    pthread_mutex_unlock(&pool->mutex);
     return NULL;
+}
+
+static int block_signature_pool_start(void) {
+    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
+    pthread_mutex_lock(&pool->mutex);
+    if (pool->started) {
+        pthread_mutex_unlock(&pool->mutex);
+        return 0;
+    }
+    if (pool->start_failed) {
+        pthread_mutex_unlock(&pool->mutex);
+        return -1;
+    }
+
+    pool->worker_count = block_signature_cpu_worker_count();
+    pool->threads = calloc(pool->worker_count, sizeof(*pool->threads));
+    if (!pool->threads) {
+        pool->start_failed = true;
+        pthread_mutex_unlock(&pool->mutex);
+        return -1;
+    }
+
+    size_t started = 0u;
+    for (; started < pool->worker_count; ++started) {
+        if (pthread_create(&pool->threads[started], NULL, block_attestation_signature_pool_worker, NULL) != 0) {
+            break;
+        }
+    }
+    if (started != pool->worker_count) {
+        pool->stopping = true;
+        pthread_cond_broadcast(&pool->work_available);
+        pthread_mutex_unlock(&pool->mutex);
+        for (size_t i = 0; i < started; ++i) {
+            pthread_join(pool->threads[i], NULL);
+        }
+        pthread_mutex_lock(&pool->mutex);
+        free(pool->threads);
+        pool->threads = NULL;
+        pool->worker_count = 0u;
+        pool->stopping = false;
+        pool->start_failed = true;
+        pthread_mutex_unlock(&pool->mutex);
+        return -1;
+    }
+
+    pool->started = true;
+    pthread_mutex_unlock(&pool->mutex);
+    return 0;
+}
+
+static int verify_block_attestation_signature_jobs_pooled(
+    struct lantern_block_attestation_signature_job *jobs,
+    size_t job_count) {
+    if (block_signature_pool_start() != 0) {
+        return -1;
+    }
+
+    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
+    pthread_mutex_lock(&pool->mutex);
+    while (pool->active) {
+        pthread_cond_wait(&pool->batch_done, &pool->mutex);
+    }
+
+    pool->jobs = jobs;
+    pool->job_count = job_count;
+    pool->next_job = 0u;
+    pool->in_progress = 0u;
+    pool->failed = false;
+    pool->active = true;
+    pthread_cond_broadcast(&pool->work_available);
+    while (pool->active) {
+        pthread_cond_wait(&pool->batch_done, &pool->mutex);
+    }
+    pool->jobs = NULL;
+    pool->job_count = 0u;
+    pthread_mutex_unlock(&pool->mutex);
+    return 0;
 }
 
 static void verify_block_attestation_signature_jobs_serial(
@@ -147,29 +253,10 @@ static int verify_block_attestation_signature_jobs(
     size_t worker_count = block_signature_worker_count(job_count);
     if (worker_count <= 1u) {
         verify_block_attestation_signature_jobs_serial(jobs, job_count);
+    } else if (verify_block_attestation_signature_jobs_pooled(jobs, job_count) == 0) {
+        /* Pooled verification completed. */
     } else {
-        struct lantern_block_attestation_signature_worker_ctx ctx = {
-            .jobs = jobs,
-            .job_count = job_count,
-        };
-        pthread_t *threads = calloc(worker_count - 1u, sizeof(*threads));
-        if (!threads || pthread_mutex_init(&ctx.mutex, NULL) != 0) {
-            free(threads);
-            verify_block_attestation_signature_jobs_serial(jobs, job_count);
-        } else {
-            size_t started = 0u;
-            for (; started < worker_count - 1u; ++started) {
-                if (pthread_create(&threads[started], NULL, block_attestation_signature_worker, &ctx) != 0) {
-                    break;
-                }
-            }
-            block_attestation_signature_worker(&ctx);
-            for (size_t i = 0; i < started; ++i) {
-                pthread_join(threads[i], NULL);
-            }
-            pthread_mutex_destroy(&ctx.mutex);
-            free(threads);
-        }
+        verify_block_attestation_signature_jobs_serial(jobs, job_count);
     }
 
     lean_metrics_record_pq_block_aggregated_signatures_verification(
