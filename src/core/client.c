@@ -3529,11 +3529,15 @@ static void shutdown_pending_blocks(struct lantern_client *client)
         if (pthread_mutex_lock(&client->pending_lock) == 0)
         {
             pending_block_list_reset(&client->pending_blocks);
+            free(client->backfill.entries);
+            memset(&client->backfill, 0, sizeof(client->backfill));
             pthread_mutex_unlock(&client->pending_lock);
         }
         else
         {
             pending_block_list_reset(&client->pending_blocks);
+            free(client->backfill.entries);
+            memset(&client->backfill, 0, sizeof(client->backfill));
         }
         pthread_mutex_destroy(&client->pending_lock);
         client->pending_lock_initialized = false;
@@ -3541,6 +3545,8 @@ static void shutdown_pending_blocks(struct lantern_client *client)
     else
     {
         pending_block_list_reset(&client->pending_blocks);
+        free(client->backfill.entries);
+        memset(&client->backfill, 0, sizeof(client->backfill));
     }
 }
 

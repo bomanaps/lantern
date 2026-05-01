@@ -81,4 +81,16 @@ if [[ -n "${LANTERN_EXTRA_ARGS:-}" ]]; then
 fi
 
 
+if [[ "${LANTERN_PROFILE_HEAPTRACK:-}" == "true" ]]; then
+    if ! command -v heaptrack >/dev/null 2>&1; then
+        echo "LANTERN_PROFILE_HEAPTRACK=true but heaptrack is not installed; rebuild image with INCLUDE_HEAPTRACK=true" >&2
+        exit 1
+    fi
+    HEAPTRACK_OUT_DIR="${LANTERN_HEAPTRACK_DIR:-${DATA_DIR}/heaptrack}"
+    mkdir -p "${HEAPTRACK_OUT_DIR}"
+    HEAPTRACK_OUT_PREFIX="${HEAPTRACK_OUT_DIR}/heaptrack.${NODE_ID}.$(date -u +%Y%m%dT%H%M%SZ)"
+    echo "Launching lantern under heaptrack: trace prefix ${HEAPTRACK_OUT_PREFIX}" >&2
+    exec heaptrack -o "${HEAPTRACK_OUT_PREFIX}" /opt/lantern/bin/lantern "${args[@]}"
+fi
+
 exec /opt/lantern/bin/lantern "${args[@]}"
