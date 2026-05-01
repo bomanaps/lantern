@@ -56,16 +56,16 @@ WORKDIR /usr/src/lantern
 COPY . .
 
 RUN LANTERN_BOOTSTRAP_SKIP_SUBMODULE_SYNC=1 ./scripts/bootstrap.sh
-
-RUN echo "LANTERN_RUST_PROFILE=${LANTERN_RUST_PROFILE}"
+RUN if [ "${LANTERN_RUST_PROFILE}" = "1" ]; then \
+        printf '[target."cfg(target_arch = \\"x86_64\\")"]\nrustflags = ["-C", "target-cpu=x86-64-v3", "-C", "force-frame-pointers=yes", "-C", "debuginfo=2"]\n' > external/c-leanvm-xmss/.cargo/config.toml; \
+    fi \
+    && echo "LANTERN_RUST_PROFILE=${LANTERN_RUST_PROFILE}" \
+    && cat external/c-leanvm-xmss/.cargo/config.toml
 
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked,id=cargo-git-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/src/lantern/external/c-leanvm-xmss/target,sharing=locked,id=leanvm-xmss-target-${TARGETPLATFORM}-${LANTERN_RUST_PROFILE} \
     cd external/c-leanvm-xmss \
-    && if [ "${LANTERN_RUST_PROFILE}" = "1" ]; then \
-        export RUSTFLAGS="-C target-cpu=x86-64-v3 -C force-frame-pointers=yes -C debuginfo=2"; \
-       fi \
     && cargo build --release --locked \
     && find target/release -name '*.a' -exec ranlib {} \;
 
