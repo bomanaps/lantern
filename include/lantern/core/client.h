@@ -184,6 +184,7 @@ struct lantern_local_validator {
     bool has_secret;
     struct PQSignatureSchemeSecretKey *attestation_secret_key;
     struct PQSignatureSchemeSecretKey *proposal_secret_key;
+    char *proposal_secret_path;
     bool has_attestation_secret_handle;
     bool has_proposal_secret_handle;
     uint64_t last_proposed_slot;
