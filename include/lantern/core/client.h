@@ -314,10 +314,8 @@ lantern_client_error lantern_init(
     struct lantern_client *client,
     const struct lantern_client_options *options);
 void lantern_shutdown(struct lantern_client *client);
-
-int lantern_client_attestation_subnet_for_validator(
+int lantern_client_aggregation_subnet_id(
     const struct lantern_client *client,
-    uint64_t validator_index,
     size_t *out_subnet_id);
 
 /**

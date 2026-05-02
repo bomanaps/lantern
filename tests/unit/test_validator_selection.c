@@ -112,32 +112,26 @@ int main(void) {
         fprintf(stderr, "unexpected range for lantern_6\n");
         goto cleanup;
     }
-    if (!lantern6->has_subnet || lantern6->subnet != 1) {
-        fprintf(stderr, "lantern_6 subnet was not parsed\n");
+    if (!lantern6->enr.is_aggregator || !lantern6->has_subnet || lantern6->subnet != 1) {
+        fprintf(stderr, "lantern_6 aggregator subnet was not parsed\n");
         goto cleanup;
     }
 
     struct lantern_client client;
     memset(&client, 0, sizeof(client));
-    client.genesis.validator_config = artifacts.validator_config;
+    client.assigned_validators = lantern6;
     client.genesis.chain_config = artifacts.chain_config;
     size_t subnet_id = 0;
-    if (lantern_client_attestation_subnet_for_validator(&client, 6, &subnet_id) != 0
-        || subnet_id != 1) {
-        fprintf(stderr, "explicit subnet was not used for lantern_6\n");
+    if (lantern_client_aggregation_subnet_id(&client, &subnet_id) != 0 || subnet_id != 1) {
+        fprintf(stderr, "configured aggregator subnet was not used\n");
         goto cleanup;
     }
-    if (lantern_client_attestation_subnet_for_validator(&client, 0, &subnet_id) != 0
-        || subnet_id != 0) {
-        fprintf(stderr, "fallback subnet mismatch for ream_0\n");
+    lantern6->enr.is_aggregator = false;
+    if (lantern_client_aggregation_subnet_id(&client, &subnet_id) != 0 || subnet_id != 0) {
+        fprintf(stderr, "non-aggregator subnet should use validator index modulo committee count\n");
         goto cleanup;
     }
-    if (lantern_client_attestation_subnet_for_validator(&client, 1, &subnet_id) != 0
-        || subnet_id != 1) {
-        fprintf(stderr, "explicit subnets did not expand fallback committee count\n");
-        goto cleanup;
-    }
-
+    lantern6->enr.is_aggregator = true;
     if (lantern_validator_config_apply_assignments(
             &artifacts.validator_config,
             annotated_path,
