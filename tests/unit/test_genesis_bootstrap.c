@@ -175,8 +175,17 @@ int main(void) {
     if (!lantern_entry
         || lantern_entry->enr.quic_port != 9000
         || lantern_entry->count != 1
-        || lantern_entry->enr.is_aggregator) {
+        || !lantern_entry->enr.is_aggregator
+        || !lantern_entry->has_subnet
+        || lantern_entry->subnet != 1u) {
         fprintf(stderr, "validator config entry mismatch for lantern_6\n");
+        goto cleanup;
+    }
+    struct lantern_validator_config_entry *ream_entry = lantern_validator_config_find(
+        &artifacts.validator_config,
+        "ream_0");
+    if (!ream_entry || ream_entry->enr.is_aggregator || ream_entry->has_subnet) {
+        fprintf(stderr, "validator config entry mismatch for ream_0 defaults\n");
         goto cleanup;
     }
     if (lantern_state_generate_genesis(

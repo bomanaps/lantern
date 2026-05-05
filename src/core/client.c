@@ -263,6 +263,48 @@ static int fork_choice_target_interval(
     return 0;
 }
 
+static bool interval_range_first_with_phase(
+    uint64_t start,
+    uint64_t end,
+    uint64_t intervals_per_slot,
+    uint64_t phase,
+    uint64_t *out_interval) {
+    if (intervals_per_slot == 0u || phase >= intervals_per_slot || start > end) {
+        return false;
+    }
+    uint64_t distance = end - start;
+    uint64_t remainder = start % intervals_per_slot;
+    uint64_t offset = (phase + intervals_per_slot - remainder) % intervals_per_slot;
+    if (offset > distance) {
+        return false;
+    }
+    if (out_interval) {
+        *out_interval = start + offset;
+    }
+    return true;
+}
+
+static bool interval_range_last_with_phase(
+    uint64_t start,
+    uint64_t end,
+    uint64_t intervals_per_slot,
+    uint64_t phase,
+    uint64_t *out_interval) {
+    if (intervals_per_slot == 0u || phase >= intervals_per_slot || start > end) {
+        return false;
+    }
+    uint64_t distance = end - start;
+    uint64_t remainder = end % intervals_per_slot;
+    uint64_t offset = (remainder + intervals_per_slot - phase) % intervals_per_slot;
+    if (offset > distance) {
+        return false;
+    }
+    if (out_interval) {
+        *out_interval = end - offset;
+    }
+    return true;
+}
+
 int lantern_client_set_attestation_signature(
     struct lantern_client *client,
     const LanternSignatureKey *key,
@@ -365,44 +407,73 @@ int lantern_client_skip_fork_choice_intervals_locked(
     if (intervals_per_slot == 0u || target_interval == previous_intervals) {
         return 0;
     }
-    for (uint64_t step = previous_intervals + 1u;; ++step) {
-        uint64_t phase = step % intervals_per_slot;
-        if (phase == 3u) {
-            size_t new_before = client->store.new_aggregated_payloads.length;
-            size_t known_before = client->store.known_aggregated_payloads.length;
-            if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
-                return -1;
-            }
-            log_aggregated_payload_interval_transition(
-                client,
-                "skip_safe_target",
-                step,
-                phase,
-                new_before,
-                known_before,
-                0u);
-        } else if (phase == 4u) {
-            size_t new_before = client->store.new_aggregated_payloads.length;
-            size_t known_before = client->store.known_aggregated_payloads.length;
-            if (lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
-                return -1;
-            }
-            size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
-            if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
-                return -1;
-            }
-            log_aggregated_payload_interval_transition(
-                client,
-                "skip_accept_new",
-                step,
-                phase,
-                new_before,
-                known_before,
-                promoted);
+
+    uint64_t start_interval = previous_intervals + 1u;
+    uint64_t first_accept_interval = 0u;
+    uint64_t last_safe_interval = 0u;
+    bool has_accept = interval_range_first_with_phase(
+        start_interval,
+        target_interval,
+        intervals_per_slot,
+        4u,
+        &first_accept_interval);
+    bool has_safe = interval_range_last_with_phase(
+        start_interval,
+        target_interval,
+        intervals_per_slot,
+        3u,
+        &last_safe_interval);
+
+    if (has_safe && (!has_accept || last_safe_interval < first_accept_interval)) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
+            return -1;
         }
-        if (step == target_interval) {
-            break;
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_safe_target",
+            last_safe_interval,
+            last_safe_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            0u);
+    }
+
+    if (has_accept) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+            return -1;
         }
+        size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
+        if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+            return -1;
+        }
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_accept_new",
+            first_accept_interval,
+            first_accept_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            promoted);
+    }
+
+    if (has_safe && has_accept && last_safe_interval > first_accept_interval) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
+            return -1;
+        }
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_safe_target",
+            last_safe_interval,
+            last_safe_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            0u);
     }
     return 0;
 }
@@ -873,80 +944,60 @@ size_t lantern_client_attestation_committee_count(const struct lantern_client *c
     {
         return LANTERN_DEFAULT_ATTESTATION_COMMITTEE_COUNT;
     }
-    size_t count = LANTERN_DEFAULT_ATTESTATION_COMMITTEE_COUNT;
     if (client->debug_attestation_committee_count > 0)
     {
-        count = client->debug_attestation_committee_count;
+        return client->debug_attestation_committee_count;
     }
-    else if (client->genesis.chain_config.attestation_committee_count > 0)
+    if (client->genesis.chain_config.attestation_committee_count > 0)
     {
-        count = (size_t)client->genesis.chain_config.attestation_committee_count;
+        return (size_t)client->genesis.chain_config.attestation_committee_count;
     }
-    const struct lantern_validator_config *config = &client->genesis.validator_config;
-    for (size_t i = 0; i < config->count; ++i)
-    {
-        const struct lantern_validator_config_entry *entry = &config->entries[i];
-        if (entry->has_subnet && entry->subnet < SIZE_MAX)
-        {
-            size_t required_count = (size_t)entry->subnet + 1u;
-            if (required_count > count)
-            {
-                count = required_count;
-            }
-        }
-    }
-    return count;
+    return LANTERN_DEFAULT_ATTESTATION_COMMITTEE_COUNT;
 }
 
-static const struct lantern_validator_config_entry *client_validator_entry_for_index(
+int lantern_client_aggregation_subnet_id(
     const struct lantern_client *client,
-    uint64_t validator_index)
-{
-    if (!client || !client->genesis.validator_config.entries)
-    {
-        return NULL;
-    }
-    const struct lantern_validator_config *config = &client->genesis.validator_config;
-    for (size_t i = 0; i < config->count; ++i)
-    {
-        const struct lantern_validator_config_entry *entry = &config->entries[i];
-        for (size_t j = 0; j < entry->indices_len; ++j)
-        {
-            if (entry->indices[j] == validator_index)
-            {
-                return entry;
-            }
-        }
-        if (entry->has_range
-            && validator_index >= entry->start_index
-            && validator_index < entry->end_index)
-        {
-            return entry;
-        }
-    }
-    return NULL;
-}
-
-int lantern_client_attestation_subnet_for_validator(
-    const struct lantern_client *client,
-    uint64_t validator_index,
     size_t *out_subnet_id)
 {
-    if (!out_subnet_id)
+    if (!client || !out_subnet_id)
     {
         return -1;
     }
-    const struct lantern_validator_config_entry *entry =
-        client_validator_entry_for_index(client, validator_index);
-    if (entry && entry->has_subnet)
+
+    const struct lantern_validator_config_entry *entry = client->assigned_validators;
+    if (entry && entry->enr.is_aggregator && entry->has_subnet)
     {
+        if (entry->subnet > (uint64_t)SIZE_MAX)
+        {
+            return -1;
+        }
         *out_subnet_id = (size_t)entry->subnet;
         return 0;
     }
-    return lantern_validator_index_compute_subnet_id(
-        (LanternValidatorIndex)validator_index,
-        lantern_client_attestation_committee_count(client),
-        out_subnet_id);
+
+    if (client->local_validators && client->local_validator_count > 0)
+    {
+        return lantern_validator_index_compute_subnet_id(
+            client->local_validators[0].global_index,
+            lantern_client_attestation_committee_count(client),
+            out_subnet_id);
+    }
+    if (entry && entry->indices_len > 0)
+    {
+        return lantern_validator_index_compute_subnet_id(
+            entry->indices[0],
+            lantern_client_attestation_committee_count(client),
+            out_subnet_id);
+    }
+    if (entry && entry->has_range)
+    {
+        return lantern_validator_index_compute_subnet_id(
+            entry->start_index,
+            lantern_client_attestation_committee_count(client),
+            out_subnet_id);
+    }
+    *out_subnet_id = client->gossip.attestation_subnet_id;
+    return 0;
 }
 
 
@@ -3162,6 +3213,7 @@ static lantern_client_error client_start_protocols(
     uint8_t fork_digest[4] = {0};
     char topic_network_name[32];
     size_t subnet_id = 0;
+    size_t attestation_committee_count = lantern_client_attestation_committee_count(client);
     bool have_fork_digest = client_resolve_gossip_fork_digest(client, fork_digest) == 0;
     if (have_fork_digest) {
         if (lantern_gossip_fork_digest_to_hex(fork_digest, topic_network_name) != 0) {
@@ -3187,9 +3239,9 @@ static lantern_client_error client_start_protocols(
         snprintf(topic_network_name, sizeof(topic_network_name), "%s", client->devnet);
     }
     if (client->local_validators && client->local_validator_count > 0) {
-        if (lantern_client_attestation_subnet_for_validator(
-                client,
+        if (lantern_validator_index_compute_subnet_id(
                 client->local_validators[0].global_index,
+                attestation_committee_count,
                 &subnet_id)
             != 0) {
             lantern_log_error(
@@ -3199,6 +3251,23 @@ static lantern_client_error client_start_protocols(
                 client->local_validators[0].global_index);
             return LANTERN_CLIENT_ERR_NETWORK;
         }
+    }
+    if (client->assigned_validators
+        && client->assigned_validators->enr.is_aggregator
+        && client->assigned_validators->has_subnet) {
+        if (lantern_client_aggregation_subnet_id(client, &subnet_id) != 0) {
+            lantern_log_error(
+                "client",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "failed to resolve configured aggregator subnet");
+            return LANTERN_CLIENT_ERR_NETWORK;
+        }
+        lantern_log_info(
+            "gossip",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "aggregator subnet configured subnet=%zu committee_count=%zu",
+            subnet_id,
+            attestation_committee_count);
     }
     struct lantern_gossipsub_config gossip_cfg = {
         .host = client->network.host,
@@ -3227,9 +3296,9 @@ static lantern_client_error client_start_protocols(
     if (client->local_validators && client->local_validator_count > 0) {
         for (size_t i = 0; i < client->local_validator_count; ++i) {
             size_t validator_subnet_id = 0;
-            if (lantern_client_attestation_subnet_for_validator(
-                    client,
+            if (lantern_validator_index_compute_subnet_id(
                     client->local_validators[i].global_index,
+                    attestation_committee_count,
                     &validator_subnet_id)
                 != 0) {
                 lantern_log_error(
@@ -3261,7 +3330,7 @@ static lantern_client_error client_start_protocols(
                 "attestation subnet subscribed validator=%" PRIu64 " subnet=%zu committee_count=%zu",
                 client->local_validators[i].global_index,
                 validator_subnet_id,
-                lantern_client_attestation_committee_count(client));
+                attestation_committee_count);
         }
     }
 
