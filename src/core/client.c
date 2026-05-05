@@ -263,6 +263,48 @@ static int fork_choice_target_interval(
     return 0;
 }
 
+static bool interval_range_first_with_phase(
+    uint64_t start,
+    uint64_t end,
+    uint64_t intervals_per_slot,
+    uint64_t phase,
+    uint64_t *out_interval) {
+    if (intervals_per_slot == 0u || phase >= intervals_per_slot || start > end) {
+        return false;
+    }
+    uint64_t distance = end - start;
+    uint64_t remainder = start % intervals_per_slot;
+    uint64_t offset = (phase + intervals_per_slot - remainder) % intervals_per_slot;
+    if (offset > distance) {
+        return false;
+    }
+    if (out_interval) {
+        *out_interval = start + offset;
+    }
+    return true;
+}
+
+static bool interval_range_last_with_phase(
+    uint64_t start,
+    uint64_t end,
+    uint64_t intervals_per_slot,
+    uint64_t phase,
+    uint64_t *out_interval) {
+    if (intervals_per_slot == 0u || phase >= intervals_per_slot || start > end) {
+        return false;
+    }
+    uint64_t distance = end - start;
+    uint64_t remainder = end % intervals_per_slot;
+    uint64_t offset = (remainder + intervals_per_slot - phase) % intervals_per_slot;
+    if (offset > distance) {
+        return false;
+    }
+    if (out_interval) {
+        *out_interval = end - offset;
+    }
+    return true;
+}
+
 int lantern_client_set_attestation_signature(
     struct lantern_client *client,
     const LanternSignatureKey *key,
@@ -365,44 +407,73 @@ int lantern_client_skip_fork_choice_intervals_locked(
     if (intervals_per_slot == 0u || target_interval == previous_intervals) {
         return 0;
     }
-    for (uint64_t step = previous_intervals + 1u;; ++step) {
-        uint64_t phase = step % intervals_per_slot;
-        if (phase == 3u) {
-            size_t new_before = client->store.new_aggregated_payloads.length;
-            size_t known_before = client->store.known_aggregated_payloads.length;
-            if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
-                return -1;
-            }
-            log_aggregated_payload_interval_transition(
-                client,
-                "skip_safe_target",
-                step,
-                phase,
-                new_before,
-                known_before,
-                0u);
-        } else if (phase == 4u) {
-            size_t new_before = client->store.new_aggregated_payloads.length;
-            size_t known_before = client->store.known_aggregated_payloads.length;
-            if (lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
-                return -1;
-            }
-            size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
-            if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
-                return -1;
-            }
-            log_aggregated_payload_interval_transition(
-                client,
-                "skip_accept_new",
-                step,
-                phase,
-                new_before,
-                known_before,
-                promoted);
+
+    uint64_t start_interval = previous_intervals + 1u;
+    uint64_t first_accept_interval = 0u;
+    uint64_t last_safe_interval = 0u;
+    bool has_accept = interval_range_first_with_phase(
+        start_interval,
+        target_interval,
+        intervals_per_slot,
+        4u,
+        &first_accept_interval);
+    bool has_safe = interval_range_last_with_phase(
+        start_interval,
+        target_interval,
+        intervals_per_slot,
+        3u,
+        &last_safe_interval);
+
+    if (has_safe && (!has_accept || last_safe_interval < first_accept_interval)) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
+            return -1;
         }
-        if (step == target_interval) {
-            break;
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_safe_target",
+            last_safe_interval,
+            last_safe_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            0u);
+    }
+
+    if (has_accept) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+            return -1;
         }
+        size_t promoted = lantern_store_promote_new_aggregated_payloads(&client->store);
+        if (promoted > 0u && lantern_fork_choice_accept_new_aggregated_payloads(&client->fork_choice) != 0) {
+            return -1;
+        }
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_accept_new",
+            first_accept_interval,
+            first_accept_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            promoted);
+    }
+
+    if (has_safe && has_accept && last_safe_interval > first_accept_interval) {
+        size_t new_before = client->store.new_aggregated_payloads.length;
+        size_t known_before = client->store.known_aggregated_payloads.length;
+        if (lantern_fork_choice_update_safe_target(&client->fork_choice) != 0) {
+            return -1;
+        }
+        log_aggregated_payload_interval_transition(
+            client,
+            "skip_safe_target",
+            last_safe_interval,
+            last_safe_interval % intervals_per_slot,
+            new_before,
+            known_before,
+            0u);
     }
     return 0;
 }
@@ -413,9 +484,6 @@ int lantern_client_advance_fork_choice_time_locked(
     bool has_proposal) {
     if (!client || !client->has_fork_choice) {
         return -1;
-    }
-    if (client->debug_disable_fork_choice_time) {
-        return 0;
     }
 
     uint64_t previous_intervals = client->fork_choice.time_intervals;

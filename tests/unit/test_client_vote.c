@@ -2018,6 +2018,38 @@ cleanup:
     return rc;
 }
 
+static int test_skip_fork_choice_intervals_large_gap_is_bounded(void) {
+    struct lantern_client client;
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    LanternRoot anchor_root;
+    LanternRoot child_root;
+    int rc = 1;
+
+    if (client_test_setup_vote_validation_client(&client, "skip_interval_large_gap", &pub, &secret, &anchor_root, &child_root) != 0) {
+        return 1;
+    }
+
+    uint64_t target_interval = (client.fork_choice.intervals_per_slot * 1000000u) + 3u;
+    if (lantern_client_skip_fork_choice_intervals_locked(&client, target_interval) != 0) {
+        fprintf(stderr, "large-gap skip helper failed to advance intervals\n");
+        goto cleanup;
+    }
+    if (client.fork_choice.time_intervals != target_interval) {
+        fprintf(
+            stderr,
+            "large-gap skip helper ended at wrong interval: %" PRIu64 "\n",
+            client.fork_choice.time_intervals);
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
 static int test_safe_target_uses_only_new_attached_aggregated_payloads(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
@@ -3451,6 +3483,9 @@ int main(void) {
         return 1;
     }
     if (test_skip_fork_choice_intervals_replays_interval_side_effects() != 0) {
+        return 1;
+    }
+    if (test_skip_fork_choice_intervals_large_gap_is_bounded() != 0) {
         return 1;
     }
     if (test_chain_service_tick_to_skips_stale_intervals() != 0) {
