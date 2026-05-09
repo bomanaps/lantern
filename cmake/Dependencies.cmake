@@ -14,23 +14,28 @@ endfunction()
 
 function(_lantern_define_static target_name source_dir)
     if(NOT TARGET ${target_name})
+        find_package(OpenSSL REQUIRED)
+        find_package(Threads REQUIRED)
         add_library(${target_name} STATIC
-            ${source_dir}/src/ssz_constants.c
+            ${source_dir}/src/ssz_types.c
             ${source_dir}/src/ssz_deserialize.c
+            ${source_dir}/src/ssz_endian.c
+            ${source_dir}/src/ssz_hash.c
             ${source_dir}/src/ssz_merkle.c
+            ${source_dir}/src/ssz_merkle_cache.c
+            ${source_dir}/src/ssz_proof.c
             ${source_dir}/src/ssz_serialize.c
-            ${source_dir}/src/ssz_utils.c
-            ${source_dir}/lib/mincrypt/sha256.c
         )
         target_include_directories(${target_name}
             PUBLIC
                 ${source_dir}/include
-                ${source_dir}/lib
-        )
-        # Ensure POSIX-sized types (e.g., ssize_t) are available without editing the submodule.
-        target_compile_options(${target_name}
             PRIVATE
-                -include sys/types.h
+                ${source_dir}/src
+        )
+        target_link_libraries(${target_name}
+            PUBLIC
+                OpenSSL::Crypto
+                Threads::Threads
         )
     endif()
 endfunction()

@@ -7,7 +7,7 @@
 
 #include "lantern/consensus/ssz.h"
 #include "lantern/consensus/state.h"
-#include "ssz_constants.h"
+#include "ssz.h"
 #include "lantern/encoding/snappy.h"
 #include "lantern/networking/reqresp_service.h"
 #include "lantern/support/log.h"

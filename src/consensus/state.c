@@ -2324,6 +2324,7 @@ void lantern_state_reset(LanternState *state) {
     if (!state) {
         return;
     }
+    lantern_state_hash_cache_reset(state);
     lantern_root_list_reset(&state->historical_block_hashes);
     lantern_bitlist_reset(&state->justified_slots);
     lantern_root_list_reset(&state->justification_roots);
@@ -2383,7 +2384,7 @@ int lantern_state_process_slot(LanternState *state) {
     }
     if (lantern_root_is_zero(&state->latest_block_header.state_root)) {
         LanternRoot computed;
-        if (lantern_hash_tree_root_state(state, &computed) != 0) {
+        if (lantern_hash_tree_root_state_cached(state, &computed) != 0) {
             return -1;
         }
         state->latest_block_header.state_root = computed;
@@ -3078,7 +3079,7 @@ int lantern_state_transition(LanternState *state, LanternStore *store, const Lan
         STATE_FAIL("process block failed");
     }
     LanternRoot computed_state_root;
-    bool hashed_state = lantern_hash_tree_root_state(state, &computed_state_root) == 0;
+    bool hashed_state = lantern_hash_tree_root_state_cached(state, &computed_state_root) == 0;
     if (hashed_state) {
         if (memcmp(block->state_root.bytes, computed_state_root.bytes, LANTERN_ROOT_SIZE) != 0) {
             char expected_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
@@ -3399,7 +3400,7 @@ int lantern_state_compute_post_state(
         rc = -1;
         goto cleanup;
     }
-    if (out_state_root && lantern_hash_tree_root_state(&scratch, out_state_root) != 0) {
+    if (out_state_root && lantern_hash_tree_root_state_cached(&scratch, out_state_root) != 0) {
         rc = -1;
         goto cleanup;
     }

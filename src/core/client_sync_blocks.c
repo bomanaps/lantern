@@ -33,7 +33,7 @@
 #include "lantern/storage/storage.h"
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
-#include "ssz_constants.h"
+#include "ssz.h"
 
 
 /* ============================================================================
@@ -717,12 +717,12 @@ static size_t bitlist_encoded_size_bits(size_t bit_length)
 
 static size_t signed_block_base_ssz_size(void)
 {
-    size_t block_fixed = (SSZ_BYTE_SIZE_OF_UINT64 * 2u)
+    size_t block_fixed = (sizeof(uint64_t) * 2u)
         + (LANTERN_ROOT_SIZE * 2u)
-        + SSZ_BYTE_SIZE_OF_UINT32;
-    size_t body_header = SSZ_BYTE_SIZE_OF_UINT32;
-    size_t message_base = SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_VOTE_SSZ_SIZE + block_fixed + body_header;
-    size_t offsets = SSZ_BYTE_SIZE_OF_UINT32 * 2u;
+        + SSZ_BYTES_PER_LENGTH_OFFSET;
+    size_t body_header = SSZ_BYTES_PER_LENGTH_OFFSET;
+    size_t message_base = SSZ_BYTES_PER_LENGTH_OFFSET + LANTERN_VOTE_SSZ_SIZE + block_fixed + body_header;
+    size_t offsets = SSZ_BYTES_PER_LENGTH_OFFSET * 2u;
     return offsets + message_base;
 }
 
@@ -730,16 +730,16 @@ static size_t signed_block_max_ssz_size(void)
 {
     size_t base = signed_block_base_ssz_size();
     size_t att_bits_max = bitlist_encoded_size_bits(LANTERN_VALIDATOR_REGISTRY_LIMIT);
-    size_t att_entry_max = SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_ATTESTATION_DATA_SSZ_SIZE + att_bits_max;
-    size_t attestations_max = (size_t)LANTERN_MAX_ATTESTATIONS * (SSZ_BYTE_SIZE_OF_UINT32 + att_entry_max);
+    size_t att_entry_max = SSZ_BYTES_PER_LENGTH_OFFSET + LANTERN_ATTESTATION_DATA_SSZ_SIZE + att_bits_max;
+    size_t attestations_max = (size_t)LANTERN_MAX_ATTESTATIONS * (SSZ_BYTES_PER_LENGTH_OFFSET + att_entry_max);
     if (attestations_max > SIZE_MAX - base)
     {
         return SIZE_MAX;
     }
     size_t total = base + attestations_max;
-    size_t proof_entry_max = (SSZ_BYTE_SIZE_OF_UINT32 * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
-    size_t signatures_max = (SSZ_BYTE_SIZE_OF_UINT32 * 2u) + LANTERN_SIGNATURE_SIZE
-        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTE_SIZE_OF_UINT32 + proof_entry_max));
+    size_t proof_entry_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
+    size_t signatures_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE
+        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTES_PER_LENGTH_OFFSET + proof_entry_max));
     if (signatures_max > SIZE_MAX - total)
     {
         return SIZE_MAX;
@@ -1833,6 +1833,7 @@ static void adopt_state_locked(struct lantern_client *client, LanternState *stat
     }
     LanternState previous = client->state;
     client->state = *state;
+    lantern_state_init(state);
     if (client->has_fork_choice)
     {
         if (lantern_fork_choice_update_checkpoints(

@@ -28,7 +28,7 @@
 #include "lantern/networking/messages.h"
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
-#include "ssz_constants.h"
+#include "ssz.h"
 
 #define LANTERN_STORAGE_VOTES_MAGIC "LNVOTES\0"
 #define LANTERN_STORAGE_VOTES_VERSION 3u
@@ -159,7 +159,7 @@ static size_t aggregated_attestation_encoded_size(const LanternAggregatedAttesta
     if (bits_size == 0) {
         return 0;
     }
-    size_t fixed_section = SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_ATTESTATION_DATA_SSZ_SIZE;
+    size_t fixed_section = SSZ_BYTES_PER_LENGTH_OFFSET + LANTERN_ATTESTATION_DATA_SSZ_SIZE;
     if (fixed_section > SIZE_MAX - bits_size) {
         return 0;
     }
@@ -176,7 +176,7 @@ static size_t aggregated_attestations_encoded_size(const LanternAggregatedAttest
     if (attestations->length > LANTERN_MAX_ATTESTATIONS || !attestations->data) {
         return 0;
     }
-    size_t offset_table = attestations->length * SSZ_BYTE_SIZE_OF_UINT32;
+    size_t offset_table = attestations->length * SSZ_BYTES_PER_LENGTH_OFFSET;
     size_t total = offset_table;
     for (size_t i = 0; i < attestations->length; ++i) {
         size_t entry_size = aggregated_attestation_encoded_size(&attestations->data[i]);
@@ -200,7 +200,7 @@ static size_t aggregated_signature_proof_encoded_size(const LanternAggregatedSig
     if (participants_size == 0 && proof->participants.bit_length != 0) {
         return 0;
     }
-    size_t fixed_section = SSZ_BYTE_SIZE_OF_UINT32 * 2u;
+    size_t fixed_section = SSZ_BYTES_PER_LENGTH_OFFSET * 2u;
     if (fixed_section > SIZE_MAX - participants_size) {
         return 0;
     }
@@ -220,7 +220,7 @@ static size_t attestation_signatures_encoded_size(const LanternAttestationSignat
     if (signatures->length > LANTERN_MAX_BLOCK_SIGNATURES || !signatures->data) {
         return 0;
     }
-    size_t offset_table = signatures->length * SSZ_BYTE_SIZE_OF_UINT32;
+    size_t offset_table = signatures->length * SSZ_BYTES_PER_LENGTH_OFFSET;
     size_t total = offset_table;
     for (size_t i = 0; i < signatures->length; ++i) {
         size_t entry_size = aggregated_signature_proof_encoded_size(&signatures->data[i]);
@@ -247,10 +247,10 @@ static size_t state_encoded_size(const LanternState *state) {
         return 0;
     }
     size_t fixed = LANTERN_CONFIG_SSZ_SIZE
-        + SSZ_BYTE_SIZE_OF_UINT64
+        + sizeof(uint64_t)
         + LANTERN_BLOCK_HEADER_SSZ_SIZE
         + (2u * LANTERN_CHECKPOINT_SSZ_SIZE)
-        + (5u * SSZ_BYTE_SIZE_OF_UINT32);
+        + (5u * SSZ_BYTES_PER_LENGTH_OFFSET);
     size_t validator_bytes = 0;
     if (state->validator_count > 0) {
         if (!state->validators || state->validator_count > SIZE_MAX / LANTERN_VALIDATOR_SSZ_SIZE) {
@@ -268,23 +268,23 @@ static size_t state_encoded_size(const LanternState *state) {
 
 static size_t block_body_encoded_size(const LanternBlockBody *body) {
     if (!body) {
-        return SSZ_BYTE_SIZE_OF_UINT32;
+        return SSZ_BYTES_PER_LENGTH_OFFSET;
     }
     size_t att_count = body->attestations.length;
     size_t attestations_bytes = aggregated_attestations_encoded_size(&body->attestations);
     if (att_count > 0 && attestations_bytes == 0) {
         return 0;
     }
-    return SSZ_BYTE_SIZE_OF_UINT32 + attestations_bytes;
+    return SSZ_BYTES_PER_LENGTH_OFFSET + attestations_bytes;
 }
 
 static size_t block_encoded_size(const LanternBlock *block) {
     if (!block) {
         return 0;
     }
-    size_t fixed = (SSZ_BYTE_SIZE_OF_UINT64 * 2u)
+    size_t fixed = (sizeof(uint64_t) * 2u)
         + (LANTERN_ROOT_SIZE * 2u)
-        + SSZ_BYTE_SIZE_OF_UINT32;
+        + SSZ_BYTES_PER_LENGTH_OFFSET;
     size_t body_size = block_body_encoded_size(&block->body);
     if (body_size == 0) {
         return 0;
@@ -301,14 +301,14 @@ static size_t block_signatures_encoded_size(const LanternBlockSignatures *signat
     if (sig_count > 0 && attestations_bytes == 0) {
         return 0;
     }
-    return (SSZ_BYTE_SIZE_OF_UINT32 * 2u) + LANTERN_SIGNATURE_SIZE + attestations_bytes;
+    return (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE + attestations_bytes;
 }
 
 static size_t signed_block_encoded_size(const LanternSignedBlock *block) {
     if (!block) {
         return 0;
     }
-    size_t offset_section = SSZ_BYTE_SIZE_OF_UINT32 * 2u;
+    size_t offset_section = SSZ_BYTES_PER_LENGTH_OFFSET * 2u;
     size_t message_size = block_encoded_size(&block->block);
     if (message_size == 0) {
         return 0;

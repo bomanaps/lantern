@@ -20,7 +20,7 @@
 #include "libp2p/stream_internal.h"
 #include "multiformats/unsigned_varint/unsigned_varint.h"
 #include "tests/support/fixture_loader.h"
-#include "ssz_constants.h"
+#include "ssz.h"
 
 #define CHECK(cond)                                                                 \
     do {                                                                            \

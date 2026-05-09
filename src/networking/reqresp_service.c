@@ -27,7 +27,7 @@
 
 #include "peer_id/peer_id.h"
 
-#include "ssz_constants.h"
+#include "ssz.h"
 #include "../core/client_network_internal.h"
 
 uint32_t lantern_reqresp_stall_timeout_ms(void) {

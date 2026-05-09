@@ -16,7 +16,7 @@
 #include "lantern/consensus/ssz.h"
 #include "lantern/networking/messages.h"
 #include "pq-bindings-c-rust.h"
-#include "ssz_constants.h"
+#include "ssz.h"
 #include "ssz_deserialize.h"
 #include "ssz_merkle.h"
 #include "ssz_serialize.h"
@@ -37,7 +37,7 @@
 #define LANTERN_XMSS_HASH_DIGEST_BYTES (LANTERN_XMSS_HASH_LEN_FE * LANTERN_XMSS_FP_BYTES)
 #define LANTERN_XMSS_RHO_BYTES (LANTERN_XMSS_RAND_LEN_FE * LANTERN_XMSS_FP_BYTES)
 #define LANTERN_XMSS_SIGNATURE_FIXED_SECTION \
-    (SSZ_BYTE_SIZE_OF_UINT32 + LANTERN_XMSS_RHO_BYTES + SSZ_BYTE_SIZE_OF_UINT32)
+    (SSZ_BYTES_PER_LENGTH_OFFSET + LANTERN_XMSS_RHO_BYTES + SSZ_BYTES_PER_LENGTH_OFFSET)
 
 struct fixture_stats {
     size_t total;
@@ -328,11 +328,16 @@ static int for_each_json(
     return status;
 }
 
-static void chunk_from_uint64(uint64_t value, uint8_t out[SSZ_BYTES_PER_CHUNK]) {
-    memset(out, 0, SSZ_BYTES_PER_CHUNK);
-    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
-        out[i] = (uint8_t)((value >> (8u * i)) & 0xFFu);
-    }
+static int chunk_from_uint64(uint64_t value, ssz_chunk_t *out) {
+    return ssz_hash_tree_root_uint64(value, out) == SSZ_SUCCESS ? 0 : -1;
+}
+
+static void chunk_from_root(const LanternRoot *root, ssz_chunk_t *out) {
+    memcpy(out->bytes, root->bytes, SSZ_BYTES_PER_CHUNK);
+}
+
+static void root_from_chunk(const ssz_chunk_t *chunk, LanternRoot *out_root) {
+    memcpy(out_root->bytes, chunk->bytes, LANTERN_ROOT_SIZE);
 }
 
 static void write_u32_le(uint32_t value, uint8_t out[4]) {
@@ -380,28 +385,34 @@ static int merkleize_bytes_with_optional_length(
     }
 
     size_t chunk_count = byte_len == 0u ? 0u : ((byte_len + SSZ_BYTES_PER_CHUNK - 1u) / SSZ_BYTES_PER_CHUNK);
-    uint8_t *chunks = NULL;
+    ssz_chunk_t *chunks = NULL;
     if (chunk_count > 0u) {
-        chunks = (uint8_t *)calloc(chunk_count, SSZ_BYTES_PER_CHUNK);
+        chunks = (ssz_chunk_t *)calloc(chunk_count, sizeof(*chunks));
         if (!chunks) {
             return -1;
         }
         memcpy(chunks, bytes, byte_len);
     }
 
-    uint8_t temp_root[SSZ_BYTES_PER_CHUNK];
-    ssz_error_t err = ssz_merkleize(chunks, chunk_count, chunk_limit, temp_root);
+    uint64_t effective_limit = chunk_limit == 0u ? SSZ_NO_LIMIT : (uint64_t)chunk_limit;
+    ssz_chunk_t temp_root;
+    ssz_error_t err = ssz_merkleize(chunks, chunk_count, effective_limit, NULL, NULL, &temp_root);
     free(chunks);
     if (err != SSZ_SUCCESS) {
         return -1;
     }
 
     if (mix_length) {
-        err = ssz_mix_in_length(temp_root, length_value, out_root->bytes);
-        return err == SSZ_SUCCESS ? 0 : -1;
+        ssz_chunk_t mixed;
+        err = ssz_mix_in_length_u64(&temp_root, length_value, NULL, &mixed);
+        if (err != SSZ_SUCCESS) {
+            return -1;
+        }
+        root_from_chunk(&mixed, out_root);
+        return 0;
     }
 
-    memcpy(out_root->bytes, temp_root, LANTERN_ROOT_SIZE);
+    root_from_chunk(&temp_root, out_root);
     return 0;
 }
 
@@ -410,6 +421,32 @@ static int root_from_fixed_serialized_bytes(
     size_t byte_len,
     LanternRoot *out_root) {
     return merkleize_bytes_with_optional_length(bytes, byte_len, 0u, false, 0u, out_root);
+}
+
+static int pack_bool_bits(const bool *bits, size_t bit_count, uint8_t **out_bytes, size_t *out_len) {
+    if (!out_bytes || !out_len || (bit_count > 0u && !bits)) {
+        return -1;
+    }
+    size_t byte_len = (bit_count + 7u) / 8u;
+    uint8_t *bytes = (uint8_t *)calloc(byte_len > 0u ? byte_len : 1u, sizeof(*bytes));
+    if (!bytes) {
+        return -1;
+    }
+    for (size_t i = 0; i < bit_count; ++i) {
+        if (bits[i]) {
+            bytes[i / 8u] |= (uint8_t)(1u << (i % 8u));
+        }
+    }
+    *out_bytes = bytes;
+    *out_len = byte_len;
+    return 0;
+}
+
+static bool packed_bit_is_set(const uint8_t *bytes, size_t bit_count, size_t index) {
+    if (!bytes || index >= bit_count) {
+        return false;
+    }
+    return (bytes[index / 8u] & (uint8_t)(1u << (index % 8u))) != 0u;
 }
 
 static int parse_size_suffix(const char *text, const char *prefix, size_t *out_value) {
@@ -981,10 +1018,15 @@ static int compute_status_root(const LanternStatusMessage *status, LanternRoot *
         || lantern_hash_tree_root_checkpoint(&status->head, &head_root) != 0) {
         return -1;
     }
-    uint8_t chunks[2][SSZ_BYTES_PER_CHUNK];
-    memcpy(chunks[0], finalized_root.bytes, SSZ_BYTES_PER_CHUNK);
-    memcpy(chunks[1], head_root.bytes, SSZ_BYTES_PER_CHUNK);
-    return ssz_merkleize(&chunks[0][0], 2u, 0u, out_root->bytes) == SSZ_SUCCESS ? 0 : -1;
+    ssz_chunk_t chunks[2];
+    chunk_from_root(&finalized_root, &chunks[0]);
+    chunk_from_root(&head_root, &chunks[1]);
+    ssz_chunk_t root;
+    if (ssz_merkleize(chunks, 2u, SSZ_NO_LIMIT, NULL, NULL, &root) != SSZ_SUCCESS) {
+        return -1;
+    }
+    root_from_chunk(&root, out_root);
+    return 0;
 }
 
 static int compute_blocks_by_root_request_root(
@@ -1040,10 +1082,17 @@ static int compute_hash_tree_layer_root(
         != 0) {
         return -1;
     }
-    uint8_t chunks[2][SSZ_BYTES_PER_CHUNK];
-    chunk_from_uint64(start_index, chunks[0]);
-    memcpy(chunks[1], nodes_root.bytes, SSZ_BYTES_PER_CHUNK);
-    return ssz_merkleize(&chunks[0][0], 2u, 0u, out_root->bytes) == SSZ_SUCCESS ? 0 : -1;
+    ssz_chunk_t chunks[2];
+    if (chunk_from_uint64(start_index, &chunks[0]) != 0) {
+        return -1;
+    }
+    chunk_from_root(&nodes_root, &chunks[1]);
+    ssz_chunk_t root;
+    if (ssz_merkleize(chunks, 2u, SSZ_NO_LIMIT, NULL, NULL, &root) != SSZ_SUCCESS) {
+        return -1;
+    }
+    root_from_chunk(&root, out_root);
+    return 0;
 }
 
 static int run_unsupported_fixture(
@@ -1065,18 +1114,18 @@ static int run_boolean_fixture(
     const struct byte_buffer *expected_serialized,
     const LanternRoot *expected_root) {
     bool value = false;
-    bool decoded = false;
+    uint8_t decoded = 0u;
     uint8_t encoded[1];
     size_t encoded_len = sizeof(encoded);
     if (fixture_token_to_bool(doc, value_idx, &value) != 0
-        || ssz_serialize_boolean(&value, encoded, &encoded_len) != SSZ_SUCCESS
+        || ssz_serialize_boolean(value ? 1u : 0u, encoded) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || ssz_deserialize_boolean(expected_serialized->data, expected_serialized->len, &decoded) != SSZ_SUCCESS
-        || decoded != value) {
+        || (decoded != 0u) != value) {
         return record_failure(path, type_name, "boolean roundtrip failed");
     }
     encoded_len = sizeof(encoded);
-    if (ssz_serialize_boolean(&decoded, encoded, &encoded_len) != SSZ_SUCCESS
+    if (ssz_serialize_boolean(decoded, encoded) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "decode(serialized)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0) {
         return -1;
     }
@@ -1102,13 +1151,14 @@ static int run_uint_fixture(
 
     uint8_t encoded[32];
     size_t encoded_len = sizeof(encoded);
-    ssz_error_t serr = SSZ_ERROR_SERIALIZATION;
+    ssz_error_t serr = SSZ_ERR_INVALID_ARGUMENT;
     if (bits == 8u) {
         uint8_t v = (uint8_t)value;
         if (value > UINT8_MAX) {
             return record_failure(path, type_name, "value out of range");
         }
-        serr = ssz_serialize_uint8(&v, encoded, &encoded_len);
+        serr = ssz_serialize_uint8(v, encoded);
+        encoded_len = sizeof(uint8_t);
         uint8_t decoded = 0u;
         if (serr != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
@@ -1121,7 +1171,8 @@ static int run_uint_fixture(
         if (value > UINT16_MAX) {
             return record_failure(path, type_name, "value out of range");
         }
-        serr = ssz_serialize_uint16(&v, encoded, &encoded_len);
+        serr = ssz_serialize_uint16(v, encoded);
+        encoded_len = sizeof(uint16_t);
         uint16_t decoded = 0u;
         if (serr != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
@@ -1134,7 +1185,8 @@ static int run_uint_fixture(
         if (value > UINT32_MAX) {
             return record_failure(path, type_name, "value out of range");
         }
-        serr = ssz_serialize_uint32(&v, encoded, &encoded_len);
+        serr = ssz_serialize_uint32(v, encoded);
+        encoded_len = sizeof(uint32_t);
         uint32_t decoded = 0u;
         if (serr != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
@@ -1144,7 +1196,8 @@ static int run_uint_fixture(
         }
     } else if (bits == 64u) {
         uint64_t decoded = 0u;
-        serr = ssz_serialize_uint64(&value, encoded, &encoded_len);
+        serr = ssz_serialize_uint64(value, encoded);
+        encoded_len = sizeof(uint64_t);
         if (serr != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
             || ssz_deserialize_uint64(expected_serialized->data, expected_serialized->len, &decoded) != SSZ_SUCCESS
@@ -1180,9 +1233,16 @@ static int run_fixed_bytes_fixture(
     size_t encoded_len = expected_serialized->len;
     uint8_t *encoded = (uint8_t *)malloc(encoded_len > 0u ? encoded_len : 1u);
     if (!decoded || !encoded
-        || ssz_serialize_vector_uint8(value.data, byte_len, encoded, &encoded_len) != SSZ_SUCCESS
+        || ssz_serialize_vector_fixed(value.data, byte_len, sizeof(uint8_t), encoded, encoded_len, &encoded_len) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
-        || ssz_deserialize_vector_uint8(expected_serialized->data, expected_serialized->len, byte_len, decoded) != SSZ_SUCCESS
+        || ssz_deserialize_vector_fixed(
+               expected_serialized->data,
+               expected_serialized->len,
+               byte_len,
+               sizeof(uint8_t),
+               decoded,
+               byte_len)
+               != SSZ_SUCCESS
         || memcmp(decoded, value.data, byte_len) != 0) {
         free(decoded);
         free(encoded);
@@ -1191,7 +1251,7 @@ static int run_fixed_bytes_fixture(
     }
 
     encoded_len = expected_serialized->len;
-    if (ssz_serialize_vector_uint8(decoded, byte_len, encoded, &encoded_len) != SSZ_SUCCESS
+    if (ssz_serialize_vector_fixed(decoded, byte_len, sizeof(uint8_t), encoded, encoded_len, &encoded_len) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "decode(serialized)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0) {
         free(decoded);
         free(encoded);
@@ -1227,17 +1287,29 @@ static int run_byte_list_fixture(
 
     uint8_t *decoded = (uint8_t *)malloc(BYTELIST_MIB_LIMIT);
     uint8_t *encoded = (uint8_t *)malloc(value.len > 0u ? value.len : 1u);
-    size_t actual_count = 0u;
+    uint64_t actual_count = 0u;
     size_t encoded_len = value.len;
-    int serialize_rc = value.len == 0u ? SSZ_SUCCESS : ssz_serialize_list_uint8(value.data, value.len, encoded, &encoded_len);
-    int deserialize_rc = value.len == 0u
-        ? SSZ_SUCCESS
-        : ssz_deserialize_list_uint8(expected_serialized->data, expected_serialized->len, BYTELIST_MIB_LIMIT, decoded, &actual_count);
+    int serialize_rc = ssz_serialize_list_fixed(
+        value.data,
+        value.len,
+        BYTELIST_MIB_LIMIT,
+        sizeof(uint8_t),
+        encoded,
+        value.len > 0u ? value.len : 1u,
+        &encoded_len);
+    int deserialize_rc = ssz_deserialize_list_fixed(
+        expected_serialized->data,
+        expected_serialized->len,
+        BYTELIST_MIB_LIMIT,
+        sizeof(uint8_t),
+        decoded,
+        BYTELIST_MIB_LIMIT,
+        &actual_count);
     if (!decoded || !encoded
         || serialize_rc != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || deserialize_rc != SSZ_SUCCESS
-        || actual_count != value.len
+        || actual_count != (uint64_t)value.len
         || (actual_count > 0u && memcmp(decoded, value.data, actual_count) != 0)) {
         free(decoded);
         free(encoded);
@@ -1281,21 +1353,29 @@ static int run_bool_vector_fixture(
         return record_failure(path, type_name, "invalid bitvector value");
     }
 
-    bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(bool));
+    uint8_t *packed = NULL;
+    size_t packed_len = 0u;
+    if (pack_bool_bits(bits, bit_count, &packed, &packed_len) != 0) {
+        free(bits);
+        return record_failure(path, type_name, "failed to pack bitvector");
+    }
+    uint8_t *decoded = (uint8_t *)calloc(packed_len > 0u ? packed_len : 1u, sizeof(*decoded));
     uint8_t *encoded = (uint8_t *)malloc(expected_serialized->len > 0u ? expected_serialized->len : 1u);
     size_t encoded_len = expected_serialized->len;
     if (!decoded || !encoded
-        || ssz_serialize_bitvector(bits, bit_count, encoded, &encoded_len) != SSZ_SUCCESS
+        || ssz_serialize_bitvector(packed, packed_len, bit_count, encoded, expected_serialized->len, &encoded_len) != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
-        || ssz_deserialize_bitvector(expected_serialized->data, expected_serialized->len, bit_count, decoded) != SSZ_SUCCESS) {
+        || ssz_deserialize_bitvector(expected_serialized->data, expected_serialized->len, bit_count, decoded, packed_len) != SSZ_SUCCESS) {
         free(bits);
+        free(packed);
         free(decoded);
         free(encoded);
         return record_failure(path, type_name, "bitvector roundtrip failed");
     }
     for (size_t i = 0; i < bit_count; ++i) {
-        if (decoded[i] != bits[i]) {
+        if (packed_bit_is_set(decoded, bit_count, i) != bits[i]) {
             free(bits);
+            free(packed);
             free(decoded);
             free(encoded);
             return record_failure(path, type_name, "decoded bitvector differs from fixture value");
@@ -1305,12 +1385,14 @@ static int run_bool_vector_fixture(
     LanternRoot root;
     if (root_from_fixed_serialized_bytes(expected_serialized->data, expected_serialized->len, &root) != 0) {
         free(bits);
+        free(packed);
         free(decoded);
         free(encoded);
         return record_failure(path, type_name, "failed to compute bitvector root");
     }
 
     free(bits);
+    free(packed);
     free(decoded);
     free(encoded);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
@@ -1346,30 +1428,48 @@ static int run_bitlist_fixture(
 
     uint8_t *encoded = (uint8_t *)malloc(expected_serialized->len > 0u ? expected_serialized->len : 1u);
     size_t encoded_len = expected_serialized->len;
-    bool *decoded = (bool *)calloc(max_bits > 0u ? max_bits : 1u, sizeof(bool));
-    size_t actual_bits = 0u;
-    if (encoded && bit_count == 0u) {
-        encoded[0] = 0x01u;
-        encoded_len = 1u;
+    uint8_t *packed = NULL;
+    size_t packed_len = 0u;
+    if (pack_bool_bits(bits, bit_count, &packed, &packed_len) != 0) {
+        free(bits);
+        free(encoded);
+        lantern_bitlist_reset(&bitlist);
+        return record_failure(path, type_name, "failed to pack bitlist");
     }
-    int serialize_rc = bit_count == 0u ? SSZ_SUCCESS : ssz_serialize_bitlist(bits, bit_count, encoded, &encoded_len);
-    int deserialize_rc = bit_count == 0u
-        ? SSZ_SUCCESS
-        : ssz_deserialize_bitlist(expected_serialized->data, expected_serialized->len, max_bits, decoded, &actual_bits);
+    size_t decoded_len = (max_bits + 7u) / 8u;
+    uint8_t *decoded = (uint8_t *)calloc(decoded_len > 0u ? decoded_len : 1u, sizeof(*decoded));
+    uint64_t actual_bits = 0u;
+    int serialize_rc = ssz_serialize_bitlist(
+        packed,
+        packed_len,
+        bit_count,
+        max_bits,
+        encoded,
+        expected_serialized->len > 0u ? expected_serialized->len : 1u,
+        &encoded_len);
+    int deserialize_rc = ssz_deserialize_bitlist(
+        expected_serialized->data,
+        expected_serialized->len,
+        max_bits,
+        decoded,
+        decoded_len,
+        &actual_bits);
     if (!decoded || !encoded
         || serialize_rc != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || deserialize_rc != SSZ_SUCCESS
-        || actual_bits != bit_count) {
+        || actual_bits != (uint64_t)bit_count) {
         free(bits);
+        free(packed);
         free(decoded);
         free(encoded);
         lantern_bitlist_reset(&bitlist);
         return record_failure(path, type_name, "bitlist roundtrip failed");
     }
     for (size_t i = 0; i < bit_count; ++i) {
-        if (decoded[i] != bits[i]) {
+        if (packed_bit_is_set(decoded, bit_count, i) != bits[i]) {
             free(bits);
+            free(packed);
             free(decoded);
             free(encoded);
             lantern_bitlist_reset(&bitlist);
@@ -1388,6 +1488,7 @@ static int run_bitlist_fixture(
     }
 
     free(bits);
+    free(packed);
     free(decoded);
     free(encoded);
     lantern_bitlist_reset(&bitlist);
@@ -1422,9 +1523,23 @@ static int run_uint_vector_fixture(
             }
             values[i] = (uint16_t)parsed[i];
         }
-        if (ssz_serialize_vector_uint16(values, element_count, encoded, &encoded_len) != SSZ_SUCCESS
+        if (ssz_serialize_vector_fixed(
+                (const uint8_t *)values,
+                element_count,
+                sizeof(uint16_t),
+                encoded,
+                sizeof(encoded),
+                &encoded_len)
+                != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
-            || ssz_deserialize_vector_uint16(expected_serialized->data, expected_serialized->len, element_count, decoded) != SSZ_SUCCESS) {
+            || ssz_deserialize_vector_fixed(
+                   expected_serialized->data,
+                   expected_serialized->len,
+                   element_count,
+                   sizeof(uint16_t),
+                   (uint8_t *)decoded,
+                   sizeof(decoded))
+                   != SSZ_SUCCESS) {
             free(parsed);
             return record_failure(path, type_name, "uint16 vector roundtrip failed");
         }
@@ -1452,9 +1567,23 @@ static int run_uint_vector_fixture(
             free(values);
             return record_failure(path, type_name, "invalid uint64 vector value");
         }
-        if (ssz_serialize_vector_uint64(values, element_count, encoded, &encoded_len) != SSZ_SUCCESS
+        if (ssz_serialize_vector_fixed(
+                (const uint8_t *)values,
+                element_count,
+                sizeof(uint64_t),
+                encoded,
+                sizeof(encoded),
+                &encoded_len)
+                != SSZ_SUCCESS
             || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
-            || ssz_deserialize_vector_uint64(expected_serialized->data, expected_serialized->len, element_count, decoded) != SSZ_SUCCESS) {
+            || ssz_deserialize_vector_fixed(
+                   expected_serialized->data,
+                   expected_serialized->len,
+                   element_count,
+                   sizeof(uint64_t),
+                   (uint8_t *)decoded,
+                   sizeof(decoded))
+                   != SSZ_SUCCESS) {
             free(values);
             return record_failure(path, type_name, "uint64 vector roundtrip failed");
         }
@@ -1485,7 +1614,7 @@ static int run_uint32_list_fixture(
     uint32_t *values = NULL;
     size_t count = 0u;
     uint32_t decoded[SAMPLE_UINT32_LIST_LIMIT];
-    size_t actual_count = 0u;
+    uint64_t actual_count = 0u;
     uint8_t encoded[64];
     size_t encoded_len = sizeof(encoded);
     if (parse_u32_data_array(doc, value_idx, &values, &count) != 0 || count > SAMPLE_UINT32_LIST_LIMIT) {
@@ -1495,19 +1624,26 @@ static int run_uint32_list_fixture(
     if (count == 0u) {
         encoded_len = 0u;
     }
-    int serialize_rc = count == 0u ? SSZ_SUCCESS : ssz_serialize_list_uint32(values, count, encoded, &encoded_len);
-    int deserialize_rc = count == 0u
-        ? SSZ_SUCCESS
-        : ssz_deserialize_list_uint32(
-              expected_serialized->data,
-              expected_serialized->len,
-              SAMPLE_UINT32_LIST_LIMIT,
-              decoded,
-              &actual_count);
+    int serialize_rc = ssz_serialize_list_fixed(
+        (const uint8_t *)values,
+        count,
+        SAMPLE_UINT32_LIST_LIMIT,
+        sizeof(uint32_t),
+        encoded,
+        sizeof(encoded),
+        &encoded_len);
+    int deserialize_rc = ssz_deserialize_list_fixed(
+        expected_serialized->data,
+        expected_serialized->len,
+        SAMPLE_UINT32_LIST_LIMIT,
+        sizeof(uint32_t),
+        (uint8_t *)decoded,
+        sizeof(decoded),
+        &actual_count);
     if (serialize_rc != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || deserialize_rc != SSZ_SUCCESS
-        || actual_count != count) {
+        || actual_count != (uint64_t)count) {
         free(values);
         return record_failure(path, type_name, "uint32 list roundtrip failed");
     }
@@ -1547,7 +1683,7 @@ static int run_uint64_list_fixture(
     uint64_t *decoded = NULL;
     uint8_t *encoded = NULL;
     size_t count = 0u;
-    size_t actual_count = 0u;
+    uint64_t actual_count = 0u;
     int rc = -1;
 
     if (parse_u64_data_array(doc, value_idx, &values, &count) != 0 || count > max_count) {
@@ -1566,19 +1702,26 @@ static int run_uint64_list_fixture(
     if (count == 0u) {
         encoded_len = 0u;
     }
-    int serialize_rc = count == 0u ? SSZ_SUCCESS : ssz_serialize_list_uint64(values, count, encoded, &encoded_len);
-    int deserialize_rc = count == 0u
-        ? SSZ_SUCCESS
-        : ssz_deserialize_list_uint64(
-              expected_serialized->data,
-              expected_serialized->len,
-              max_count,
-              decoded,
-              &actual_count);
+    int serialize_rc = ssz_serialize_list_fixed(
+        (const uint8_t *)values,
+        count,
+        max_count,
+        sizeof(uint64_t),
+        encoded,
+        expected_serialized->len > 0u ? expected_serialized->len : 1u,
+        &encoded_len);
+    int deserialize_rc = ssz_deserialize_list_fixed(
+        expected_serialized->data,
+        expected_serialized->len,
+        max_count,
+        sizeof(uint64_t),
+        (uint8_t *)decoded,
+        max_count * sizeof(uint64_t),
+        &actual_count);
     if (serialize_rc != SSZ_SUCCESS
         || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0
         || deserialize_rc != SSZ_SUCCESS
-        || actual_count != count) {
+        || actual_count != (uint64_t)count) {
         rc = record_failure(path, type_name, "uint64 list roundtrip failed");
         goto cleanup;
     }
@@ -1698,7 +1841,7 @@ static int run_union_fixture(
         uint8_t one = 0u;
         size_t one_len = 1u;
         if (lantern_fixture_token_to_uint64(doc, inner_value_idx, &value) != 0 || value > UINT8_MAX
-            || ssz_serialize_uint8(&(uint8_t){(uint8_t)value}, encoded + 1u, &one_len) != SSZ_SUCCESS) {
+            || ssz_serialize_uint8((uint8_t)value, encoded + 1u) != SSZ_SUCCESS) {
             return record_failure(path, type_name, "invalid uint8 union arm");
         }
         encoded_len += one_len;
@@ -1713,7 +1856,7 @@ static int run_union_fixture(
             return record_failure(path, type_name, "invalid uint16 union arm");
         }
         v16 = (uint16_t)value;
-        if (ssz_serialize_uint16(&v16, encoded + 1u, &two_len) != SSZ_SUCCESS) {
+        if (ssz_serialize_uint16(v16, encoded + 1u) != SSZ_SUCCESS) {
             return record_failure(path, type_name, "failed to encode uint16 union arm");
         }
         encoded_len += two_len;
@@ -1728,7 +1871,7 @@ static int run_union_fixture(
             return record_failure(path, type_name, "invalid uint32 union arm");
         }
         v32 = (uint32_t)value;
-        if (ssz_serialize_uint32(&v32, encoded + 1u, &four_len) != SSZ_SUCCESS) {
+        if (ssz_serialize_uint32(v32, encoded + 1u) != SSZ_SUCCESS) {
             return record_failure(path, type_name, "failed to encode uint32 union arm");
         }
         encoded_len += four_len;
@@ -1747,10 +1890,14 @@ static int run_union_fixture(
         return record_failure(path, type_name, "decoded union selector mismatch");
     }
 
+    ssz_chunk_t value_chunk;
+    ssz_chunk_t root_chunk;
     LanternRoot root;
-    if (ssz_mix_in_selector(value_root.bytes, (uint8_t)selector, root.bytes) != SSZ_SUCCESS) {
+    chunk_from_root(&value_root, &value_chunk);
+    if (ssz_mix_in_selector(&value_chunk, (uint8_t)selector, NULL, &root_chunk) != SSZ_SUCCESS) {
         return record_failure(path, type_name, "failed to compute union root");
     }
+    root_from_chunk(&root_chunk, &root);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
 
@@ -2533,7 +2680,7 @@ static int run_decode_rejection_fixture(
     int raw_idx = lantern_fixture_object_get_field(doc, case_idx, "rawBytes");
     int serialized_idx = lantern_fixture_object_get_field(doc, case_idx, "serialized");
     struct byte_buffer bytes = {0};
-    ssz_error_t decode_status = SSZ_ERROR_DESERIALIZATION;
+    ssz_error_t decode_status = SSZ_ERR_INVALID_ARGUMENT;
 
     if ((raw_idx < 0 && serialized_idx < 0)
         || fixture_token_to_bytes(doc, raw_idx >= 0 ? raw_idx : serialized_idx, &bytes) != 0) {
@@ -2545,28 +2692,42 @@ static int run_decode_rejection_fixture(
         decode_status = ssz_deserialize_uint32(bytes.data, bytes.len, &decoded);
     } else if (strcmp(type_name, "Bytes4") == 0) {
         uint8_t decoded[4];
-        decode_status = ssz_deserialize_vector_uint8(bytes.data, bytes.len, sizeof(decoded), decoded);
+        decode_status = ssz_deserialize_vector_fixed(
+            bytes.data,
+            bytes.len,
+            sizeof(decoded),
+            sizeof(uint8_t),
+            decoded,
+            sizeof(decoded));
     } else {
         size_t bit_count = 0u;
         if (parse_size_suffix(type_name, "DecodeBitvector", &bit_count) == 0
             || parse_size_suffix(type_name, "BoundaryBitvector", &bit_count) == 0) {
-            bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(*decoded));
+            size_t decoded_len = (bit_count + 7u) / 8u;
+            uint8_t *decoded = (uint8_t *)calloc(decoded_len > 0u ? decoded_len : 1u, sizeof(*decoded));
             if (!decoded) {
                 byte_buffer_reset(&bytes);
                 return record_failure(path, type_name, "allocation failed");
             }
-            decode_status = ssz_deserialize_bitvector(bytes.data, bytes.len, bit_count, decoded);
+            decode_status = ssz_deserialize_bitvector(bytes.data, bytes.len, bit_count, decoded, decoded_len);
             free(decoded);
         } else if (parse_size_suffix(type_name, "DecodeBitlist", &bit_count) == 0
             || parse_size_suffix(type_name, "SmokeBitlist", &bit_count) == 0
             || parse_size_suffix(type_name, "BoundaryBitlist", &bit_count) == 0) {
-            bool *decoded = (bool *)calloc(bit_count > 0u ? bit_count : 1u, sizeof(*decoded));
-            size_t actual_bits = 0u;
+            size_t decoded_len = (bit_count + 7u) / 8u;
+            uint8_t *decoded = (uint8_t *)calloc(decoded_len > 0u ? decoded_len : 1u, sizeof(*decoded));
+            uint64_t actual_bits = 0u;
             if (!decoded) {
                 byte_buffer_reset(&bytes);
                 return record_failure(path, type_name, "allocation failed");
             }
-            decode_status = ssz_deserialize_bitlist(bytes.data, bytes.len, bit_count, decoded, &actual_bits);
+            decode_status = ssz_deserialize_bitlist(
+                bytes.data,
+                bytes.len,
+                bit_count,
+                decoded,
+                decoded_len,
+                &actual_bits);
             free(decoded);
         } else {
             byte_buffer_reset(&bytes);

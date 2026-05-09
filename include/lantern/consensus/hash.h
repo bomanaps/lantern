@@ -28,12 +28,14 @@ int lantern_hash_tree_root_block_header(const LanternBlockHeader *header, Lanter
 int lantern_hash_tree_root_block(const LanternBlock *block, LanternRoot *out_root);
 int lantern_hash_tree_root_signed_block(const LanternSignedBlock *block, LanternRoot *out_root);
 int lantern_hash_tree_root_state(const LanternState *state, LanternRoot *out_root);
+int lantern_hash_tree_root_state_cached(LanternState *state, LanternRoot *out_root);
 int lantern_hash_tree_root_validators(const uint8_t *pubkeys, size_t count, LanternRoot *out_root);
 int lantern_hash_tree_root_validators_dual(
     const uint8_t *attestation_pubkeys,
     const uint8_t *proposal_pubkeys,
     size_t count,
     LanternRoot *out_root);
+void lantern_state_hash_cache_reset(LanternState *state);
 
 int lantern_merkleize_root_list(
     const struct lantern_root_list *list,
