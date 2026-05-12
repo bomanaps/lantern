@@ -518,6 +518,43 @@ static int test_pending_block_queue(void) {
         goto cleanup;
     }
 
+    if (lantern_client_debug_set_parent_requested(&client, &child_root, true) != 0) {
+        fprintf(stderr, "failed to remark parent_requested for failed completion test\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    if (lantern_client_debug_on_blocks_request_complete(
+            &client,
+            peer_b,
+            &parent_root,
+            LANTERN_TEST_BLOCKS_REQUEST_FAILED)
+        != 0) {
+        fprintf(stderr, "blocks_request_complete failed outcome wrapper failed\n");
+        rc = 1;
+        goto cleanup;
+    }
+
+    parent_requested = false;
+    if (lantern_client_debug_pending_entry(
+            &client,
+            0,
+            NULL,
+            NULL,
+            &parent_requested,
+            NULL,
+            0)
+        != 0) {
+        fprintf(stderr, "failed to inspect parent_requested after failed completion\n");
+        rc = 1;
+        goto cleanup;
+    }
+    if (!parent_requested) {
+        fprintf(stderr, "parent_requested cleared after failed completion\n");
+        rc = 1;
+        goto cleanup;
+    }
+
     size_t extra_count = LANTERN_PENDING_BLOCK_LIMIT + 50u;
     for (size_t i = 0; i < extra_count; ++i) {
         LanternSignedBlock extra;

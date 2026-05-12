@@ -10,6 +10,10 @@
 #include "lantern/support/log.h"
 
 #define LANTERN_GOSSIP_ENCODE_BUFFER_BYTES (16u * 1024u * 1024u)
+#define LANTERN_GOSSIP_MAX_MESSAGE_BYTES (10u * 1024u * 1024u)
+#define LANTERN_GOSSIP_MAX_RPC_BYTES (LANTERN_GOSSIP_MAX_MESSAGE_BYTES + (64u * 1024u))
+#define LANTERN_GOSSIP_TX_BUFFER_BYTES (4u * LANTERN_GOSSIP_MAX_RPC_BYTES)
+#define LANTERN_GOSSIP_MCACHE_BYTES (4u * LANTERN_GOSSIP_MAX_MESSAGE_BYTES)
 
 static int topic_eq(const libp2p_gossipsub_bytes_t topic, const char *expected) {
     return expected && strlen(expected) == topic.len && memcmp(topic.data, expected, topic.len) == 0;
@@ -369,6 +373,11 @@ int lantern_gossipsub_service_start(
     }
     gs_config.random_fn = lantern_libp2p_gossipsub_random;
     gs_config.message_id_fn = lantern_gossipsub_message_id;
+    /* Match leanSpec's 10 MiB max networking payload; hash-sig blocks exceed libp2p's 1 MiB defaults. */
+    gs_config.limits.max_message_data_bytes = LANTERN_GOSSIP_MAX_MESSAGE_BYTES;
+    gs_config.limits.max_rpc_bytes = LANTERN_GOSSIP_MAX_RPC_BYTES;
+    gs_config.capacity.tx_buffer_bytes = LANTERN_GOSSIP_TX_BUFFER_BYTES;
+    gs_config.capacity.mcache_bytes = LANTERN_GOSSIP_MCACHE_BYTES;
     gs_config.mesh.enable_flood_publish = 1;
     gs_config.mesh.seen_ttl_us = 120000000ull;
     gs_config.protocol_mask = LIBP2P_GOSSIPSUB_PROTOCOL_MASK_ALL;

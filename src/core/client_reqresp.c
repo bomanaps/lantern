@@ -128,7 +128,8 @@ static const char *lantern_blocks_request_outcome_text(enum lantern_blocks_reque
 static void lantern_client_handle_pending_parent_request_result(
     struct lantern_client *client,
     const LanternRoot *request_roots,
-    size_t root_count);
+    size_t root_count,
+    enum lantern_blocks_request_outcome outcome);
 
 
 /* ============================================================================
@@ -1132,7 +1133,8 @@ static const char *lantern_blocks_request_outcome_text(enum lantern_blocks_reque
 static void lantern_client_handle_pending_parent_request_result(
     struct lantern_client *client,
     const LanternRoot *request_roots,
-    size_t root_count)
+    size_t root_count,
+    enum lantern_blocks_request_outcome outcome)
 {
     if (!client || !request_roots || root_count == 0)
     {
@@ -1146,6 +1148,9 @@ static void lantern_client_handle_pending_parent_request_result(
     }
 
     struct lantern_pending_block_list *list = &client->pending_blocks;
+    bool retry_later =
+        outcome == LANTERN_BLOCKS_REQUEST_FAILED || outcome == LANTERN_BLOCKS_REQUEST_EMPTY;
+    uint64_t retry_after_ms = retry_later ? monotonic_millis() : 0u;
 
     for (size_t i = 0; i < list->length; ++i)
     {
@@ -1168,8 +1173,16 @@ static void lantern_client_handle_pending_parent_request_result(
             continue;
         }
 
-        entry->parent_requested = false;
-        entry->parent_requested_ms = 0;
+        if (retry_later)
+        {
+            entry->parent_requested = true;
+            entry->parent_requested_ms = retry_after_ms;
+        }
+        else
+        {
+            entry->parent_requested = false;
+            entry->parent_requested_ms = 0;
+        }
     }
 
     lantern_client_unlock_pending(client, locked);
@@ -1912,7 +1925,8 @@ void lantern_client_on_blocks_request_complete_batch_with_id(
     lantern_client_handle_pending_parent_request_result(
         client,
         request_roots,
-        root_count);
+        root_count,
+        outcome);
 
     if (outcome == LANTERN_BLOCKS_REQUEST_SUCCESS && peer_for_logs && peer_for_logs[0] != '\0')
     {

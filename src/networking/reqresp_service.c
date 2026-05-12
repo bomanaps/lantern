@@ -1051,7 +1051,7 @@ static void exchange_fail(struct lantern_reqresp_exchange *exchange, int error) 
                 exchange->roots,
                 exchange->root_count,
                 exchange->request_id,
-                0);
+                exchange->responses_received > 0u ? 1 : 0);
         }
     }
 }
