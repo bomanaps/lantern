@@ -692,10 +692,10 @@ cleanup:
     return rc;
 }
 
-static int test_import_block_parent_mismatch(void) {
+static int test_reqresp_block_response_accepts_missing_parent(void) {
     struct lantern_client client;
     memset(&client, 0, sizeof(client));
-    client.node_id = "test_parent_mismatch";
+    client.node_id = "test_reqresp_missing_parent";
 
     int rc = 0;
     LanternSignedBlock block;
@@ -822,13 +822,17 @@ static int test_import_block_parent_mismatch(void) {
     lantern_block_body_init(&block.block.body);
     block.block.slot = 5;
     block.block.proposer_index = 0;
-    client_test_fill_root(&block_root, 0x90);
     client_test_fill_root(&parent_root, 0x20);
     if (memcmp(parent_root.bytes, head_root.bytes, LANTERN_ROOT_SIZE) == 0) {
         parent_root.bytes[0] ^= 0xFFu;
     }
     block.block.parent_root = parent_root;
     client_test_fill_root(&block.block.state_root, 0x30);
+    if (lantern_hash_tree_root_block(&block.block, &block_root) != SSZ_SUCCESS) {
+        fprintf(stderr, "failed to hash block with missing parent\n");
+        rc = 1;
+        goto cleanup;
+    }
 
     if (lantern_client_pending_block_count(&client) != 0) {
         rc = 1;
@@ -836,14 +840,20 @@ static int test_import_block_parent_mismatch(void) {
         goto cleanup;
     }
 
-    if (lantern_client_debug_import_block(&client, &block, &block_root, "12D3KooWparent") != 0) {
-        fprintf(stderr, "import unexpectedly succeeded for mismatched parent\n");
+    if (reqresp_handle_block_response(
+            &client,
+            &block,
+            NULL,
+            0u,
+            "12D3KooWparent")
+        != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "reqresp rejected block accepted into pending queue\n");
         rc = 1;
         goto cleanup;
     }
 
     if (lantern_client_pending_block_count(&client) != 1) {
-        fprintf(stderr, "pending queue count mismatch after mismatched parent\n");
+        fprintf(stderr, "pending queue count mismatch after missing parent response\n");
         rc = 1;
         goto cleanup;
     }
@@ -859,18 +869,18 @@ static int test_import_block_parent_mismatch(void) {
             peer_text,
             sizeof(peer_text))
         != 0) {
-        fprintf(stderr, "failed to inspect pending entry after mismatched parent\n");
+        fprintf(stderr, "failed to inspect pending entry after missing parent response\n");
         rc = 1;
         goto cleanup;
     }
 
     if (memcmp(pending_root.bytes, block_root.bytes, LANTERN_ROOT_SIZE) != 0) {
-        fprintf(stderr, "pending root mismatch after mismatched parent\n");
+        fprintf(stderr, "pending root mismatch after missing parent response\n");
         rc = 1;
         goto cleanup;
     }
     if (memcmp(pending_parent.bytes, parent_root.bytes, LANTERN_ROOT_SIZE) != 0) {
-        fprintf(stderr, "pending parent root mismatch after mismatched parent\n");
+        fprintf(stderr, "pending parent root mismatch after missing parent response\n");
         rc = 1;
         goto cleanup;
     }
@@ -1389,7 +1399,7 @@ int main(void) {
     if (test_pending_block_queue_sync_drops_incoming() != 0) {
         return 1;
     }
-    if (test_import_block_parent_mismatch() != 0) {
+    if (test_reqresp_block_response_accepts_missing_parent() != 0) {
         return 1;
     }
     if (test_reqresp_collect_blocks_pending_fallback() != 0) {

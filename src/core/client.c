@@ -3099,8 +3099,7 @@ static lantern_client_error client_start_runtime(struct lantern_client *client)
 /**
  * @brief Start libp2p host and connection-level services.
  *
- * Loads the node key, starts the libp2p host, subscribes to connection events,
- * and launches the ping service.
+ * Loads the node key and prepares the libp2p host.
  *
  * @param client   Client to start networking for
  * @param options  User options containing key paths
@@ -3153,15 +3152,6 @@ static lantern_client_error client_start_network(
         client->connection_lock_initialized = true;
     }
     connection_counter_reset(client);
-
-    if (lantern_libp2p_host_register_event_handler(&client->network, connection_events_cb, client) != 0)
-    {
-        lantern_log_error(
-            "network",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "failed to subscribe to libp2p connection events");
-        return LANTERN_CLIENT_ERR_NETWORK;
-    }
 
     return LANTERN_CLIENT_OK;
 }
@@ -3332,6 +3322,19 @@ static lantern_client_error client_start_protocols(
         return LANTERN_CLIENT_ERR_NETWORK;
     }
     client->reqresp_running = true;
+
+    /*
+     * This handler may immediately send Status on CONN_ESTABLISHED. Register
+     * it after reqresp so reqresp has already cached the connection.
+     */
+    if (lantern_libp2p_host_register_event_handler(&client->network, connection_events_cb, client) != 0)
+    {
+        lantern_log_error(
+            "network",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "failed to subscribe to libp2p connection events");
+        return LANTERN_CLIENT_ERR_NETWORK;
+    }
 
     if (append_genesis_bootnodes(client) != 0)
     {

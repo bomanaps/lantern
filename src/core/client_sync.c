@@ -2815,13 +2815,10 @@ static bool try_schedule_blocks_request_batch(
                 .peer = selected_peer},
             "blocks_by_root request scheduling failed roots=%zu",
             root_count);
-        lantern_client_on_blocks_request_complete_batch_with_id(
-            client,
-            request_id,
-            selected_peer,
-            roots,
-            root_count,
-            LANTERN_BLOCKS_REQUEST_ABORTED);
+        /*
+         * The reqresp scheduler completes parse/open-stream failures itself so
+         * the reserved request id is released exactly once.
+         */
         return false;
     }
 

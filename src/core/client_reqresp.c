@@ -1470,6 +1470,36 @@ static bool append_pending_block_for_root(
     return appended;
 }
 
+static bool block_response_was_accepted(
+    struct lantern_client *client,
+    const LanternRoot *block_root)
+{
+    if (!client || !block_root)
+    {
+        return false;
+    }
+
+    bool pending_locked = lantern_client_lock_pending(client);
+    if (pending_locked)
+    {
+        bool pending = pending_block_list_find(&client->pending_blocks, block_root) != NULL;
+        lantern_client_unlock_pending(client, pending_locked);
+        if (pending)
+        {
+            return true;
+        }
+    }
+
+    bool state_locked = lantern_client_lock_state(client);
+    if (!state_locked)
+    {
+        return false;
+    }
+    bool known = lantern_client_block_known_locked(client, block_root, NULL);
+    lantern_client_unlock_state(client, state_locked);
+    return known;
+}
+
 /**
  * Collect blocks for a blocks_by_root request.
  *
@@ -1589,17 +1619,21 @@ int reqresp_handle_block_response(
         .has_slot = true,
         .slot = block->block.slot,
     };
-    return lantern_client_import_block(
-               client,
-               block,
-               &block_root,
-               &meta,
-               0u,
-               true,
-        raw_block_ssz,
-        raw_block_ssz_len)
-        ? LANTERN_CLIENT_OK
-        : LANTERN_CLIENT_ERR_RUNTIME;
+    if (lantern_client_import_block(
+            client,
+            block,
+            &block_root,
+            &meta,
+            0u,
+            true,
+            raw_block_ssz,
+            raw_block_ssz_len)
+        || block_response_was_accepted(client, &block_root))
+    {
+        return LANTERN_CLIENT_OK;
+    }
+
+    return LANTERN_CLIENT_ERR_RUNTIME;
 }
 
 void reqresp_blocks_request_complete(
