@@ -1258,6 +1258,55 @@ cleanup:
     return rc;
 }
 
+static int test_import_block_rejects_malformed_attestation_signature(void)
+{
+    struct block_signature_fixture fixture;
+    LanternSignedBlock block;
+    LanternRoot block_root;
+    uint64_t initial_slot = 0;
+    int rc = 1;
+
+    memset(&block, 0, sizeof(block));
+    if (setup_block_signature_fixture(&fixture, "test_import_bad_att_sig") != 0) {
+        fprintf(stderr, "failed to set up malformed attestation signature fixture\n");
+        return 1;
+    }
+
+    initial_slot = fixture.client.state.slot;
+    if (build_signed_block_for_import(&fixture, true, true, &block, &block_root) != 0) {
+        fprintf(stderr, "failed to build block fixture for malformed attestation signature\n");
+        goto cleanup;
+    }
+    if (block.signatures.attestation_signatures.length == 0
+        || !block.signatures.attestation_signatures.data
+        || block.signatures.attestation_signatures.data[0].proof_data.length == 0
+        || !block.signatures.attestation_signatures.data[0].proof_data.data) {
+        fprintf(stderr, "block fixture did not contain an attestation signature to corrupt\n");
+        goto cleanup;
+    }
+
+    memset(
+        block.signatures.attestation_signatures.data[0].proof_data.data,
+        0,
+        block.signatures.attestation_signatures.data[0].proof_data.length);
+
+    if (lantern_client_debug_import_block(&fixture.client, &block, &block_root, "12D3KooWsig") != 0) {
+        fprintf(stderr, "import unexpectedly accepted malformed attestation signature\n");
+        goto cleanup;
+    }
+    if (fixture.client.state.slot != initial_slot) {
+        fprintf(stderr, "state slot advanced after rejecting malformed attestation signature\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_signed_block_with_attestation_reset(&block);
+    teardown_block_signature_fixture(&fixture);
+    return rc;
+}
+
 static int test_import_block_skips_unknown_attestation_head_root(void)
 {
     struct block_signature_fixture fixture;
@@ -1452,6 +1501,9 @@ int main(void) {
         return 1;
     }
     if (test_import_block_rejects_missing_proposer_signature() != 0) {
+        return 1;
+    }
+    if (test_import_block_rejects_malformed_attestation_signature() != 0) {
         return 1;
     }
     if (test_import_block_skips_unknown_attestation_head_root() != 0) {
