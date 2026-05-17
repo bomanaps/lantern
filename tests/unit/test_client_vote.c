@@ -63,6 +63,7 @@ int lantern_client_advance_fork_choice_time_locked(
     struct lantern_client *client,
     uint64_t now_milliseconds,
     bool has_proposal);
+uint64_t monotonic_millis(void);
 void lantern_client_reset_local_validators(struct lantern_client *client);
 int lantern_client_load_xmss_keys(struct lantern_client *client);
 int validator_sign_with_key(
@@ -3454,6 +3455,100 @@ cleanup:
     return rc;
 }
 
+static int test_publish_attestations_ignores_peer_status_gate_inputs(void) {
+    struct lantern_client client;
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    struct publish_capture capture;
+    struct lantern_local_validator validator;
+    bool validator_enabled = true;
+    bool peer_enabled = false;
+    int rc = 1;
+
+    memset(&capture, 0, sizeof(capture));
+    memset(&validator, 0, sizeof(validator));
+
+    if (client_test_setup_vote_validation_client(
+            &client,
+            "vote_publish_peer_status_ignored",
+            &pub,
+            &secret,
+            NULL,
+            NULL)
+        != 0) {
+        goto cleanup;
+    }
+
+    validator.global_index = 0u;
+    validator.last_attested_slot = UINT64_MAX;
+    validator.attestation_secret_key = secret;
+    validator.proposal_secret_key = secret;
+
+    client.local_validators = &validator;
+    client.local_validator_count = 1u;
+    client.validator_enabled = &validator_enabled;
+    client.has_runtime = true;
+    client.gossip_running = true;
+    client.gossip.attestation_subnet_id = 0u;
+    snprintf(client.gossip.vote_topic, sizeof(client.gossip.vote_topic), "test/status_gate_vote");
+    snprintf(
+        client.gossip.vote_subnet_topic,
+        sizeof(client.gossip.vote_subnet_topic),
+        "test/status_gate_vote_subnet");
+    lantern_gossipsub_service_set_publish_hook(&client.gossip, publish_capture_hook, &capture);
+    lantern_gossipsub_service_set_loopback_only(&client.gossip, 1);
+
+    if (test_enable_blocks_request_peer(&client, "peer_status_gate") != 0) {
+        fprintf(stderr, "failed to initialize peer status gate test peer\n");
+        goto cleanup;
+    }
+    peer_enabled = true;
+
+    struct lantern_peer_status_entry *entry = &client.peer_status_entries[0];
+    entry->has_status = true;
+    entry->last_status_ms = 1u;
+    entry->status.head.slot = client.state.slot + 64u;
+    client_test_fill_root(&entry->status.head.root, 0xacu);
+    entry->status.finalized = client.state.latest_finalized;
+
+    uint64_t stale_slot = client.state.slot + 1u;
+    if (validator_publish_attestations(&client, stale_slot) != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "stale peer status should not block validator attestation\n");
+        goto cleanup;
+    }
+    if (capture.calls != 1u || validator.last_attested_slot != stale_slot) {
+        fprintf(stderr, "stale peer status did not produce exactly one attestation\n");
+        goto cleanup;
+    }
+
+    capture.calls = 0u;
+    capture.payload_len = 0u;
+    entry->last_status_ms = monotonic_millis();
+    entry->status.head.slot = client.state.slot + 128u;
+    client_test_fill_root(&entry->status.head.root, 0xbcu);
+
+    uint64_t mismatched_slot = stale_slot + 1u;
+    if (validator_publish_attestations(&client, mismatched_slot) != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "fresh mismatched peer head should not block validator attestation\n");
+        goto cleanup;
+    }
+    if (capture.calls != 1u || validator.last_attested_slot != mismatched_slot) {
+        fprintf(stderr, "fresh mismatched peer head did not produce exactly one attestation\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (peer_enabled) {
+        test_disable_blocks_request_peer(&client);
+    }
+    publish_capture_reset(&capture);
+    test_reset_agg_cache(&client);
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
 static int test_local_block_commit_updates_state_before_publish(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
@@ -3728,6 +3823,9 @@ int main(void) {
         return 1;
     }
     if (test_publish_attestations_includes_proposer() != 0) {
+        return 1;
+    }
+    if (test_publish_attestations_ignores_peer_status_gate_inputs() != 0) {
         return 1;
     }
     if (test_publish_aggregated_attestations_collects_any_slot_and_prunes_gossip() != 0) {
