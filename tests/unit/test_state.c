@@ -3096,6 +3096,143 @@ cleanup:
     return rc;
 }
 
+static int test_collect_attestations_uses_store_justified_when_parent_state_lags(void) {
+    LanternState state;
+    LanternState parent_state;
+    LanternState post_state;
+    LanternStore post_store;
+    LanternForkChoice fork_choice;
+    LanternRoot genesis_root;
+    LanternRoot block_one_root;
+    LanternRoot block_one_state_root;
+    LanternRoot block_two_root;
+    LanternBlock block_one;
+    LanternBlock block_two;
+    LanternCheckpoint store_justified;
+    LanternCheckpoint target;
+    LanternVote vote;
+    LanternAggregatedAttestations collected;
+    LanternAttestationSignatures collected_signatures;
+    LanternSignedBlock signed_block;
+    uint64_t proposer_index = 0;
+    int rc = 1;
+
+    lantern_state_init(&parent_state);
+    lantern_state_init(&post_state);
+    lantern_store_init(&post_store);
+    lantern_aggregated_attestations_init(&collected);
+    lantern_attestation_signatures_init(&collected_signatures);
+    lantern_signed_block_init(&signed_block);
+    memset(&block_one, 0, sizeof(block_one));
+    memset(&block_two, 0, sizeof(block_two));
+    memset(&vote, 0, sizeof(vote));
+
+    setup_state_and_fork_choice(&state, &fork_choice, 985, 4, &genesis_root);
+    expect_zero(
+        lantern_state_prepare_validator_votes(&state, state.config.num_validators),
+        "prepare validator votes for store-justified collection test");
+
+    make_block(&state, 1u, &genesis_root, &block_one, &block_one_root);
+    expect_zero(lantern_state_clone(&state, &parent_state), "clone lagging parent state");
+    expect_zero(lantern_state_process_slots(&parent_state, block_one.slot), "advance lagging parent state");
+    expect_zero(
+        lantern_state_process_block(&parent_state, &block_one, NULL, NULL),
+        "process lagging parent block");
+    expect_ssz_success(lantern_hash_tree_root_state(&parent_state, &block_one_state_root), "hash lagging parent state");
+    block_one.state_root = block_one_state_root;
+    parent_state.latest_block_header.state_root = block_one_state_root;
+    expect_ssz_success(lantern_hash_tree_root_block(&block_one, &block_one_root), "rehash lagging parent block");
+    expect_zero(
+        lantern_root_list_resize(&parent_state.historical_block_hashes, 3u),
+        "resize lagging parent history");
+    parent_state.historical_block_hashes.items[0] = genesis_root;
+    parent_state.historical_block_hashes.items[1] = block_one_root;
+
+    make_block(&parent_state, 2u, &block_one_root, &block_two, &block_two_root);
+    parent_state.historical_block_hashes.items[2] = block_two_root;
+
+    expect_zero(
+        lantern_fork_choice_add_block_with_state(
+            &fork_choice,
+            &block_one,
+            NULL,
+            &parent_state.latest_justified,
+            &parent_state.latest_finalized,
+            &block_one_root,
+            &parent_state),
+        "add lagging parent block with state");
+
+    store_justified.slot = 1u;
+    store_justified.root = block_one_root;
+    const LanternCheckpoint *store_finalized = lantern_fork_choice_latest_finalized(&fork_choice);
+    expect_zero(
+        lantern_fork_choice_update_checkpoints(&fork_choice, &store_justified, store_finalized),
+        "advance store justified for collection test");
+
+    target.slot = 2u;
+    target.root = block_two_root;
+    build_vote(&vote, NULL, 0u, target.slot, &store_justified, &target, 0u);
+    expect_zero(seed_known_payload_for_vote(&state, &vote, 0x88u), "seed store-source payload");
+
+    expect_zero(
+        lantern_proposer_for_slot(2u, state.config.num_validators, &proposer_index),
+        "compute proposer for store-source block");
+    expect_zero(
+        lantern_state_collect_attestations_for_block(
+            &state,
+            2u,
+            proposer_index,
+            &block_one_root,
+            &collected,
+            &collected_signatures),
+        "collect store-source attestations");
+
+    if (collected.length != 1u || collected_signatures.length != 1u) {
+        fprintf(stderr, "expected one store-source attestation, got %zu\n", collected.length);
+        goto cleanup;
+    }
+    if (!checkpoints_equal(&collected.data[0].data.source, &store_justified)) {
+        fprintf(stderr, "collected attestation did not use store latest_justified source\n");
+        goto cleanup;
+    }
+
+    signed_block.block.slot = 2u;
+    signed_block.block.proposer_index = proposer_index;
+    signed_block.block.parent_root = block_one_root;
+    if (lantern_aggregated_attestations_copy(&signed_block.block.body.attestations, &collected) != 0) {
+        fprintf(stderr, "failed to copy store-source attestations into block\n");
+        goto cleanup;
+    }
+
+    expect_zero(
+        lantern_state_compute_post_state(
+            &state,
+            &signed_block,
+            &post_state,
+            &post_store,
+            NULL),
+        "compute store-source post state");
+    if (!checkpoints_equal(&post_state.latest_justified, &store_justified)) {
+        fprintf(stderr, "post-state latest_justified did not use store checkpoint\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_signed_block_reset(&signed_block);
+    lantern_attestation_signatures_reset(&collected_signatures);
+    lantern_aggregated_attestations_reset(&collected);
+    lantern_store_reset(&post_store);
+    lantern_state_reset(&post_state);
+    lantern_block_body_reset(&block_two.body);
+    lantern_block_body_reset(&block_one.body);
+    lantern_state_reset(&parent_state);
+    lantern_state_reset(&state);
+    lantern_fork_choice_reset(&fork_choice);
+    return rc;
+}
+
 static int test_select_block_parent_uses_fork_choice(void) {
     LanternState state;
     lantern_state_init(&state);
@@ -4202,6 +4339,9 @@ int main(void) {
         return 1;
     }
     if (test_collect_attestations_fixed_point_deep_chain() != 0) {
+        return 1;
+    }
+    if (test_collect_attestations_uses_store_justified_when_parent_state_lags() != 0) {
         return 1;
     }
     if (test_select_block_parent_uses_fork_choice() != 0) {
