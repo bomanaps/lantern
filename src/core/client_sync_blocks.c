@@ -164,6 +164,45 @@ static void update_sync_progress_after_block(struct lantern_client *client)
     lantern_client_update_sync_progress(client, local_slot);
 }
 
+static void update_network_view_after_import(
+    struct lantern_client *client,
+    uint64_t block_slot,
+    uint64_t finalized_slot)
+{
+    if (!client)
+    {
+        return;
+    }
+
+    bool locked = false;
+    if (client->status_lock_initialized)
+    {
+        if (pthread_mutex_lock(&client->status_lock) != 0)
+        {
+            return;
+        }
+        locked = true;
+    }
+
+    if (!client->network_view.has_latest_observed_head_slot
+        || block_slot > client->network_view.latest_observed_head_slot)
+    {
+        client->network_view.latest_observed_head_slot = block_slot;
+        client->network_view.has_latest_observed_head_slot = true;
+    }
+    if (!client->network_view.has_network_finalized_slot
+        || finalized_slot > client->network_view.network_finalized_slot)
+    {
+        client->network_view.network_finalized_slot = finalized_slot;
+        client->network_view.has_network_finalized_slot = true;
+    }
+
+    if (locked)
+    {
+        pthread_mutex_unlock(&client->status_lock);
+    }
+}
+
 
 void lantern_client_cache_block_aggregated_proofs_locked(
     struct lantern_client *client,
@@ -287,6 +326,7 @@ int lantern_client_commit_and_publish_local_block(
     LanternCheckpoint pre_transition_finalized = {0};
     LanternRoot head_root = {0};
     uint64_t head_slot = 0u;
+    uint64_t committed_finalized_slot = 0u;
     bool committed = false;
 
     bool state_locked = lantern_client_lock_state(client);
@@ -340,6 +380,7 @@ int lantern_client_commit_and_publish_local_block(
     }
 
     lantern_client_cache_block_aggregated_proofs_locked(client, block);
+    committed_finalized_slot = post_state->latest_finalized.slot;
     adopt_state_locked(client, post_state);
     lantern_state_init(post_state);
     get_head_info_locked(client, &head_root, &head_slot);
@@ -381,6 +422,7 @@ int lantern_client_commit_and_publish_local_block(
     if (committed)
     {
         persist_block_after_import(client, block, &meta);
+        update_network_view_after_import(client, block->block.slot, committed_finalized_slot);
         if (client->status_lock_initialized
             && pthread_mutex_lock(&client->status_lock) == 0)
         {
@@ -2977,6 +3019,7 @@ static bool lantern_client_import_block_internal(
         bool have_replay_state = false;
         bool processed = false;
         bool deferred = false;
+        uint64_t observed_finalized_slot = 0u;
         LanternRoot missing_roots[LANTERN_MAX_REQUEST_BLOCKS];
         size_t missing_count = 0;
 
@@ -3004,6 +3047,10 @@ static bool lantern_client_import_block_internal(
                     &replay_state.latest_justified,
                     &replay_state.latest_finalized,
                     meta);
+                if (processed)
+                {
+                    observed_finalized_slot = replay_state.latest_finalized.slot;
+                }
             }
             else
             {
@@ -3150,6 +3197,7 @@ static bool lantern_client_import_block_internal(
         if (processed)
         {
             persist_block_after_import(client, block, meta);
+            update_network_view_after_import(client, block->block.slot, observed_finalized_slot);
             if (drain_pending_children)
             {
                 lantern_client_process_pending_children(client, &block_root_local);
@@ -3169,6 +3217,7 @@ static bool lantern_client_import_block_internal(
     }
 
     LanternCheckpoint pre_transition_finalized = client->state.latest_finalized;
+    uint64_t imported_finalized_slot = 0u;
     if (!apply_state_transition_locked(client, block, meta))
     {
         persist_invalid_block_on_state_transition_failure(
@@ -3205,6 +3254,7 @@ static bool lantern_client_import_block_internal(
         &head_root,
         head_slot,
         meta);
+    imported_finalized_slot = client->state.latest_finalized.slot;
     imported = true;
 
 cleanup:
@@ -3213,6 +3263,7 @@ cleanup:
     if (imported)
     {
         persist_block_after_import(client, block, meta);
+        update_network_view_after_import(client, block->block.slot, imported_finalized_slot);
         bool quiet_log = false;
         if (client->status_lock_initialized
             && pthread_mutex_lock(&client->status_lock) == 0)

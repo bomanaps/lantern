@@ -729,6 +729,186 @@ cleanup:
     return rc;
 }
 
+static int test_sync_completion_uses_network_finalized_threshold(void)
+{
+    struct lantern_client client;
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    int rc = 1;
+
+    if (client_test_setup_vote_validation_client(
+            &client,
+            "sync_completion_threshold",
+            &pub,
+            &secret,
+            NULL,
+            NULL)
+        != 0) {
+        return 1;
+    }
+
+    if (pthread_mutex_init(&client.status_lock, NULL) != 0) {
+        fprintf(stderr, "failed to initialize status mutex for sync threshold test\n");
+        goto cleanup;
+    }
+    client.status_lock_initialized = true;
+
+    if (pthread_mutex_init(&client.pending_lock, NULL) != 0) {
+        fprintf(stderr, "failed to initialize pending mutex for sync threshold test\n");
+        goto cleanup;
+    }
+    client.pending_lock_initialized = true;
+    lantern_client_debug_pending_reset(&client);
+
+    uint64_t local_head_slot = client.state.slot;
+    client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+    lantern_client_update_sync_progress(&client, local_head_slot);
+    if (client.sync_state == LANTERN_SYNC_STATE_SYNCED) {
+        fprintf(stderr, "sync should not complete without a network finalized view\n");
+        goto cleanup;
+    }
+
+    client.network_view.latest_observed_head_slot = local_head_slot + 128u;
+    client.network_view.network_finalized_slot = local_head_slot;
+    client.network_view.has_latest_observed_head_slot = true;
+    client.network_view.has_network_finalized_slot = true;
+
+    LanternSignedBlock pending_block;
+    memset(&pending_block, 0, sizeof(pending_block));
+    lantern_block_body_init(&pending_block.block.body);
+    pending_block.block.slot = local_head_slot + 10u;
+    LanternRoot pending_root;
+    LanternRoot missing_parent;
+    client_test_fill_root(&pending_root, 0x60u);
+    client_test_fill_root(&missing_parent, 0x70u);
+    if (lantern_client_debug_enqueue_pending_block(
+            &client,
+            &pending_block,
+            &pending_root,
+            &missing_parent,
+            NULL)
+        != 0) {
+        fprintf(stderr, "failed to enqueue orphan block for sync threshold test\n");
+        lantern_block_body_reset(&pending_block.block.body);
+        goto cleanup;
+    }
+    lantern_block_body_reset(&pending_block.block.body);
+
+    client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+    lantern_client_update_sync_progress(&client, local_head_slot);
+    if (client.sync_state == LANTERN_SYNC_STATE_SYNCED) {
+        fprintf(stderr, "sync should not complete while orphan parents are pending\n");
+        goto cleanup;
+    }
+
+    lantern_client_debug_pending_reset(&client);
+    client.network_view.network_finalized_slot = local_head_slot + 1u;
+    client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+    lantern_client_update_sync_progress(&client, local_head_slot);
+    if (client.sync_state == LANTERN_SYNC_STATE_SYNCED) {
+        fprintf(stderr, "sync should not complete below network finalized slot\n");
+        goto cleanup;
+    }
+
+    client.network_view.latest_observed_head_slot = local_head_slot + 1024u;
+    client.network_view.network_finalized_slot = local_head_slot;
+    client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+    lantern_client_update_sync_progress(&client, local_head_slot);
+    if (client.sync_state != LANTERN_SYNC_STATE_SYNCED) {
+        fprintf(stderr, "sync should complete at network finalized threshold\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    if (client.pending_lock_initialized) {
+        lantern_client_debug_pending_reset(&client);
+        pthread_mutex_destroy(&client.pending_lock);
+        client.pending_lock_initialized = false;
+    }
+    if (client.status_lock_initialized) {
+        pthread_mutex_destroy(&client.status_lock);
+        client.status_lock_initialized = false;
+    }
+    client_test_teardown_vote_validation_client(&client, pub, secret);
+    return rc;
+}
+
+static int test_imported_blocks_update_sync_network_view(void)
+{
+    struct block_signature_fixture fixture;
+    LanternSignedBlock first_block;
+    LanternSignedBlock second_block;
+    LanternRoot first_root;
+    LanternRoot second_root;
+    int rc = 1;
+
+    memset(&first_block, 0, sizeof(first_block));
+    memset(&second_block, 0, sizeof(second_block));
+    if (setup_block_signature_fixture(&fixture, "test_imported_network_view") != 0) {
+        fprintf(stderr, "failed to set up network view import fixture\n");
+        return 1;
+    }
+
+    if (pthread_mutex_init(&fixture.client.status_lock, NULL) != 0) {
+        fprintf(stderr, "failed to initialize status mutex for network view import test\n");
+        goto cleanup;
+    }
+    fixture.client.status_lock_initialized = true;
+    fixture.client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+
+    if (build_signed_block_for_import(&fixture, true, true, &first_block, &first_root) != 0) {
+        fprintf(stderr, "failed to build first network view block\n");
+        goto cleanup;
+    }
+    if (lantern_client_debug_import_block(&fixture.client, &first_block, &first_root, "12D3KooWview") != 1) {
+        fprintf(stderr, "failed to import first network view block\n");
+        goto cleanup;
+    }
+    uint64_t first_finalized = fixture.client.state.latest_finalized.slot;
+    if (!fixture.client.network_view.has_latest_observed_head_slot
+        || fixture.client.network_view.latest_observed_head_slot != first_block.block.slot) {
+        fprintf(stderr, "network view head slot did not track first imported block\n");
+        goto cleanup;
+    }
+    if (!fixture.client.network_view.has_network_finalized_slot
+        || fixture.client.network_view.network_finalized_slot != first_finalized) {
+        fprintf(stderr, "network view finalized slot did not track first imported post-state\n");
+        goto cleanup;
+    }
+    if (fixture.client.sync_state != LANTERN_SYNC_STATE_SYNCED) {
+        fprintf(stderr, "sync did not complete from imported block network view\n");
+        goto cleanup;
+    }
+
+    fixture.client.sync_state = LANTERN_SYNC_STATE_SYNCING;
+    if (build_signed_block_for_import(&fixture, true, true, &second_block, &second_root) != 0) {
+        fprintf(stderr, "failed to build second network view block\n");
+        goto cleanup;
+    }
+    if (lantern_client_debug_import_block(&fixture.client, &second_block, &second_root, "12D3KooWview") != 1) {
+        fprintf(stderr, "failed to import second network view block\n");
+        goto cleanup;
+    }
+    if (fixture.client.network_view.latest_observed_head_slot != second_block.block.slot) {
+        fprintf(stderr, "network view head slot did not update for newer imported block\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_signed_block_with_attestation_reset(&second_block);
+    lantern_signed_block_with_attestation_reset(&first_block);
+    if (fixture.client.status_lock_initialized) {
+        pthread_mutex_destroy(&fixture.client.status_lock);
+        fixture.client.status_lock_initialized = false;
+    }
+    teardown_block_signature_fixture(&fixture);
+    return rc;
+}
+
 static int test_reqresp_block_response_accepts_missing_parent(void) {
     struct lantern_client client;
     memset(&client, 0, sizeof(client));
@@ -1485,6 +1665,9 @@ int main(void) {
     if (test_pending_block_queue_sync_drops_incoming() != 0) {
         return 1;
     }
+    if (test_sync_completion_uses_network_finalized_threshold() != 0) {
+        return 1;
+    }
     if (test_reqresp_block_response_accepts_missing_parent() != 0) {
         return 1;
     }
@@ -1492,6 +1675,9 @@ int main(void) {
         return 1;
     }
     if (test_import_block_accepts_complete_signatures() != 0) {
+        return 1;
+    }
+    if (test_imported_blocks_update_sync_network_view() != 0) {
         return 1;
     }
     if (test_historical_backfill_imports_after_large_gap_connects() != 0) {

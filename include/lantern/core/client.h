@@ -190,6 +190,13 @@ struct lantern_local_validator {
     uint64_t last_attested_slot;
 };
 
+struct lantern_network_view {
+    uint64_t latest_observed_head_slot;
+    uint64_t network_finalized_slot;
+    bool has_latest_observed_head_slot;
+    bool has_network_finalized_slot;
+};
+
 struct lantern_client {
     char *data_dir;
     char *node_id;
@@ -279,6 +286,7 @@ struct lantern_client {
     uint64_t sync_target_slot;
     LanternSyncState sync_state;
     bool sync_in_progress;
+    struct lantern_network_view network_view;
     size_t status_requests_inflight_total;
     size_t status_requests_peak;
     bool status_guard_disabled;

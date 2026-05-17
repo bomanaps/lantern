@@ -529,128 +529,29 @@ static void maybe_seed_head_request_from_status(
         local_finalized_slot);
 }
 
-static bool peer_status_is_eligible(
+static void network_view_snapshot_locked(
     struct lantern_client *client,
-    const struct lantern_peer_status_entry *entry,
-    uint64_t now_ms)
+    uint64_t *out_head_slot,
+    bool *out_has_head_slot,
+    uint64_t *out_finalized_slot,
+    bool *out_has_finalized_slot)
 {
-    if (!client || !entry || !entry->has_status)
+    if (out_head_slot)
     {
-        return false;
+        *out_head_slot = client ? client->network_view.latest_observed_head_slot : 0u;
     }
-    if (entry->last_status_ms == 0 || now_ms < entry->last_status_ms)
+    if (out_has_head_slot)
     {
-        return false;
+        *out_has_head_slot = client && client->network_view.has_latest_observed_head_slot;
     }
-    if (!client->connection_lock_initialized)
+    if (out_finalized_slot)
     {
-        return true;
+        *out_finalized_slot = client ? client->network_view.network_finalized_slot : 0u;
     }
-    return lantern_client_is_peer_connected(client, entry->peer_id);
-}
-
-static bool network_finalized_slot_locked(
-    struct lantern_client *client,
-    uint64_t now_ms,
-    uint64_t *out_slot)
-{
-    if (!client || !out_slot)
+    if (out_has_finalized_slot)
     {
-        return false;
+        *out_has_finalized_slot = client && client->network_view.has_network_finalized_slot;
     }
-
-    bool found = false;
-    uint64_t mode_slot = 0;
-    size_t mode_count = 0;
-
-    for (size_t i = 0; i < client->peer_status_count; ++i)
-    {
-        const struct lantern_peer_status_entry *entry = &client->peer_status_entries[i];
-        if (!peer_status_is_eligible(client, entry, now_ms))
-        {
-            continue;
-        }
-
-        uint64_t slot = entry->status.finalized.slot;
-        size_t count = 0;
-        for (size_t j = 0; j < client->peer_status_count; ++j)
-        {
-            const struct lantern_peer_status_entry *other = &client->peer_status_entries[j];
-            if (!peer_status_is_eligible(client, other, now_ms))
-            {
-                continue;
-            }
-            if (other->status.finalized.slot == slot)
-            {
-                count += 1u;
-            }
-        }
-
-        if (!found || count > mode_count)
-        {
-            mode_slot = slot;
-            mode_count = count;
-            found = true;
-        }
-    }
-
-    if (found)
-    {
-        *out_slot = mode_slot;
-    }
-
-    return found;
-}
-
-static bool network_head_status_locked(
-    struct lantern_client *client,
-    uint64_t now_ms,
-    const LanternRoot *local_head_root,
-    uint64_t local_head_slot,
-    uint64_t *out_slot,
-    bool *out_matches_local)
-{
-    if (!client || !out_slot || !out_matches_local)
-    {
-        return false;
-    }
-
-    bool found = false;
-    bool matches_local = false;
-    uint64_t max_slot = 0;
-
-    for (size_t i = 0; i < client->peer_status_count; ++i)
-    {
-        const struct lantern_peer_status_entry *entry = &client->peer_status_entries[i];
-        if (!peer_status_is_eligible(client, entry, now_ms))
-        {
-            continue;
-        }
-
-        uint64_t slot = entry->status.head.slot;
-        if (!found || slot > max_slot)
-        {
-            max_slot = slot;
-            found = true;
-        }
-        if (local_head_root
-            && slot == local_head_slot
-            && memcmp(
-                   entry->status.head.root.bytes,
-                   local_head_root->bytes,
-                   LANTERN_ROOT_SIZE)
-                == 0)
-        {
-            matches_local = true;
-        }
-    }
-
-    if (found)
-    {
-        *out_slot = max_slot;
-    }
-    *out_matches_local = matches_local;
-    return found;
 }
 
 static void format_duration_seconds(uint64_t seconds, char *out, size_t out_len)
@@ -685,6 +586,8 @@ static void format_duration_seconds(uint64_t seconds, char *out, size_t out_len)
 static void maybe_log_sync_progress(
     struct lantern_client *client,
     uint64_t local_slot,
+    uint64_t network_head_slot,
+    bool has_network_head,
     uint64_t network_finalized,
     bool has_network_finalized,
     bool allow_sync_complete)
@@ -698,9 +601,7 @@ static void maybe_log_sync_progress(
 
     size_t pending = 0;
     size_t orphan_count = 0;
-    LanternRoot local_head_root = {0};
     uint64_t local_head_slot = local_slot;
-    bool has_local_head = false;
     char pending_peer[sizeof(((struct lantern_pending_block *)0)->peer_text)];
     pending_peer[0] = '\0';
     char orphan_peer[sizeof(((struct lantern_pending_block *)0)->peer_text)];
@@ -746,6 +647,7 @@ static void maybe_log_sync_progress(
         }
         if (state_locked && client->has_fork_choice)
         {
+            LanternRoot local_head_root = {0};
             if (lantern_fork_choice_current_head(&client->fork_choice, &local_head_root) == 0)
             {
                 uint64_t fork_slot = 0;
@@ -758,7 +660,6 @@ static void maybe_log_sync_progress(
                     == 0)
                 {
                     local_head_slot = fork_slot;
-                    has_local_head = true;
                 }
             }
         }
@@ -766,20 +667,6 @@ static void maybe_log_sync_progress(
         lantern_client_unlock_state(client, state_locked);
     }
 
-    uint64_t network_head_slot = 0;
-    bool has_network_head = false;
-    bool head_matches_peer = false;
-    if (client->status_lock_initialized && pthread_mutex_lock(&client->status_lock) == 0)
-    {
-        has_network_head = network_head_status_locked(
-            client,
-            now_ms,
-            has_local_head ? &local_head_root : NULL,
-            local_head_slot,
-            &network_head_slot,
-            &head_matches_peer);
-        pthread_mutex_unlock(&client->status_lock);
-    }
     if (!has_network_finalized && !has_network_head)
     {
         return;
@@ -793,9 +680,8 @@ static void maybe_log_sync_progress(
 
     bool has_orphans = orphan_count > 0;
     bool behind_finalized = has_network_finalized && network_finalized > local_head_slot;
-    bool behind_head = has_network_head && local_head_slot < network_head_slot;
-    bool caught_up = has_network_head && !behind_head && head_matches_peer;
-    bool syncing = has_orphans || behind_finalized || !caught_up;
+    bool synced = has_network_finalized && !has_orphans && !behind_finalized;
+    bool syncing = !synced;
 
     struct lantern_log_metadata meta = {.validator = client->node_id};
     bool should_request_parent = false;
@@ -947,15 +833,27 @@ void lantern_client_update_sync_progress(
         return;
     }
 
+    uint64_t network_head = 0;
+    bool has_network_head = false;
     uint64_t network_finalized = 0;
-    bool has_network_finalized = network_finalized_slot_locked(
+    bool has_network_finalized = false;
+    network_view_snapshot_locked(
         client,
-        monotonic_millis(),
-        &network_finalized);
+        &network_head,
+        &has_network_head,
+        &network_finalized,
+        &has_network_finalized);
 
     pthread_mutex_unlock(&client->status_lock);
 
-    maybe_log_sync_progress(client, local_slot, network_finalized, has_network_finalized, true);
+    maybe_log_sync_progress(
+        client,
+        local_slot,
+        network_head,
+        has_network_head,
+        network_finalized,
+        has_network_finalized,
+        true);
 }
 
 
@@ -1055,15 +953,9 @@ static void lantern_client_peer_status_update(
         return;
     }
 
-    uint64_t network_finalized = 0;
-    bool has_network_finalized = network_finalized_slot_locked(
-        client,
-        monotonic_millis(),
-        &network_finalized);
-
     pthread_mutex_unlock(&client->status_lock);
 
-    maybe_log_sync_progress(client, local_slot, network_finalized, has_network_finalized, true);
+    lantern_client_update_sync_progress(client, local_slot);
 }
 
 
