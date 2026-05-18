@@ -58,7 +58,7 @@ static bool finalized_checkpoint_advanced(
     const LanternCheckpoint *previous_finalized,
     const LanternCheckpoint *current_finalized);
 static void persist_finalized_state_if_advanced_locked(
-    const struct lantern_client *client,
+    struct lantern_client *client,
     const LanternCheckpoint *previous_finalized,
     const struct lantern_log_metadata *meta);
 static void prune_finalized_attestation_material_if_slot_advanced_locked(
@@ -2657,7 +2657,7 @@ static void prune_finalized_fork_choice_states_if_advanced_locked(
 }
 
 static void persist_finalized_state_if_advanced_locked(
-    const struct lantern_client *client,
+    struct lantern_client *client,
     const LanternCheckpoint *previous_finalized,
     const struct lantern_log_metadata *meta)
 {
@@ -2678,7 +2678,72 @@ static void persist_finalized_state_if_advanced_locked(
         return;
     }
 
-    if (lantern_storage_save_finalized_state(client->data_dir, &client->state) != 0)
+    char finalized_hex[ROOT_HEX_BUFFER_LEN];
+    format_root_hex(&current_finalized->root, finalized_hex, sizeof(finalized_hex));
+
+    const LanternState *finalized_state = NULL;
+    LanternState loaded_finalized_state;
+    lantern_state_init(&loaded_finalized_state);
+    bool loaded_finalized_state_owned = false;
+
+    if (client->has_fork_choice)
+    {
+        finalized_state =
+            lantern_fork_choice_block_state(&client->fork_choice, &current_finalized->root);
+        if (finalized_state
+            && !state_matches_root(finalized_state, &current_finalized->root))
+        {
+            finalized_state = NULL;
+        }
+    }
+    if (!finalized_state
+        && client->has_state
+        && state_matches_root(&client->state, &current_finalized->root))
+    {
+        finalized_state = &client->state;
+    }
+    if (!finalized_state
+        && load_snapshot_state_for_root_locked(
+               client,
+               &current_finalized->root,
+               &loaded_finalized_state,
+               NULL))
+    {
+        loaded_finalized_state_owned = true;
+        if (state_matches_root(&loaded_finalized_state, &current_finalized->root))
+        {
+            finalized_state = &loaded_finalized_state;
+        }
+    }
+    if (!finalized_state)
+    {
+        lantern_log_warn(
+            "storage",
+            log_meta,
+            "failed to find finalized replay state finalized_slot=%" PRIu64 " root=%s head_slot=%" PRIu64,
+            current_finalized->slot,
+            finalized_hex[0] ? finalized_hex : "0x0",
+            client->state.slot);
+        goto cleanup;
+    }
+
+    if (lantern_storage_store_state_for_root(
+            client->data_dir,
+            &current_finalized->root,
+            finalized_state)
+        != 0)
+    {
+        lantern_log_warn(
+            "storage",
+            log_meta,
+            "failed to persist finalized root state finalized_slot=%" PRIu64 " root=%s head_slot=%" PRIu64,
+            current_finalized->slot,
+            finalized_hex[0] ? finalized_hex : "0x0",
+            client->state.slot);
+        goto cleanup;
+    }
+
+    if (lantern_storage_save_finalized_state(client->data_dir, finalized_state) != 0)
     {
         lantern_log_warn(
             "storage",
@@ -2686,11 +2751,9 @@ static void persist_finalized_state_if_advanced_locked(
             "failed to persist finalized replay state finalized_slot=%" PRIu64 " head_slot=%" PRIu64,
             current_finalized->slot,
             client->state.slot);
-        return;
+        goto cleanup;
     }
 
-    char finalized_hex[ROOT_HEX_BUFFER_LEN];
-    format_root_hex(&current_finalized->root, finalized_hex, sizeof(finalized_hex));
     lantern_log_info(
         "storage",
         log_meta,
@@ -2724,6 +2787,12 @@ static void persist_finalized_state_if_advanced_locked(
             current_finalized->slot,
             finalized_hex[0] ? finalized_hex : "0x0",
             pruned);
+    }
+
+cleanup:
+    if (loaded_finalized_state_owned)
+    {
+        lantern_state_reset(&loaded_finalized_state);
     }
 }
 

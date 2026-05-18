@@ -12,6 +12,7 @@
 #include "lantern/consensus/hash.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/state.h"
+#include "lantern/consensus/ssz.h"
 #include "lantern/genesis/genesis.h"
 #include "lantern/storage/storage.h"
 #include "lantern/support/string_list.h"
@@ -168,6 +169,32 @@ static int enable_sync_test_peer(struct lantern_client *client, const char *peer
     }
     client->connected_peers = 1u;
     return 0;
+}
+
+static int test_state_latest_block_root(const LanternState *state, LanternRoot *out_root)
+{
+    if (!state || !out_root) {
+        return -1;
+    }
+    LanternRoot state_root;
+    if (lantern_hash_tree_root_state(state, &state_root) != SSZ_SUCCESS) {
+        return -1;
+    }
+    LanternBlockHeader header = state->latest_block_header;
+    header.state_root = state_root;
+    return lantern_hash_tree_root_block_header(&header, out_root) == SSZ_SUCCESS ? 0 : -1;
+}
+
+static bool test_state_matches_root(const LanternState *state, const LanternRoot *root)
+{
+    if (!state || !root) {
+        return false;
+    }
+    LanternRoot computed;
+    if (test_state_latest_block_root(state, &computed) != 0) {
+        return false;
+    }
+    return memcmp(computed.bytes, root->bytes, LANTERN_ROOT_SIZE) == 0;
 }
 
 static void disable_sync_test_peer(struct lantern_client *client)
@@ -1483,6 +1510,119 @@ cleanup:
     return rc;
 }
 
+static int test_import_persists_finalized_replay_base(void)
+{
+    struct block_signature_fixture fixture;
+    LanternCheckpoint initial_finalized;
+    LanternCheckpoint advanced_finalized = {0};
+    bool finalized_advanced = false;
+    int rc = 1;
+
+    if (setup_block_signature_fixture(&fixture, "test_finalized_replay_base") != 0) {
+        fprintf(stderr, "failed to set up finalized replay base fixture\n");
+        return 1;
+    }
+
+    initial_finalized = fixture.client.state.latest_finalized;
+    LanternRoot initial_head_root;
+    if (test_state_latest_block_root(&fixture.client.state, &initial_head_root) != 0) {
+        fprintf(stderr, "failed to compute initial head root for replay base test\n");
+        goto cleanup;
+    }
+    if (fixture.client.has_fork_choice
+        && lantern_fork_choice_set_block_state(
+               &fixture.client.fork_choice,
+               &initial_head_root,
+               &fixture.client.state)
+            != 0) {
+        fprintf(stderr, "failed to seed initial head state for replay base test\n");
+        goto cleanup;
+    }
+    if (lantern_storage_store_state_for_root(
+            fixture.client.data_dir,
+            &initial_head_root,
+            &fixture.client.state)
+        != 0) {
+        fprintf(stderr, "failed to persist initial head state for replay base test\n");
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < 12u && !finalized_advanced; ++i) {
+        LanternSignedBlock block;
+        LanternRoot block_root;
+        memset(&block, 0, sizeof(block));
+        if (build_signed_block_for_import(&fixture, true, true, &block, &block_root) != 0) {
+            fprintf(stderr, "failed to build block for finalized replay base test\n");
+            lantern_signed_block_with_attestation_reset(&block);
+            goto cleanup;
+        }
+        if (lantern_client_debug_import_block(&fixture.client, &block, &block_root, "12D3KooWbase") != 1) {
+            fprintf(stderr, "failed to import block for finalized replay base test\n");
+            lantern_signed_block_with_attestation_reset(&block);
+            goto cleanup;
+        }
+        lantern_signed_block_with_attestation_reset(&block);
+        if (fixture.client.state.latest_finalized.slot > initial_finalized.slot) {
+            advanced_finalized = fixture.client.state.latest_finalized;
+            finalized_advanced = true;
+        }
+    }
+
+    if (!finalized_advanced) {
+        fprintf(stderr, "finalized checkpoint did not advance in replay base test\n");
+        goto cleanup;
+    }
+
+    uint8_t *state_bytes = NULL;
+    size_t state_len = 0u;
+    if (lantern_storage_load_state_bytes_for_root(
+            fixture.client.data_dir,
+            &advanced_finalized.root,
+            &state_bytes,
+            &state_len)
+        != 0) {
+        fprintf(stderr, "finalized root state snapshot missing after prune\n");
+        free(state_bytes);
+        goto cleanup;
+    }
+
+    LanternState keyed_state;
+    lantern_state_init(&keyed_state);
+    if (lantern_ssz_decode_state(&keyed_state, state_bytes, state_len) != SSZ_SUCCESS) {
+        fprintf(stderr, "failed to decode finalized root state snapshot\n");
+        free(state_bytes);
+        lantern_state_reset(&keyed_state);
+        goto cleanup;
+    }
+    free(state_bytes);
+    if (!test_state_matches_root(&keyed_state, &advanced_finalized.root)) {
+        fprintf(stderr, "finalized root state snapshot does not match finalized root\n");
+        lantern_state_reset(&keyed_state);
+        goto cleanup;
+    }
+    lantern_state_reset(&keyed_state);
+
+    LanternState finalized_state;
+    lantern_state_init(&finalized_state);
+    if (lantern_storage_load_finalized_state(fixture.client.data_dir, &finalized_state) != 0) {
+        fprintf(stderr, "persisted finalized replay state missing\n");
+        lantern_state_reset(&finalized_state);
+        goto cleanup;
+    }
+    if (!test_state_matches_root(&finalized_state, &advanced_finalized.root)) {
+        fprintf(stderr, "persisted finalized replay state does not match finalized root\n");
+        lantern_state_reset(&finalized_state);
+        goto cleanup;
+    }
+    lantern_state_reset(&finalized_state);
+
+    rc = 0;
+
+cleanup:
+    teardown_block_signature_fixture(&fixture);
+    return rc;
+}
+
 static int test_historical_backfill_imports_after_large_gap_connects(void)
 {
     struct block_signature_fixture target;
@@ -1881,6 +2021,9 @@ int main(void) {
         return 1;
     }
     if (test_import_block_accepts_complete_signatures() != 0) {
+        return 1;
+    }
+    if (test_import_persists_finalized_replay_base() != 0) {
         return 1;
     }
     if (test_imported_blocks_update_sync_network_view() != 0) {
