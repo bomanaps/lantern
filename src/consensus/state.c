@@ -360,22 +360,6 @@ static const LanternState *lantern_state_cached_fork_choice_state_for_root(
     return lantern_fork_choice_block_state(store->fork_choice, root);
 }
 
-static int lantern_state_apply_store_latest_justified(LanternState *state, const LanternStore *store) {
-    if (!state || !store || !store->fork_choice) {
-        return 0;
-    }
-    const LanternCheckpoint *latest_justified =
-        lantern_fork_choice_latest_justified(store->fork_choice);
-    if (!latest_justified || lantern_root_is_zero(&latest_justified->root)) {
-        return 0;
-    }
-    if (latest_justified->slot < state->latest_justified.slot) {
-        return 0;
-    }
-    state->latest_justified = *latest_justified;
-    return lantern_state_mark_justified_slot(state, latest_justified->slot);
-}
-
 static bool signature_is_zero(const LanternSignature *signature) {
     if (!signature) {
         return true;
@@ -3290,10 +3274,6 @@ int lantern_state_collect_attestations_for_block(
         rc = -1;
         goto cleanup;
     }
-    if (lantern_state_apply_store_latest_justified(&slot_snapshot, store) != 0) {
-        rc = -1;
-        goto cleanup;
-    }
 
     LanternCheckpoint checkpoint = slot_snapshot.latest_justified;
     if (slot_snapshot.latest_block_header.slot == 0u) {
@@ -3424,10 +3404,6 @@ int lantern_state_compute_post_state(
     }
     int rc = 0;
     if (lantern_state_process_slots(&scratch, block->block.slot) != 0) {
-        rc = -1;
-        goto cleanup;
-    }
-    if (lantern_state_apply_store_latest_justified(&scratch, store) != 0) {
         rc = -1;
         goto cleanup;
     }

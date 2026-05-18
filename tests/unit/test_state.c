@@ -3096,11 +3096,9 @@ cleanup:
     return rc;
 }
 
-static int test_collect_attestations_uses_store_justified_when_parent_state_lags(void) {
+static int test_collect_attestations_ignores_store_justified_when_parent_state_lags(void) {
     LanternState state;
     LanternState parent_state;
-    LanternState post_state;
-    LanternStore post_store;
     LanternForkChoice fork_choice;
     LanternRoot genesis_root;
     LanternRoot block_one_root;
@@ -3113,16 +3111,12 @@ static int test_collect_attestations_uses_store_justified_when_parent_state_lags
     LanternVote vote;
     LanternAggregatedAttestations collected;
     LanternAttestationSignatures collected_signatures;
-    LanternSignedBlock signed_block;
     uint64_t proposer_index = 0;
     int rc = 1;
 
     lantern_state_init(&parent_state);
-    lantern_state_init(&post_state);
-    lantern_store_init(&post_store);
     lantern_aggregated_attestations_init(&collected);
     lantern_attestation_signatures_init(&collected_signatures);
-    lantern_signed_block_init(&signed_block);
     memset(&block_one, 0, sizeof(block_one));
     memset(&block_two, 0, sizeof(block_two));
     memset(&vote, 0, sizeof(vote));
@@ -3187,44 +3181,16 @@ static int test_collect_attestations_uses_store_justified_when_parent_state_lags
             &collected_signatures),
         "collect store-source attestations");
 
-    if (collected.length != 1u || collected_signatures.length != 1u) {
-        fprintf(stderr, "expected one store-source attestation, got %zu\n", collected.length);
-        goto cleanup;
-    }
-    if (!checkpoints_equal(&collected.data[0].data.source, &store_justified)) {
-        fprintf(stderr, "collected attestation did not use store latest_justified source\n");
-        goto cleanup;
-    }
-
-    signed_block.block.slot = 2u;
-    signed_block.block.proposer_index = proposer_index;
-    signed_block.block.parent_root = block_one_root;
-    if (lantern_aggregated_attestations_copy(&signed_block.block.body.attestations, &collected) != 0) {
-        fprintf(stderr, "failed to copy store-source attestations into block\n");
-        goto cleanup;
-    }
-
-    expect_zero(
-        lantern_state_compute_post_state(
-            &state,
-            &signed_block,
-            &post_state,
-            &post_store,
-            NULL),
-        "compute store-source post state");
-    if (!checkpoints_equal(&post_state.latest_justified, &store_justified)) {
-        fprintf(stderr, "post-state latest_justified did not use store checkpoint\n");
+    if (collected.length != 0u || collected_signatures.length != 0u) {
+        fprintf(stderr, "selected store-source attestation from lagging parent state\n");
         goto cleanup;
     }
 
     rc = 0;
 
 cleanup:
-    lantern_signed_block_reset(&signed_block);
     lantern_attestation_signatures_reset(&collected_signatures);
     lantern_aggregated_attestations_reset(&collected);
-    lantern_store_reset(&post_store);
-    lantern_state_reset(&post_state);
     lantern_block_body_reset(&block_two.body);
     lantern_block_body_reset(&block_one.body);
     lantern_state_reset(&parent_state);
@@ -3543,15 +3509,17 @@ cleanup:
     return result;
 }
 
-static int test_compute_post_state_seals_cached_parent_before_store_justified(void) {
+static int test_compute_post_state_ignores_store_justified_for_hash(void) {
     LanternState state;
     LanternState block_one_state;
+    LanternState expected_state;
     LanternState post_state;
     LanternStore post_store;
     LanternForkChoice fork_choice;
     LanternRoot genesis_root;
     LanternRoot block_one_root;
     LanternRoot block_one_state_root;
+    LanternRoot expected_state_root;
     LanternRoot post_state_root;
     LanternBlock block_one;
     LanternSignedBlock signed_block;
@@ -3560,6 +3528,7 @@ static int test_compute_post_state_seals_cached_parent_before_store_justified(vo
 
     lantern_state_init(&state);
     lantern_state_init(&block_one_state);
+    lantern_state_init(&expected_state);
     lantern_state_init(&post_state);
     lantern_store_init(&post_store);
     lantern_signed_block_init(&signed_block);
@@ -3615,8 +3584,24 @@ static int test_compute_post_state_seals_cached_parent_before_store_justified(vo
         fprintf(stderr, "compute_post_state rejected cached parent after store justified advanced\n");
         goto cleanup;
     }
-    if (!checkpoints_equal(&post_state.latest_justified, &store_justified)) {
-        fprintf(stderr, "compute_post_state did not retain advanced store justified checkpoint\n");
+
+    expect_zero(lantern_state_clone(&block_one_state, &expected_state), "clone expected cached parent state");
+    expect_zero(lantern_state_process_slots(&expected_state, signed_block.block.slot), "advance expected cached parent state");
+    expect_zero(
+        lantern_state_process_block(&expected_state, &signed_block.block, NULL, NULL),
+        "process expected cached parent block");
+    expect_ssz_success(lantern_hash_tree_root_state(&expected_state, &expected_state_root), "hash expected cached parent state");
+
+    if (memcmp(post_state_root.bytes, expected_state_root.bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "compute_post_state root used store justified checkpoint\n");
+        goto cleanup;
+    }
+    if (!checkpoints_equal(&post_state.latest_justified, &expected_state.latest_justified)) {
+        fprintf(stderr, "compute_post_state checkpoint diverged from spec transition\n");
+        goto cleanup;
+    }
+    if (checkpoints_equal(&post_state.latest_justified, &store_justified)) {
+        fprintf(stderr, "compute_post_state retained store justified checkpoint\n");
         goto cleanup;
     }
 
@@ -3626,6 +3611,7 @@ cleanup:
     lantern_signed_block_reset(&signed_block);
     lantern_store_reset(&post_store);
     lantern_state_reset(&post_state);
+    lantern_state_reset(&expected_state);
     lantern_block_body_reset(&block_one.body);
     lantern_state_reset(&block_one_state);
     lantern_state_reset(&state);
@@ -4368,7 +4354,7 @@ int main(void) {
     if (test_compute_post_state_matches_process_block_and_votes() != 0) {
         return 1;
     }
-    if (test_compute_post_state_seals_cached_parent_before_store_justified() != 0) {
+    if (test_compute_post_state_ignores_store_justified_for_hash() != 0) {
         return 1;
     }
     if (test_attestations_single_vote_justifies() != 0) {
@@ -4434,7 +4420,7 @@ int main(void) {
     if (test_collect_attestations_fixed_point_deep_chain() != 0) {
         return 1;
     }
-    if (test_collect_attestations_uses_store_justified_when_parent_state_lags() != 0) {
+    if (test_collect_attestations_ignores_store_justified_when_parent_state_lags() != 0) {
         return 1;
     }
     if (test_select_block_parent_uses_fork_choice() != 0) {
