@@ -764,6 +764,9 @@ static int collect_attestations_for_checkpoint(
         if (!lantern_checkpoint_equal(&data.source, checkpoint)) {
             continue;
         }
+        if (data.target.slot <= data.source.slot) {
+            continue;
+        }
         if (lantern_root_list_contains(processed_data_roots, &entry->data_root)) {
             continue;
         }
