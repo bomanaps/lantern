@@ -3557,11 +3557,11 @@ int lantern_state_compute_vote_checkpoints(
                     parent_slot,
                     target_hex[0] ? target_hex : "0x0",
                     parent_hex[0] ? parent_hex : "0x0");
+            }
+            target_root = parent_root;
+            target_slot = parent_slot;
         }
-        target_root = parent_root;
-        target_slot = parent_slot;
     }
-}
 
     bool justifiable_slot_found = true;
     while (!lantern_slot_is_justifiable(target_slot, finalized_checkpoint.slot)) {

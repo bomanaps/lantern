@@ -316,8 +316,8 @@ int lantern_libp2p_host_prepare(struct lantern_libp2p_host *state, const struct 
     state->quic_config.endpoint.max_incoming_connections = 64u;
     state->quic_config.endpoint.max_outgoing_connections = 64u;
     state->quic_config.endpoint.max_bidi_streams = 128u;
-    state->quic_config.max_rx_datagrams_per_drive = 64u;
-    state->quic_config.max_tx_datagrams_per_drive = 64u;
+    state->quic_config.max_rx_datagrams_per_drive = LIBP2P_QUIC_SERVICE_DEFAULT_DATAGRAM_BUDGET;
+    state->quic_config.max_tx_datagrams_per_drive = LIBP2P_QUIC_SERVICE_DEFAULT_DATAGRAM_BUDGET;
 
     libp2p_host_config_t host_config;
     if (libp2p_host_config_default(&host_config) != LIBP2P_HOST_OK) {
