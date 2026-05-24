@@ -798,6 +798,9 @@ int lantern_fixture_parse_signature_proof(
         proof_data_idx = lantern_fixture_object_get_field(doc, proof_idx, "proof_data");
     }
     if (proof_data_idx < 0) {
+        proof_data_idx = lantern_fixture_object_get_field(doc, proof_idx, "proof");
+    }
+    if (proof_data_idx < 0) {
         return -1;
     }
     if (lantern_fixture_parse_byte_list_object(doc, proof_data_idx, &out_proof->proof_data) != 0) {

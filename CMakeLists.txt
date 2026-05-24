@@ -297,6 +297,16 @@ if(LANTERN_BUILD_TESTS)
     add_test(NAME lantern_signature COMMAND lantern_signature_test)
     set_tests_properties(lantern_signature PROPERTIES TIMEOUT 3600)
 
+    add_executable(lantern_fixture_loader_test tests/unit/test_fixture_loader.c)
+    target_link_libraries(lantern_fixture_loader_test PRIVATE ${LANTERN_TEST_LINK_LIB})
+    target_include_directories(
+        lantern_fixture_loader_test
+        PRIVATE
+            ${PROJECT_SOURCE_DIR}
+            ${PROJECT_SOURCE_DIR}/external/jsmn
+    )
+    add_test(NAME lantern_fixture_loader COMMAND lantern_fixture_loader_test)
+
     add_executable(lantern_consensus_runtime_test tests/unit/test_consensus_runtime.c)
     target_link_libraries(lantern_consensus_runtime_test PRIVATE ${LANTERN_TEST_LINK_LIB})
     add_test(NAME lantern_consensus_runtime COMMAND lantern_consensus_runtime_test)

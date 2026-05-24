@@ -72,7 +72,7 @@ RUN --mount=type=cache,target=/root/.ccache,sharing=locked,id=ccache-${TARGETPLA
     --mount=type=cache,target=/usr/src/lantern/build,sharing=locked,id=lantern-build-${TARGETPLATFORM} \
     echo "LANTERN_FORCE_REBUILD=${LANTERN_FORCE_REBUILD}" \
     && cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DLANTERN_GIT_COMMIT="${GIT_COMMIT}" -DLANTERN_GIT_BRANCH="${GIT_BRANCH}" \
-    && cmake --build build --target lantern_cli --parallel "$(nproc)" \
+    && cmake --build build --target lantern_cli --parallel "$(nproc)" --clean-first \
     && (cmake --build build --target lantern_client_test --parallel "$(nproc)" || true) \
     && mkdir -p /opt/lantern/bin \
     && cp build/lantern_cli /opt/lantern/bin/lantern \
