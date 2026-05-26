@@ -5,13 +5,11 @@
 #include "lantern/consensus/state.h"
 
 #include <inttypes.h>
-#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
@@ -24,255 +22,9 @@
 #include "lantern/consensus/quorum.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/store.h"
-#include "pq-bindings-c-rust.h"
-
-#define LANTERN_BLOCK_SIGNATURE_WORKER_FALLBACK 4u
-#define LANTERN_BLOCK_SIGNATURE_WORKER_MAX 64u
-
-struct lantern_block_attestation_signature_job {
-    const uint8_t **pubkeys;
-    size_t pubkey_count;
-    LanternRoot message;
-    const LanternByteList *proof;
-    uint64_t epoch;
-    size_t index;
-    bool valid;
-};
-
-struct lantern_block_attestation_signature_pool {
-    pthread_mutex_t mutex;
-    pthread_cond_t work_available;
-    pthread_cond_t batch_done;
-    pthread_t *threads;
-    size_t worker_count;
-    struct lantern_block_attestation_signature_job *jobs;
-    size_t job_count;
-    size_t next_job;
-    size_t in_progress;
-    bool active;
-    bool failed;
-    bool stopping;
-    bool started;
-    bool start_failed;
-};
-
-static struct lantern_block_attestation_signature_pool block_signature_pool = {
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .work_available = PTHREAD_COND_INITIALIZER,
-    .batch_done = PTHREAD_COND_INITIALIZER,
-};
 
 static void record_attestation_validation_metric(double start_seconds, bool valid) {
     lean_metrics_record_attestation_validation(lantern_time_now_seconds() - start_seconds, valid);
-}
-
-static size_t block_signature_cpu_worker_count(void) {
-    long processors = -1;
-#ifdef _SC_NPROCESSORS_ONLN
-    processors = sysconf(_SC_NPROCESSORS_ONLN);
-#endif
-    size_t workers = LANTERN_BLOCK_SIGNATURE_WORKER_FALLBACK;
-    if (processors > 0) {
-        workers = (size_t)processors;
-    }
-    if (workers > LANTERN_BLOCK_SIGNATURE_WORKER_MAX) {
-        workers = LANTERN_BLOCK_SIGNATURE_WORKER_MAX;
-    }
-    return workers == 0u ? 1u : workers;
-}
-
-static size_t block_signature_worker_count(size_t job_count) {
-    if (job_count <= 1u) {
-        return job_count;
-    }
-
-    size_t workers = block_signature_cpu_worker_count();
-    if (workers > job_count) {
-        workers = job_count;
-    }
-    return workers == 0u ? 1u : workers;
-}
-
-static void block_attestation_signature_jobs_reset(
-    struct lantern_block_attestation_signature_job *jobs,
-    size_t job_count) {
-    if (!jobs) {
-        return;
-    }
-    for (size_t i = 0; i < job_count; ++i) {
-        free(jobs[i].pubkeys);
-    }
-    free(jobs);
-}
-
-static void *block_attestation_signature_pool_worker(void *arg) {
-    (void)arg;
-    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
-
-    pthread_mutex_lock(&pool->mutex);
-    for (;;) {
-        while (!pool->stopping
-            && (!pool->active || pool->failed || pool->next_job >= pool->job_count)) {
-            pthread_cond_wait(&pool->work_available, &pool->mutex);
-        }
-        if (pool->stopping) {
-            break;
-        }
-
-        size_t index = pool->next_job++;
-        pool->in_progress++;
-        struct lantern_block_attestation_signature_job *job = &pool->jobs[index];
-        pthread_mutex_unlock(&pool->mutex);
-
-        job->valid = lantern_signature_verify_aggregated(
-            job->pubkeys,
-            job->pubkey_count,
-            &job->message,
-            job->proof,
-            job->epoch);
-
-        pthread_mutex_lock(&pool->mutex);
-        if (!job->valid) {
-            pool->failed = true;
-        }
-        pool->in_progress--;
-        if ((pool->failed || pool->next_job >= pool->job_count) && pool->in_progress == 0u) {
-            pool->active = false;
-            pthread_cond_broadcast(&pool->work_available);
-            pthread_cond_signal(&pool->batch_done);
-        }
-    }
-    pthread_mutex_unlock(&pool->mutex);
-    return NULL;
-}
-
-static int block_signature_pool_start(void) {
-    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
-    pthread_mutex_lock(&pool->mutex);
-    if (pool->started) {
-        pthread_mutex_unlock(&pool->mutex);
-        return 0;
-    }
-    if (pool->start_failed) {
-        pthread_mutex_unlock(&pool->mutex);
-        return -1;
-    }
-
-    pool->worker_count = block_signature_cpu_worker_count();
-    pool->threads = calloc(pool->worker_count, sizeof(*pool->threads));
-    if (!pool->threads) {
-        pool->start_failed = true;
-        pthread_mutex_unlock(&pool->mutex);
-        return -1;
-    }
-
-    size_t started = 0u;
-    for (; started < pool->worker_count; ++started) {
-        if (pthread_create(&pool->threads[started], NULL, block_attestation_signature_pool_worker, NULL) != 0) {
-            break;
-        }
-    }
-    if (started != pool->worker_count) {
-        pool->stopping = true;
-        pthread_cond_broadcast(&pool->work_available);
-        pthread_mutex_unlock(&pool->mutex);
-        for (size_t i = 0; i < started; ++i) {
-            pthread_join(pool->threads[i], NULL);
-        }
-        pthread_mutex_lock(&pool->mutex);
-        free(pool->threads);
-        pool->threads = NULL;
-        pool->worker_count = 0u;
-        pool->stopping = false;
-        pool->start_failed = true;
-        pthread_mutex_unlock(&pool->mutex);
-        return -1;
-    }
-
-    pool->started = true;
-    pthread_mutex_unlock(&pool->mutex);
-    return 0;
-}
-
-static int verify_block_attestation_signature_jobs_pooled(
-    struct lantern_block_attestation_signature_job *jobs,
-    size_t job_count) {
-    if (block_signature_pool_start() != 0) {
-        return -1;
-    }
-
-    struct lantern_block_attestation_signature_pool *pool = &block_signature_pool;
-    pthread_mutex_lock(&pool->mutex);
-    while (pool->active) {
-        pthread_cond_wait(&pool->batch_done, &pool->mutex);
-    }
-
-    pool->jobs = jobs;
-    pool->job_count = job_count;
-    pool->next_job = 0u;
-    pool->in_progress = 0u;
-    pool->failed = false;
-    pool->active = true;
-    pthread_cond_broadcast(&pool->work_available);
-    while (pool->active) {
-        pthread_cond_wait(&pool->batch_done, &pool->mutex);
-    }
-    pool->jobs = NULL;
-    pool->job_count = 0u;
-    pthread_mutex_unlock(&pool->mutex);
-    return 0;
-}
-
-static void verify_block_attestation_signature_jobs_serial(
-    struct lantern_block_attestation_signature_job *jobs,
-    size_t job_count) {
-    for (size_t i = 0; i < job_count; ++i) {
-        jobs[i].valid = lantern_signature_verify_aggregated(
-            jobs[i].pubkeys,
-            jobs[i].pubkey_count,
-            &jobs[i].message,
-            jobs[i].proof,
-            jobs[i].epoch);
-        if (!jobs[i].valid) {
-            break;
-        }
-    }
-}
-
-static int verify_block_attestation_signature_jobs(
-    struct lantern_block_attestation_signature_job *jobs,
-    size_t job_count,
-    const struct lantern_log_metadata *meta) {
-    double start = lantern_time_now_seconds();
-
-    if (job_count == 0u) {
-        lean_metrics_record_pq_block_aggregated_signatures_verification(0.0);
-        return 0;
-    }
-
-    size_t worker_count = block_signature_worker_count(job_count);
-    if (worker_count <= 1u) {
-        verify_block_attestation_signature_jobs_serial(jobs, job_count);
-    } else if (verify_block_attestation_signature_jobs_pooled(jobs, job_count) == 0) {
-        /* Pooled verification completed. */
-    } else {
-        verify_block_attestation_signature_jobs_serial(jobs, job_count);
-    }
-
-    lean_metrics_record_pq_block_aggregated_signatures_verification(
-        lantern_time_now_seconds() - start);
-
-    for (size_t i = 0; i < job_count; ++i) {
-        if (!jobs[i].valid) {
-            lantern_log_warn(
-                "state",
-                meta,
-                "invalid aggregated attestation signature index=%zu",
-                jobs[i].index);
-            return -1;
-        }
-    }
-    return 0;
 }
 
 static void format_root_hex(const LanternRoot *root, char *out, size_t out_len) {
@@ -360,18 +112,6 @@ static const LanternState *lantern_state_cached_fork_choice_state_for_root(
     return lantern_fork_choice_block_state(store->fork_choice, root);
 }
 
-static bool signature_is_zero(const LanternSignature *signature) {
-    if (!signature) {
-        return true;
-    }
-    for (size_t i = 0; i < LANTERN_SIGNATURE_SIZE; ++i) {
-        if (signature->bytes[i] != 0u) {
-            return false;
-        }
-    }
-    return true;
-}
-
 static bool validator_pubkey_is_zero(const uint8_t *pubkey) {
     if (!pubkey) {
         return true;
@@ -448,210 +188,6 @@ static int lantern_state_validate_block_attestation_data_uniqueness(const Lanter
 
     lantern_root_list_reset(&seen_data_roots);
     return rc;
-}
-
-static int lantern_state_verify_block_signatures(
-    const LanternState *state,
-    const LanternBlock *block,
-    const LanternBlockSignatures *signatures) {
-    if (!state || !block || !signatures) {
-        return -1;
-    }
-
-    const struct lantern_log_metadata meta = {
-        .has_slot = true,
-        .slot = block->slot,
-    };
-    const LanternAggregatedAttestations *attestations = &block->body.attestations;
-    const LanternAttestationSignatures *sig_groups = &signatures->attestation_signatures;
-    size_t attestation_count = attestations->length;
-    size_t validator_count = lantern_state_validator_count(state);
-
-    if (attestation_count != sig_groups->length) {
-        lantern_log_warn(
-            "state",
-            &meta,
-            "block signature count mismatch expected=%zu actual=%zu",
-            attestation_count,
-            sig_groups->length);
-        return -1;
-    }
-    if (attestation_count > 0 && (!attestations->data || !sig_groups->data)) {
-        lantern_log_warn("state", &meta, "block attestation/signature data missing");
-        return -1;
-    }
-
-    struct lantern_block_attestation_signature_job *jobs =
-        attestation_count > 0u ? calloc(attestation_count, sizeof(*jobs)) : NULL;
-    if (attestation_count > 0u && !jobs) {
-        return -1;
-    }
-
-    int rc = 0;
-    for (size_t i = 0; i < attestation_count; ++i) {
-        const LanternAggregatedAttestation *attestation = &attestations->data[i];
-        const LanternAggregatedSignatureProof *proof = &sig_groups->data[i];
-        size_t bit_length = attestation->aggregation_bits.bit_length;
-        size_t participant_count = 0;
-
-        if (proof->participants.bit_length != bit_length) {
-            lantern_log_warn(
-                "state",
-                &meta,
-                "attestation signature participant length mismatch index=%zu expected=%zu actual=%zu",
-                i,
-                bit_length,
-                proof->participants.bit_length);
-            rc = -1;
-            break;
-        }
-        if (bit_length > 0 && !attestation->aggregation_bits.bytes) {
-            lantern_log_warn(
-                "state",
-                &meta,
-                "attestation aggregation bits missing index=%zu bit_length=%zu",
-                i,
-                bit_length);
-            rc = -1;
-            break;
-        }
-
-        size_t bytes = (bit_length + 7u) / 8u;
-        if (bytes > 0) {
-            if (!proof->participants.bytes
-                || memcmp(proof->participants.bytes, attestation->aggregation_bits.bytes, bytes) != 0) {
-                lantern_log_warn(
-                    "state",
-                    &meta,
-                    "attestation signature participants mismatch index=%zu",
-                    i);
-                rc = -1;
-                break;
-            }
-        }
-
-        for (size_t v = 0; v < bit_length; ++v) {
-            if (!lantern_bitlist_get(&attestation->aggregation_bits, v)) {
-                continue;
-            }
-            if (v >= validator_count) {
-                lantern_log_warn(
-                    "state",
-                    &meta,
-                    "attestation participant out of range index=%zu validator=%zu validators=%zu",
-                    i,
-                    v,
-                    validator_count);
-                rc = -1;
-                break;
-            }
-            participant_count += 1u;
-        }
-        if (rc != 0) {
-            break;
-        }
-        if (participant_count == 0) {
-            lantern_log_warn(
-                "state",
-                &meta,
-                "attestation signature has no participants index=%zu",
-                i);
-            rc = -1;
-            break;
-        }
-
-        jobs[i].pubkeys = calloc(participant_count, sizeof(*jobs[i].pubkeys));
-        if (!jobs[i].pubkeys) {
-            rc = -1;
-            break;
-        }
-        jobs[i].pubkey_count = participant_count;
-        jobs[i].proof = &proof->proof_data;
-        jobs[i].epoch = attestation->data.slot;
-        jobs[i].index = i;
-
-        size_t pubkey_index = 0;
-        for (size_t v = 0; v < bit_length; ++v) {
-            if (!lantern_bitlist_get(&attestation->aggregation_bits, v)) {
-                continue;
-            }
-            const uint8_t *pubkey = lantern_state_validator_attestation_pubkey(state, v);
-            if (!pubkey || validator_pubkey_is_zero(pubkey)) {
-                lantern_log_warn(
-                    "state",
-                    &meta,
-                    "attestation participant pubkey missing index=%zu validator=%zu",
-                    i,
-                    v);
-                rc = -1;
-                break;
-            }
-            jobs[i].pubkeys[pubkey_index++] = pubkey;
-        }
-
-        if (rc == 0
-            && lantern_hash_tree_root_attestation_data(&attestation->data, &jobs[i].message) != SSZ_SUCCESS) {
-            lantern_log_warn(
-                "state",
-                &meta,
-                "failed to hash attestation for signature verification index=%zu",
-                i);
-            rc = -1;
-        }
-        if (rc != 0) {
-            break;
-        }
-    }
-    if (rc == 0) {
-        rc = verify_block_attestation_signature_jobs(jobs, attestation_count, &meta);
-    }
-    block_attestation_signature_jobs_reset(jobs, attestation_count);
-    if (rc != 0) {
-        return -1;
-    }
-
-    if (signature_is_zero(&signatures->proposer_signature)) {
-        lantern_log_warn("state", &meta, "missing proposer signature");
-        return -1;
-    }
-    if (block->proposer_index >= validator_count) {
-        lantern_log_warn(
-            "state",
-            &meta,
-            "proposer index out of range validator=%" PRIu64 " validators=%zu",
-            block->proposer_index,
-            validator_count);
-        return -1;
-    }
-
-    const uint8_t *proposer_pubkey =
-        lantern_state_validator_proposal_pubkey(state, (size_t)block->proposer_index);
-    if (!proposer_pubkey || validator_pubkey_is_zero(proposer_pubkey)) {
-        lantern_log_warn("state", &meta, "missing proposer pubkey");
-        return -1;
-    }
-
-    LanternRoot proposer_root;
-    if (lantern_hash_tree_root_block(block, &proposer_root) != SSZ_SUCCESS) {
-        lantern_log_warn("state", &meta, "failed to hash block for proposer signature");
-        return -1;
-    }
-    if (!lantern_signature_verify(
-            proposer_pubkey,
-            LANTERN_VALIDATOR_PUBKEY_SIZE,
-            block->slot,
-            &signatures->proposer_signature,
-            &proposer_root)) {
-        lantern_log_warn(
-            "state",
-            &meta,
-            "invalid proposer signature validator=%" PRIu64 " slot=%" PRIu64,
-            block->proposer_index,
-            block->slot);
-        return -1;
-    }
-
-    return 0;
 }
 
 static bool lantern_root_list_contains(const struct lantern_root_list *list, const LanternRoot *root) {
@@ -3012,8 +2548,7 @@ int lantern_state_process_attestations(
 int lantern_state_process_block(
     LanternState *state,
     LanternStore *store,
-    const LanternBlock *block,
-    const LanternBlockSignatures *signatures) {
+    const LanternBlock *block) {
     if (!state || !store || !block) {
         return -1;
     }
@@ -3021,9 +2556,6 @@ int lantern_state_process_block(
         return -1;
     }
     double block_metrics_start = lantern_time_now_seconds();
-    if (signatures && lantern_state_verify_block_signatures(state, block, signatures) != 0) {
-        return -1;
-    }
     if (lantern_state_process_block_header(state, block) != 0) {
         return -1;
     }
@@ -3067,8 +2599,11 @@ int lantern_state_transition(LanternState *state, LanternStore *store, const Lan
     if (block->slot <= state->slot) {
         STATE_FAIL("block slot %" PRIu64 " not ahead of state %" PRIu64, block->slot, state->slot);
     }
-    if (lantern_state_verify_block_signatures(state, block, &signed_block->signatures) != 0) {
-        STATE_FAIL("block signatures invalid");
+    if (signed_block->proof.length == 0u || !signed_block->proof.data) {
+        STATE_FAIL("block proof missing");
+    }
+    if (!lantern_signature_verify_block_type2_proof(state, block, &signed_block->proof)) {
+        STATE_FAIL("block proof invalid");
     }
     uint64_t slot_before = state->slot;
     double slots_metrics_start = lantern_time_now_seconds();
@@ -3078,7 +2613,7 @@ int lantern_state_transition(LanternState *state, LanternStore *store, const Lan
     double slots_duration = lantern_time_now_seconds() - slots_metrics_start;
     uint64_t slots_processed = block->slot >= slot_before ? (block->slot - slot_before) : 0;
     lean_metrics_record_state_transition_slots(slots_processed, slots_duration);
-    if (lantern_state_process_block(state, store, block, NULL) != 0) {
+    if (lantern_state_process_block(state, store, block) != 0) {
         STATE_FAIL("process block failed");
     }
     LanternRoot computed_state_root;
@@ -3329,7 +2864,7 @@ int lantern_state_collect_attestations_for_block(
         candidate.body.attestations.length = out_attestations->length;
         candidate.body.attestations.capacity = out_attestations->length;
 
-        if (lantern_state_process_block(&scratch, &scratch_store, &candidate, NULL) != 0) {
+        if (lantern_state_process_block(&scratch, &scratch_store, &candidate) != 0) {
             rc = -1;
             goto cleanup;
         }
@@ -3407,7 +2942,7 @@ int lantern_state_compute_post_state(
         rc = -1;
         goto cleanup;
     }
-    if (lantern_state_process_block(&scratch, &scratch_store, &block->block, NULL) != 0) {
+    if (lantern_state_process_block(&scratch, &scratch_store, &block->block) != 0) {
         rc = -1;
         goto cleanup;
     }

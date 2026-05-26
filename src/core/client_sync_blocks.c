@@ -239,29 +239,85 @@ void lantern_client_cache_block_aggregated_proofs_locked(
         return;
     }
     const LanternAggregatedAttestations *attestations = &block->block.body.attestations;
-    const LanternAttestationSignatures *proofs = &block->signatures.attestation_signatures;
-    if (!attestations->data || !proofs->data) {
+    if (attestations->length == 0u) {
         return;
     }
-    size_t count = attestations->length;
-    if (proofs->length < count) {
-        count = proofs->length;
-    }
-    if (count == 0) {
+    if (!attestations->data) {
         return;
     }
-    for (size_t i = 0; i < count; ++i) {
+
+    if (block->proof.length == 0u || !block->proof.data) {
+        return;
+    }
+
+    for (size_t i = 0; i < attestations->length; ++i) {
         LanternRoot data_root;
         if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != SSZ_SUCCESS) {
             continue;
         }
-        (void)lantern_client_add_known_aggregated_payload(
+        (void)lantern_store_add_attestation_data(
+            &client->store,
+            &data_root,
+            &attestations->data[i].data,
+            attestations->data[i].data.target.slot);
+    }
+
+#if LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE <= 1u
+    return;
+#endif
+
+    LanternState scratch;
+    lantern_state_init(&scratch);
+    const LanternState *sig_state = lantern_client_state_for_root_local_locked(
+        client,
+        &block->block.parent_root,
+        &scratch,
+        NULL);
+    if (!sig_state) {
+        lantern_state_reset(&scratch);
+        return;
+    }
+
+    for (size_t i = 0; i < attestations->length; ++i) {
+        LanternRoot data_root;
+        if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != SSZ_SUCCESS) {
+            continue;
+        }
+        LanternAggregatedSignatureProof proof;
+        lantern_aggregated_signature_proof_init(&proof);
+        if (lantern_bitlist_resize(
+                &proof.participants,
+                attestations->data[i].aggregation_bits.bit_length)
+                != 0) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            continue;
+        }
+        size_t byte_len = (proof.participants.bit_length + 7u) / 8u;
+        if (byte_len > 0u) {
+            if (!proof.participants.bytes || !attestations->data[i].aggregation_bits.bytes) {
+                lantern_aggregated_signature_proof_reset(&proof);
+                continue;
+            }
+            memcpy(proof.participants.bytes, attestations->data[i].aggregation_bits.bytes, byte_len);
+        }
+        if (!lantern_signature_split_block_type2_proof_by_message(
+                sig_state,
+                &block->block,
+                &block->proof,
+                &data_root,
+                &proof.proof_data)) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            continue;
+        }
+        (void)lantern_client_add_new_aggregated_payload(
             client,
             &data_root,
             &attestations->data[i].data,
-            &proofs->data[i],
+            &proof,
             attestations->data[i].data.target.slot);
+        lantern_aggregated_signature_proof_reset(&proof);
     }
+    lantern_state_reset(&scratch);
 }
 
 static bool sync_validator_votes_from_preview_locked(
@@ -505,14 +561,11 @@ static size_t signed_block_max_ssz_size(void)
         return SIZE_MAX;
     }
     size_t total = base + attestations_max;
-    size_t proof_entry_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
-    size_t signatures_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE
-        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTES_PER_LENGTH_OFFSET + proof_entry_max));
-    if (signatures_max > SIZE_MAX - total)
+    if (LANTERN_AGG_PROOF_MAX_BYTES > SIZE_MAX - total)
     {
         return SIZE_MAX;
     }
-    return total + signatures_max;
+    return total + LANTERN_AGG_PROOF_MAX_BYTES;
 }
 
 static int encode_block_ssz(

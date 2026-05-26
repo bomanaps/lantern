@@ -484,6 +484,68 @@ static int make_signed_vote_for_validator(
     return client_test_sign_vote_with_secret(out_vote, secret);
 }
 
+static int build_proposer_only_block_proof(
+    const LanternState *state,
+    LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    const LanternSignature *proposer_signature)
+{
+    if (!state || !block || !block_root || !proposer_signature) {
+        return -1;
+    }
+
+    int rc = -1;
+    LanternAggregatedSignatureProof proposer_proof;
+    LanternAttestationSignatures attestation_proofs;
+    struct lantern_bitlist proposer_participants;
+    lantern_aggregated_signature_proof_init(&proposer_proof);
+    lantern_attestation_signatures_init(&attestation_proofs);
+    lantern_bitlist_init(&proposer_participants);
+
+    size_t proposer_index = (size_t)block->block.proposer_index;
+    const uint8_t *proposer_pubkey = lantern_state_validator_proposal_pubkey(state, proposer_index);
+    if (!proposer_pubkey) {
+        goto cleanup;
+    }
+    if (lantern_bitlist_resize(&proposer_participants, proposer_index + 1u) != 0
+        || lantern_bitlist_set(&proposer_participants, proposer_index, true) != 0) {
+        goto cleanup;
+    }
+
+    LanternRawXmssSignature raw_proposer = {
+        .pubkey = proposer_pubkey,
+        .signature = proposer_signature,
+    };
+    if (!lantern_aggregated_signature_proof_aggregate(
+            state,
+            &proposer_participants,
+            NULL,
+            0u,
+            &raw_proposer,
+            1u,
+            block_root,
+            block->block.slot,
+            &proposer_proof)) {
+        goto cleanup;
+    }
+    if (!lantern_signature_merge_block_type2_proof(
+            state,
+            &block->block,
+            &attestation_proofs,
+            &proposer_proof,
+            &block->proof)) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_bitlist_reset(&proposer_participants);
+    lantern_attestation_signatures_reset(&attestation_proofs);
+    lantern_aggregated_signature_proof_reset(&proposer_proof);
+    return rc;
+}
+
 static int build_signed_head_block(
     struct lantern_client *client,
     struct PQSignatureSchemeSecretKey *secret,
@@ -524,11 +586,21 @@ static int build_signed_head_block(
     if (lantern_hash_tree_root_block(&out_block->block, &block_signature_root) != SSZ_SUCCESS) {
         goto cleanup;
     }
+    LanternSignature proposer_signature;
+    memset(&proposer_signature, 0, sizeof(proposer_signature));
     if (!lantern_signature_sign(
             secret,
             out_block->block.slot,
             &block_signature_root,
-            &out_block->signatures.proposer_signature)) {
+            &proposer_signature)) {
+        goto cleanup;
+    }
+    if (build_proposer_only_block_proof(
+            &client->state,
+            out_block,
+            &block_signature_root,
+            &proposer_signature)
+        != 0) {
         goto cleanup;
     }
     if (lantern_hash_tree_root_block(&out_block->block, out_root) != SSZ_SUCCESS) {
@@ -1428,12 +1500,10 @@ static int test_validator_build_block_leaves_attestation_key_untouched(void) {
         fprintf(stderr, "proposal key was not prepared for block slot %" PRIu64 "\n", slot);
         goto cleanup;
     }
-    if (!lantern_signature_verify_pk(
-            proposal_pub,
-            slot,
-            &block.signatures.proposer_signature,
-            &block_root)) {
-        fprintf(stderr, "block proposer signature did not verify with the proposal key\n");
+    if (block.proof.length == 0u
+        || !block.proof.data
+        || !lantern_signature_verify_block_type2_proof(&client.state, &block.block, &block.proof)) {
+        fprintf(stderr, "block proof did not verify with the proposal key\n");
         goto cleanup;
     }
 

@@ -1045,33 +1045,6 @@ int lantern_signature_list_resize(LanternSignatureList *list, size_t new_length)
     return 0;
 }
 
-void lantern_block_signatures_init(LanternBlockSignatures *signatures) {
-    if (!signatures) {
-        return;
-    }
-    lantern_attestation_signatures_init(&signatures->attestation_signatures);
-    memset(&signatures->proposer_signature, 0, sizeof(signatures->proposer_signature));
-}
-
-void lantern_block_signatures_reset(LanternBlockSignatures *signatures) {
-    if (!signatures) {
-        return;
-    }
-    lantern_attestation_signatures_reset(&signatures->attestation_signatures);
-    memset(&signatures->proposer_signature, 0, sizeof(signatures->proposer_signature));
-}
-
-int lantern_block_signatures_copy(LanternBlockSignatures *dst, const LanternBlockSignatures *src) {
-    if (!dst || !src) {
-        return -1;
-    }
-    if (lantern_attestation_signatures_copy(&dst->attestation_signatures, &src->attestation_signatures) != 0) {
-        return -1;
-    }
-    dst->proposer_signature = src->proposer_signature;
-    return 0;
-}
-
 void lantern_block_body_init(LanternBlockBody *body) {
     if (!body) {
         return;
@@ -1107,7 +1080,7 @@ void lantern_signed_block_init(LanternSignedBlock *block) {
         return;
     }
     lantern_block_init(&block->block);
-    lantern_block_signatures_init(&block->signatures);
+    lantern_byte_list_init(&block->proof);
 }
 
 void lantern_signed_block_reset(LanternSignedBlock *block) {
@@ -1115,5 +1088,5 @@ void lantern_signed_block_reset(LanternSignedBlock *block) {
         return;
     }
     lantern_block_reset(&block->block);
-    lantern_block_signatures_reset(&block->signatures);
+    lantern_byte_list_reset(&block->proof);
 }

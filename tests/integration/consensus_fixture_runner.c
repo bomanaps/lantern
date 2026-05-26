@@ -61,8 +61,11 @@ static int preview_post_state_root_without_signatures(
     }
 
     LanternState scratch;
+    LanternStore scratch_store;
     lantern_state_init(&scratch);
+    lantern_store_init(&scratch_store);
     if (lantern_state_clone(state, &scratch) != 0) {
+        lantern_store_reset(&scratch_store);
         return -1;
     }
 
@@ -71,8 +74,12 @@ static int preview_post_state_root_without_signatures(
         rc = -1;
         goto cleanup;
     }
+    if (lantern_store_prepare_validator_votes(&scratch_store, scratch.config.num_validators) != 0) {
+        rc = -1;
+        goto cleanup;
+    }
 
-    if (lantern_state_process_block(&scratch, &signed_block->block, NULL, NULL) != 0) {
+    if (lantern_test_state_process_block_with_store(&scratch, &scratch_store, &signed_block->block) != 0) {
         rc = -1;
         goto cleanup;
     }
@@ -81,6 +88,7 @@ static int preview_post_state_root_without_signatures(
     }
 
 cleanup:
+    lantern_store_reset(&scratch_store);
     lantern_state_reset(&scratch);
     return rc;
 }
@@ -100,9 +108,17 @@ static int state_transition_without_signatures(
         return -1;
     }
 
-    if (lantern_state_process_block(state, block, NULL, NULL) != 0) {
+    LanternStore scratch_store;
+    lantern_store_init(&scratch_store);
+    if (lantern_store_prepare_validator_votes(&scratch_store, state->config.num_validators) != 0) {
+        lantern_store_reset(&scratch_store);
         return -1;
     }
+    if (lantern_test_state_process_block_with_store(state, &scratch_store, block) != 0) {
+        lantern_store_reset(&scratch_store);
+        return -1;
+    }
+    lantern_store_reset(&scratch_store);
 
     LanternRoot computed_state_root;
     if (lantern_hash_tree_root_state(state, &computed_state_root) != SSZ_SUCCESS) {
@@ -376,50 +392,48 @@ static int record_block_body_known_payloads(
         return -1;
     }
     const LanternAggregatedAttestations *attestations = &signed_block->block.body.attestations;
-    const LanternAttestationSignatures *signatures = &signed_block->signatures.attestation_signatures;
     for (size_t i = 0; i < attestations->length; ++i) {
-        LanternAggregatedSignatureProof synthesized;
-        const LanternAggregatedSignatureProof *proof = NULL;
-        lantern_aggregated_signature_proof_init(&synthesized);
-        if (i < signatures->length
-            && signatures->data[i].participants.bit_length > 0
-            && signatures->data[i].proof_data.length > 0) {
-            proof = &signatures->data[i];
-        } else {
-            if (lantern_bitlist_resize(&synthesized.participants, attestations->data[i].aggregation_bits.bit_length) != 0) {
-                lantern_aggregated_signature_proof_reset(&synthesized);
-                return -1;
-            }
-            size_t byte_len = (attestations->data[i].aggregation_bits.bit_length + 7u) / 8u;
-            if (byte_len > 0) {
-                memcpy(
-                    synthesized.participants.bytes,
-                    attestations->data[i].aggregation_bits.bytes,
-                    byte_len);
-            }
-            if (lantern_byte_list_resize(&synthesized.proof_data, 1u) != 0) {
-                lantern_aggregated_signature_proof_reset(&synthesized);
-                return -1;
-            }
-            synthesized.proof_data.data[0] = 0u;
-            proof = &synthesized;
-        }
         LanternRoot data_root;
         if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != SSZ_SUCCESS) {
-            lantern_aggregated_signature_proof_reset(&synthesized);
             return -1;
         }
-        if (lantern_store_add_known_aggregated_payload(
+        if (lantern_store_add_attestation_data(
                 store,
                 &data_root,
                 &attestations->data[i].data,
-                proof,
                 attestations->data[i].data.target.slot)
             != 0) {
-            lantern_aggregated_signature_proof_reset(&synthesized);
             return -1;
         }
-        lantern_aggregated_signature_proof_reset(&synthesized);
+        LanternAggregatedSignatureProof proof;
+        lantern_aggregated_signature_proof_init(&proof);
+        if (lantern_bitlist_resize(&proof.participants, attestations->data[i].aggregation_bits.bit_length) != 0) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            return -1;
+        }
+        size_t byte_len = (proof.participants.bit_length + 7u) / 8u;
+        if (byte_len > 0u) {
+            if (!proof.participants.bytes || !attestations->data[i].aggregation_bits.bytes) {
+                lantern_aggregated_signature_proof_reset(&proof);
+                return -1;
+            }
+            memcpy(proof.participants.bytes, attestations->data[i].aggregation_bits.bytes, byte_len);
+        }
+        if (lantern_byte_list_resize(&proof.proof_data, 1u) != 0) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            return -1;
+        }
+        proof.proof_data.data[0] = 0u;
+        int add_rc = lantern_store_add_known_aggregated_payload(
+            store,
+            &data_root,
+            &attestations->data[i].data,
+            &proof,
+            attestations->data[i].data.target.slot);
+        lantern_aggregated_signature_proof_reset(&proof);
+        if (add_rc != 0) {
+            return -1;
+        }
     }
     return 0;
 }
@@ -1040,7 +1054,7 @@ static void reset_signed_block_impl(LanternSignedBlock *block) {
         return;
     }
     reset_plain_block(&block->block);
-    lantern_block_signatures_reset(&block->signatures);
+    lantern_byte_list_reset(&block->proof);
 }
 
 #define reset_block(ptr)                                                                           \
@@ -1048,30 +1062,6 @@ static void reset_signed_block_impl(LanternSignedBlock *block) {
         (ptr),                                                                                     \
         LanternBlock *: reset_plain_block,                                                         \
         LanternSignedBlock *: reset_signed_block_impl)(ptr)
-
-static int ensure_signature_envelope(
-    const char *fixture_path,
-    int block_index,
-    const LanternSignedBlock *block) {
-    if (!block) {
-        return -1;
-    }
-    size_t attestation_count = block->block.body.attestations.length;
-    size_t expected = attestation_count;
-    if (block->signatures.attestation_signatures.length != expected
-        || (expected > 0 && !block->signatures.attestation_signatures.data)) {
-        fprintf(
-            stderr,
-            "%s block[%d]: expected %zu attestation signature proofs (attestations=%zu) but got %zu\\n",
-            fixture_path ? fixture_path : "(unknown)",
-            block_index,
-            expected,
-            attestation_count,
-            block->signatures.attestation_signatures.length);
-        return -1;
-    }
-    return 0;
-}
 
 static int run_state_transition_fixture(const char *path);
 static int run_fork_choice_fixture(const char *path);
@@ -1194,13 +1184,6 @@ static int run_state_transition_fixture(const char *path) {
 
         LanternSignedBlock signed_block;
         if (lantern_fixture_parse_signed_block(&doc, block_idx, &signed_block) != 0) {
-            lantern_state_reset(&state);
-            lantern_fixture_document_reset(&doc);
-            return -1;
-        }
-
-        if (ensure_signature_envelope(path, i, &signed_block) != 0) {
-            reset_block(&signed_block.block);
             lantern_state_reset(&state);
             lantern_fixture_document_reset(&doc);
             return -1;
@@ -1712,17 +1695,6 @@ static int run_fork_choice_fixture(const char *path) {
         hash_mapping_reset(&hash_mapping, &hash_mapping_count, &hash_mapping_cap);
             return -1;
         }
-        if (ensure_signature_envelope(path, i, &signed_block) != 0) {
-            reset_block(&signed_block.block);
-            reset_block(&anchor_block);
-            lantern_fork_choice_reset(&store);
-            lantern_state_reset(&state);
-            lantern_fixture_document_reset(&doc);
-            stored_state_entries_reset(&stored_states, &stored_states_count, &stored_states_cap);
-        hash_mapping_reset(&hash_mapping, &hash_mapping_count, &hash_mapping_cap);
-            return -1;
-        }
-
         uint64_t now = (genesis_time * 1000u) + (signed_block.block.slot * store.seconds_per_slot * 1000u);
         uint64_t previous_intervals = store.time_intervals;
         if (lantern_fork_choice_advance_time(&store, now, true) != 0) {

@@ -337,7 +337,7 @@ static int client_test_setup_vote_validation_client_common(
         fprintf(stderr, "failed to advance state slot for vote test child block\n");
         goto finish;
     }
-    if (lantern_state_process_block(&client->state, &client->store, &child, NULL) != 0) {
+    if (lantern_state_process_block(&client->state, &client->store, &child) != 0) {
         fprintf(stderr, "failed to process child block into vote test state\n");
         goto finish;
     }

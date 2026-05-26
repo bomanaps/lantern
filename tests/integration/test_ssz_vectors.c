@@ -25,9 +25,10 @@
 #define LANTERN_CONSENSUS_FIXTURE_DIR "tools/leanSpec/fixtures/consensus"
 #endif
 
-#define SSZ_FIXTURE_SUBDIR "ssz/devnet/ssz"
+#define SSZ_FIXTURE_SUBDIR "ssz/lstar/ssz"
 #define PREVIEW_BYTES 32u
 #define BYTELIST_MIB_LIMIT (1024u * 1024u)
+#define BYTELIST_512KIB_LIMIT (512u * 1024u)
 #define SAMPLE_UINT32_LIST_LIMIT 16u
 #define SAMPLE_BYTES32_LIST_LIMIT 8u
 #define SAMPLE_BITLIST_LIMIT_BITS 16u
@@ -753,49 +754,6 @@ static int parse_block_body_object(
     return 0;
 }
 
-static int parse_block_signatures_object(
-    const struct lantern_fixture_document *doc,
-    int object_index,
-    LanternBlockSignatures *out_signatures) {
-    if (!doc || !out_signatures) {
-        return -1;
-    }
-    lantern_block_signatures_init(out_signatures);
-
-    int attestation_idx = lantern_fixture_object_get_field(doc, object_index, "attestationSignatures");
-    int proposer_idx = lantern_fixture_object_get_field(doc, object_index, "proposerSignature");
-    int data_idx = attestation_idx >= 0 ? lantern_fixture_object_get_field(doc, attestation_idx, "data") : -1;
-    int count = data_idx >= 0 ? lantern_fixture_array_get_length(doc, data_idx) : -1;
-    struct byte_buffer proposer = {0};
-
-    if (attestation_idx < 0 || proposer_idx < 0 || data_idx < 0 || count < 0
-        || lantern_attestation_signatures_resize(&out_signatures->attestation_signatures, (size_t)count) != 0
-        || fixture_token_to_bytes(doc, proposer_idx, &proposer) != 0
-        || proposer.len != LANTERN_SIGNATURE_SIZE) {
-        byte_buffer_reset(&proposer);
-        lantern_block_signatures_reset(out_signatures);
-        return -1;
-    }
-
-    memcpy(out_signatures->proposer_signature.bytes, proposer.data, LANTERN_SIGNATURE_SIZE);
-    byte_buffer_reset(&proposer);
-
-    for (int i = 0; i < count; ++i) {
-        int proof_idx = lantern_fixture_array_get_element(doc, data_idx, i);
-        if (proof_idx < 0
-            || lantern_fixture_parse_signature_proof(
-                doc,
-                proof_idx,
-                &out_signatures->attestation_signatures.data[i])
-                != 0) {
-            lantern_block_signatures_reset(out_signatures);
-            return -1;
-        }
-    }
-
-    return 0;
-}
-
 static int parse_signed_aggregated_attestation_object(
     const struct lantern_fixture_document *doc,
     int object_index,
@@ -1278,6 +1236,7 @@ static int run_byte_list_fixture(
     const char *type_name,
     const struct lantern_fixture_document *doc,
     int value_idx,
+    size_t byte_limit,
     const struct byte_buffer *expected_serialized,
     const LanternRoot *expected_root) {
     struct byte_buffer value = {0};
@@ -1285,14 +1244,14 @@ static int run_byte_list_fixture(
         return record_failure(path, type_name, "invalid byte-list value");
     }
 
-    uint8_t *decoded = (uint8_t *)malloc(BYTELIST_MIB_LIMIT);
+    uint8_t *decoded = (uint8_t *)malloc(byte_limit);
     uint8_t *encoded = (uint8_t *)malloc(value.len > 0u ? value.len : 1u);
     uint64_t actual_count = 0u;
     size_t encoded_len = value.len;
     int serialize_rc = ssz_serialize_list_fixed(
         value.data,
         value.len,
-        BYTELIST_MIB_LIMIT,
+        byte_limit,
         sizeof(uint8_t),
         encoded,
         value.len > 0u ? value.len : 1u,
@@ -1300,10 +1259,10 @@ static int run_byte_list_fixture(
     int deserialize_rc = ssz_deserialize_list_fixed(
         expected_serialized->data,
         expected_serialized->len,
-        BYTELIST_MIB_LIMIT,
+        byte_limit,
         sizeof(uint8_t),
         decoded,
-        BYTELIST_MIB_LIMIT,
+        byte_limit,
         &actual_count);
     if (!decoded || !encoded
         || serialize_rc != SSZ_SUCCESS
@@ -1321,7 +1280,7 @@ static int run_byte_list_fixture(
     if (merkleize_bytes_with_optional_length(
             expected_serialized->data,
             expected_serialized->len,
-            BYTELIST_MIB_LIMIT / SSZ_BYTES_PER_CHUNK,
+            byte_limit / SSZ_BYTES_PER_CHUNK,
             true,
             value.len,
             &root)
@@ -2246,6 +2205,77 @@ static int run_aggregated_signature_proof_fixture(
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
 
+static int run_type_two_multi_signature_fixture(
+    const char *path,
+    const char *type_name,
+    const struct lantern_fixture_document *doc,
+    int value_idx,
+    const struct byte_buffer *expected_serialized,
+    const LanternRoot *expected_root) {
+    int proof_idx = lantern_fixture_object_get_field(doc, value_idx, "proof");
+    struct byte_buffer proof = {0};
+    if (proof_idx < 0 || parse_hex_data_object(doc, proof_idx, &proof) != 0) {
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "invalid type-two proof fixture");
+    }
+    if (proof.len > BYTELIST_512KIB_LIMIT) {
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "type-two proof exceeds limit");
+    }
+
+    size_t encoded_len = sizeof(uint32_t) + proof.len;
+    uint8_t *encoded = (uint8_t *)malloc(encoded_len > 0u ? encoded_len : 1u);
+    if (!encoded) {
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "type-two encode allocation failed");
+    }
+    write_u32_le((uint32_t)sizeof(uint32_t), encoded);
+    if (proof.len > 0u) {
+        memcpy(encoded + sizeof(uint32_t), proof.data, proof.len);
+    }
+    if (expect_bytes_equal(
+            path,
+            type_name,
+            "encode(value)",
+            expected_serialized->data,
+            expected_serialized->len,
+            encoded,
+            encoded_len)
+        != 0) {
+        free(encoded);
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "type-two encode failed");
+    }
+
+    if (expected_serialized->len < sizeof(uint32_t)
+        || read_u32_le_local(expected_serialized->data) != sizeof(uint32_t)
+        || expected_serialized->len - sizeof(uint32_t) != proof.len
+        || (proof.len > 0u
+            && memcmp(expected_serialized->data + sizeof(uint32_t), proof.data, proof.len) != 0)) {
+        free(encoded);
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "type-two decode failed");
+    }
+
+    LanternRoot root;
+    if (merkleize_bytes_with_optional_length(
+            expected_serialized->data + sizeof(uint32_t),
+            expected_serialized->len - sizeof(uint32_t),
+            BYTELIST_512KIB_LIMIT / SSZ_BYTES_PER_CHUNK,
+            true,
+            proof.len,
+            &root)
+        != 0) {
+        free(encoded);
+        byte_buffer_reset(&proof);
+        return record_failure(path, type_name, "type-two root failed");
+    }
+
+    free(encoded);
+    byte_buffer_reset(&proof);
+    return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
+}
+
 static int run_signed_aggregated_attestation_fixture(
     const char *path,
     const char *type_name,
@@ -2286,49 +2316,6 @@ static int run_signed_aggregated_attestation_fixture(
     free(encoded);
     lantern_signed_aggregated_attestation_reset(&attestation);
     lantern_signed_aggregated_attestation_reset(&decoded);
-    return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
-}
-
-static int run_block_signatures_fixture(
-    const char *path,
-    const char *type_name,
-    const struct lantern_fixture_document *doc,
-    int value_idx,
-    const struct byte_buffer *expected_serialized,
-    const LanternRoot *expected_root) {
-    LanternBlockSignatures signatures;
-    size_t encoded_capacity = expected_serialized->len > 0u ? expected_serialized->len : 1u;
-    uint8_t *encoded = (uint8_t *)malloc(encoded_capacity);
-    size_t encoded_len = 0u;
-    lantern_block_signatures_init(&signatures);
-    if (!encoded
-        || parse_block_signatures_object(doc, value_idx, &signatures) != 0
-        || lantern_ssz_encode_block_signatures(&signatures, encoded, encoded_capacity, &encoded_len) != SSZ_SUCCESS
-        || expect_bytes_equal(path, type_name, "encode(value)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0) {
-        free(encoded);
-        lantern_block_signatures_reset(&signatures);
-        return record_failure(path, type_name, "block-signatures encode failed");
-    }
-    LanternBlockSignatures decoded;
-    lantern_block_signatures_init(&decoded);
-    if (lantern_ssz_decode_block_signatures(&decoded, expected_serialized->data, expected_serialized->len) != SSZ_SUCCESS
-        || lantern_ssz_encode_block_signatures(&decoded, encoded, encoded_capacity, &encoded_len) != SSZ_SUCCESS
-        || expect_bytes_equal(path, type_name, "decode(serialized)", expected_serialized->data, expected_serialized->len, encoded, encoded_len) != 0) {
-        free(encoded);
-        lantern_block_signatures_reset(&signatures);
-        lantern_block_signatures_reset(&decoded);
-        return record_failure(path, type_name, "block-signatures decode failed");
-    }
-    LanternRoot root;
-    if (lantern_hash_tree_root_block_signatures(&signatures, &root) != SSZ_SUCCESS) {
-        free(encoded);
-        lantern_block_signatures_reset(&signatures);
-        lantern_block_signatures_reset(&decoded);
-        return record_failure(path, type_name, "block-signatures root failed");
-    }
-    free(encoded);
-    lantern_block_signatures_reset(&signatures);
-    lantern_block_signatures_reset(&decoded);
     return expect_root_equal(path, type_name, "hash_tree_root", expected_root, &root);
 }
 
@@ -2777,7 +2764,24 @@ static int run_fixture_case(
         return run_fixed_bytes_fixture(path, type_name, doc, value_idx, 64u, expected_serialized, expected_root);
     }
     if (strcmp(type_name, "ByteListMiB") == 0) {
-        return run_byte_list_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
+        return run_byte_list_fixture(
+            path,
+            type_name,
+            doc,
+            value_idx,
+            BYTELIST_MIB_LIMIT,
+            expected_serialized,
+            expected_root);
+    }
+    if (strcmp(type_name, "ByteList512KiB") == 0) {
+        return run_byte_list_fixture(
+            path,
+            type_name,
+            doc,
+            value_idx,
+            BYTELIST_512KIB_LIMIT,
+            expected_serialized,
+            expected_root);
     }
     if (strcmp(type_name, "SampleBitvector8") == 0) {
         return run_bool_vector_fixture(path, type_name, doc, value_idx, 8u, expected_serialized, expected_root);
@@ -2855,11 +2859,14 @@ static int run_fixture_case(
     if (strcmp(type_name, "AggregatedSignatureProof") == 0) {
         return run_aggregated_signature_proof_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
     }
+    if (strcmp(type_name, "TypeOneMultiSignature") == 0) {
+        return run_aggregated_signature_proof_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
+    }
+    if (strcmp(type_name, "TypeTwoMultiSignature") == 0) {
+        return run_type_two_multi_signature_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
+    }
     if (strcmp(type_name, "SignedAggregatedAttestation") == 0) {
         return run_signed_aggregated_attestation_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
-    }
-    if (strcmp(type_name, "BlockSignatures") == 0) {
-        return run_block_signatures_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);
     }
     if (strcmp(type_name, "BlockBody") == 0) {
         return run_block_body_fixture(path, type_name, doc, value_idx, expected_serialized, expected_root);

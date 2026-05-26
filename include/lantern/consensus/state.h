@@ -66,8 +66,7 @@ int lantern_state_process_attestations(
 int lantern_state_process_block(
     LanternState *state,
     LanternStore *store,
-    const LanternBlock *block,
-    const LanternBlockSignatures *signatures);
+    const LanternBlock *block);
 bool lantern_state_slot_in_justified_window(const LanternState *state, uint64_t slot);
 int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slot, bool *out_value);
 int lantern_state_mark_justified_slot(LanternState *state, uint64_t slot);

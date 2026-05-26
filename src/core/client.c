@@ -1430,20 +1430,9 @@ static void client_log_genesis_anchors(
         body_hex,
         sizeof(body_hex));
     LanternSignedBlock genesis_signed;
-    int resize_result = 0;
     lantern_signed_block_with_attestation_init(&genesis_signed);
     genesis_signed.block = genesis_block;
-    resize_result = lantern_attestation_signatures_resize(
-        &genesis_signed.signatures.attestation_signatures,
-        0);
-    if (resize_result != 0)
-    {
-        lantern_log_error(
-            "client",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "failed to size genesis signatures list");
-    }
-    else if (lantern_hash_tree_root_signed_block(&genesis_signed, &genesis_signed_block_root) == SSZ_SUCCESS)
+    if (lantern_hash_tree_root_signed_block(&genesis_signed, &genesis_signed_block_root) == SSZ_SUCCESS)
     {
         format_root_hex(&genesis_signed_block_root, signed_block_hex, sizeof(signed_block_hex));
     }

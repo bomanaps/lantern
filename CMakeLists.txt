@@ -115,7 +115,7 @@ endif()
 add_custom_target(fixtures
     COMMAND "${CMAKE_COMMAND}" -E chdir "${LANTERN_FIXTURE_GENERATOR_DIR}" "${LANTERN_UV_EXECUTABLE}" python install 3.12
     COMMAND "${CMAKE_COMMAND}" -E chdir "${LANTERN_FIXTURE_GENERATOR_DIR}" "${LANTERN_UV_EXECUTABLE}" sync
-    COMMAND "${CMAKE_COMMAND}" -E chdir "${LANTERN_FIXTURE_GENERATOR_DIR}" "${LANTERN_UV_EXECUTABLE}" run fill --fork=Devnet --clean -n auto
+    COMMAND "${CMAKE_COMMAND}" -E chdir "${LANTERN_FIXTURE_GENERATOR_DIR}" "${LANTERN_UV_EXECUTABLE}" run fill --fork=Lstar --clean -n auto
     USES_TERMINAL
     COMMENT "Generating leanSpec consensus fixtures"
     VERBATIM
@@ -171,19 +171,19 @@ if(LANTERN_BUILD_TESTS)
     set(LANTERN_TEST_LINK_LIB lantern_test)
 
     set(_lantern_state_transition_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/state_transition/devnet/state_transition")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/state_transition/lstar/state_transition")
     set(_lantern_fork_choice_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/fork_choice/devnet/fc")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/fork_choice/lstar/fc")
     set(_lantern_verify_signatures_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/verify_signatures/devnet/verify_signatures")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/verify_signatures/lstar/verify_signatures")
     set(_lantern_ssz_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/ssz/devnet/ssz")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/ssz/lstar/ssz")
     set(_lantern_networking_codec_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/networking_codec/devnet/networking")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/networking_codec/lstar/networking")
     set(_lantern_ssz_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/ssz/devnet/ssz")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/ssz/lstar/ssz")
     set(_lantern_networking_codec_fixture_dir
-        "${LANTERN_CONSENSUS_FIXTURE_DIR}/networking_codec/devnet/networking")
+        "${LANTERN_CONSENSUS_FIXTURE_DIR}/networking_codec/lstar/networking")
 
     add_executable(lantern_client_vote_test
         tests/unit/test_client_vote.c

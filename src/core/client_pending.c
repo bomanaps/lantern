@@ -614,7 +614,7 @@ int clone_signed_block(const LanternSignedBlock *source, LanternSignedBlock *des
         return LANTERN_CLIENT_PENDING_ERR_COPY;
     }
 
-    if (lantern_block_signatures_copy(&dest->signatures, &source->signatures) != 0)
+    if (lantern_byte_list_copy(&dest->proof, &source->proof) != 0)
     {
         lantern_signed_block_with_attestation_reset(dest);
         return LANTERN_CLIENT_PENDING_ERR_COPY;

@@ -1415,10 +1415,7 @@ static int signed_block_copy(
         return -1;
     }
 
-    if (lantern_block_signatures_copy(
-            &dst->signatures,
-            &src->signatures)
-        != 0)
+    if (lantern_byte_list_copy(&dst->proof, &src->proof) != 0)
     {
         lantern_signed_block_reset(dst);
         lantern_signed_block_init(dst);

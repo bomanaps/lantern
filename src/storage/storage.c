@@ -188,50 +188,6 @@ static size_t aggregated_attestations_encoded_size(const LanternAggregatedAttest
     return total;
 }
 
-static size_t aggregated_signature_proof_encoded_size(const LanternAggregatedSignatureProof *proof) {
-    if (!proof) {
-        return 0;
-    }
-    if (proof->participants.bit_length > LANTERN_VALIDATOR_REGISTRY_LIMIT) {
-        return 0;
-    }
-    size_t participants_size = bitlist_encoded_size(&proof->participants);
-    size_t proof_bytes = byte_list_encoded_size(&proof->proof_data);
-    if (participants_size == 0 && proof->participants.bit_length != 0) {
-        return 0;
-    }
-    size_t fixed_section = SSZ_BYTES_PER_LENGTH_OFFSET * 2u;
-    if (fixed_section > SIZE_MAX - participants_size) {
-        return 0;
-    }
-    if (fixed_section + participants_size > SIZE_MAX - proof_bytes) {
-        return 0;
-    }
-    return fixed_section + participants_size + proof_bytes;
-}
-
-static size_t attestation_signatures_encoded_size(const LanternAttestationSignatures *signatures) {
-    if (!signatures) {
-        return 0;
-    }
-    if (signatures->length == 0) {
-        return 0;
-    }
-    if (signatures->length > LANTERN_MAX_BLOCK_SIGNATURES || !signatures->data) {
-        return 0;
-    }
-    size_t offset_table = signatures->length * SSZ_BYTES_PER_LENGTH_OFFSET;
-    size_t total = offset_table;
-    for (size_t i = 0; i < signatures->length; ++i) {
-        size_t entry_size = aggregated_signature_proof_encoded_size(&signatures->data[i]);
-        if (entry_size == 0 || entry_size > SIZE_MAX - total) {
-            return 0;
-        }
-        total += entry_size;
-    }
-    return total;
-}
-
 static size_t root_list_encoded_size(const struct lantern_root_list *list) {
     if (!list || list->length == 0) {
         return 0;
@@ -292,18 +248,6 @@ static size_t block_encoded_size(const LanternBlock *block) {
     return fixed + body_size;
 }
 
-static size_t block_signatures_encoded_size(const LanternBlockSignatures *signatures) {
-    if (!signatures) {
-        return 0;
-    }
-    size_t sig_count = signatures->attestation_signatures.length;
-    size_t attestations_bytes = attestation_signatures_encoded_size(&signatures->attestation_signatures);
-    if (sig_count > 0 && attestations_bytes == 0) {
-        return 0;
-    }
-    return (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE + attestations_bytes;
-}
-
 static size_t signed_block_encoded_size(const LanternSignedBlock *block) {
     if (!block) {
         return 0;
@@ -313,11 +257,15 @@ static size_t signed_block_encoded_size(const LanternSignedBlock *block) {
     if (message_size == 0) {
         return 0;
     }
-    size_t signatures_size = block_signatures_encoded_size(&block->signatures);
-    if (signatures_size == 0) {
+    size_t proof_size = byte_list_encoded_size(&block->proof);
+    if (proof_size == 0 && block->proof.length != 0u) {
         return 0;
     }
-    return offset_section + message_size + signatures_size;
+    if (offset_section > SIZE_MAX - message_size
+        || offset_section + message_size > SIZE_MAX - proof_size) {
+        return 0;
+    }
+    return offset_section + message_size + proof_size;
 }
 
 static int write_atomic_file(const char *path, const uint8_t *data, size_t data_len) {
@@ -1091,18 +1039,13 @@ static bool block_root_alias_matches_expected(
      * body_root is not reconstructible from the empty synthetic body.
      *
      * The persisted alias is only expected for the anchor-shaped block we
-     * synthesize locally: no attestations, no attestation proofs, and no
-     * proposer signature.
+     * synthesize locally: no attestations and no block-level proof.
      */
     const LanternBlockBody *body = &block->block.body;
-    const LanternBlockSignatures *signatures = &block->signatures;
-    if (body->attestations.length != 0 || signatures->attestation_signatures.length != 0) {
+    if (body->attestations.length != 0 || block->proof.length != 0u) {
         return false;
     }
-    if (body->attestations.data != NULL || signatures->attestation_signatures.data != NULL) {
-        return false;
-    }
-    if (!lantern_signature_is_zero(&signatures->proposer_signature)) {
+    if (body->attestations.data != NULL || block->proof.data != NULL) {
         return false;
     }
 
@@ -1160,10 +1103,10 @@ static int storage_store_block_internal(
         lantern_log_warn(
             "storage",
             &(const struct lantern_log_metadata){0},
-            "store_block size estimate failed slot=%" PRIu64 " attestations=%zu sig_count=%zu",
+            "store_block size estimate failed slot=%" PRIu64 " attestations=%zu proof_len=%zu",
             block->block.slot,
             block->block.body.attestations.length,
-            block->signatures.attestation_signatures.length);
+            block->proof.length);
         goto cleanup;
     }
     buffer = malloc(encoded_size);

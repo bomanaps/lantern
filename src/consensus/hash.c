@@ -7,6 +7,7 @@
 
 #include "ssz.h"
 #include "pq-bindings-c-rust.h"
+#include "lantern/consensus/ssz.h"
 
 #define LANTERN_RETURN_IF_SSZ_ERROR(expr) \
     do { \
@@ -72,7 +73,6 @@ ssz_error_t lantern_hash_tree_root_validators_dual(
     const uint8_t *proposal_pubkeys,
     size_t count,
     LanternRoot *out_root);
-static ssz_error_t hash_block_signatures(const LanternBlockSignatures *signatures, LanternRoot *out_root);
 
 static ssz_error_t merkleize_chunks(
     const ssz_chunk_t *chunks,
@@ -409,12 +409,6 @@ ssz_error_t lantern_hash_tree_root_signed_aggregated_attestation(
     return merkleize_chunks(chunks, 2, 0, out_root);
 }
 
-ssz_error_t lantern_hash_tree_root_block_signatures(
-    const LanternBlockSignatures *signatures,
-    LanternRoot *out_root) {
-    return hash_block_signatures(signatures, out_root);
-}
-
 ssz_error_t lantern_merkleize_root_list(
     const struct lantern_root_list *list,
     size_t limit,
@@ -521,63 +515,6 @@ static ssz_error_t hash_aggregated_attestations(const LanternAggregatedAttestati
     return SSZ_SUCCESS;
 }
 
-static ssz_error_t hash_attestation_signatures(const LanternAttestationSignatures *signatures, LanternRoot *out_root) {
-    if (!signatures || !out_root) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    size_t count = signatures->length;
-    ssz_chunk_t *chunks = NULL;
-    if (count > 0) {
-        if (!signatures->data) {
-            return SSZ_ERR_INVALID_ARGUMENT;
-        }
-        if (count > LANTERN_MAX_BLOCK_SIGNATURES) {
-            return SSZ_ERR_LIMIT_EXCEEDED;
-        }
-        chunks = calloc(count, sizeof(*chunks));
-        if (!chunks) {
-            return SSZ_ERR_HASH_FAILURE;
-        }
-        for (size_t i = 0; i < count; ++i) {
-            LanternRoot sig_root;
-            ssz_error_t err = lantern_hash_tree_root_aggregated_signature_proof(&signatures->data[i], &sig_root);
-            if (err != SSZ_SUCCESS) {
-                free(chunks);
-                return err;
-            }
-            chunk_from_root(&sig_root, &chunks[i]);
-        }
-    }
-    ssz_chunk_t root;
-    ssz_error_t err = ssz_hash_tree_root_list_roots(
-        chunks,
-        count,
-        LANTERN_MAX_BLOCK_SIGNATURES,
-        NULL,
-        NULL,
-        &root);
-    free(chunks);
-    if (err != SSZ_SUCCESS) {
-        return err;
-    }
-    root_from_chunk(&root, out_root);
-    return SSZ_SUCCESS;
-}
-
-static ssz_error_t hash_block_signatures(const LanternBlockSignatures *signatures, LanternRoot *out_root) {
-    if (!signatures || !out_root) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    LanternRoot attestation_root;
-    LANTERN_RETURN_IF_SSZ_ERROR(hash_attestation_signatures(&signatures->attestation_signatures, &attestation_root));
-    LanternRoot proposer_root;
-    LANTERN_RETURN_IF_SSZ_ERROR(hash_xmss_signature(&signatures->proposer_signature, &proposer_root));
-    ssz_chunk_t chunks[2];
-    chunk_from_root(&attestation_root, &chunks[0]);
-    chunk_from_root(&proposer_root, &chunks[1]);
-    return merkleize_chunks(chunks, 2, 0, out_root);
-}
-
 ssz_error_t lantern_hash_tree_root_block_body(const LanternBlockBody *body, LanternRoot *out_root) {
     if (!body || !out_root) {
         return SSZ_ERR_INVALID_ARGUMENT;
@@ -623,11 +560,18 @@ ssz_error_t lantern_hash_tree_root_signed_block(const LanternSignedBlock *block,
     }
     LanternRoot message_root;
     LANTERN_RETURN_IF_SSZ_ERROR(lantern_hash_tree_root_block(&block->block, &message_root));
-    LanternRoot signatures_root;
-    LANTERN_RETURN_IF_SSZ_ERROR(hash_block_signatures(&block->signatures, &signatures_root));
+    if (block->proof.length > LANTERN_AGG_PROOF_MAX_BYTES) {
+        return SSZ_ERR_LIMIT_EXCEEDED;
+    }
+    LanternRoot proof_root;
+    LANTERN_RETURN_IF_SSZ_ERROR(hash_byte_list(
+        block->proof.data,
+        block->proof.length,
+        LANTERN_AGG_PROOF_MAX_BYTES,
+        &proof_root));
     ssz_chunk_t chunks[2];
     chunk_from_root(&message_root, &chunks[0]);
-    chunk_from_root(&signatures_root, &chunks[1]);
+    chunk_from_root(&proof_root, &chunks[1]);
     return merkleize_chunks(chunks, 2, 0, out_root);
 }
 

@@ -227,14 +227,6 @@ static const char *check_block_sanity(const LanternSignedBlock *block) {
         }
     }
 
-    size_t sig_count = block->signatures.attestation_signatures.length;
-    size_t att_count = message->body.attestations.length;
-    if (sig_count > LANTERN_MAX_BLOCK_SIGNATURES) {
-        return "too_many_block_signatures";
-    }
-    if (sig_count > 0u && sig_count != att_count) {
-        return "attestation_signature_count_mismatch";
-    }
     return NULL;
 }
 
@@ -423,11 +415,11 @@ static void analyze_payload(const char *path) {
     printf("  lantern_ssz_decode_signed_block_rc=%d\n", (int)ssz_rc);
     if (ssz_rc == 0) {
         printf(
-            "  decoded_block slot=%" PRIu64 " proposer=%" PRIu64 " attestations=%zu sigs=%zu\n",
+            "  decoded_block slot=%" PRIu64 " proposer=%" PRIu64 " attestations=%zu proof_len=%zu\n",
             block.block.slot,
             block.block.proposer_index,
             block.block.body.attestations.length,
-            block.signatures.attestation_signatures.length);
+            block.proof.length);
         print_attestation_slots(&block);
         const char *sanity_reason = check_block_sanity(&block);
         printf(

@@ -1693,10 +1693,9 @@ static lantern_client_error validator_build_block_populate_message(
     uint64_t proposer_index,
     const LanternRoot *parent_root,
     const LanternAggregatedAttestations *attestations,
-    const LanternAttestationSignatures *signatures,
     LanternSignedBlock *out_block)
 {
-    if (!parent_root || !attestations || !signatures || !out_block)
+    if (!parent_root || !attestations || !out_block)
     {
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
@@ -1710,16 +1709,6 @@ static lantern_client_error validator_build_block_populate_message(
     if (lantern_aggregated_attestations_copy(
             &message_block->body.attestations,
             attestations)
-        != 0)
-    {
-        return LANTERN_CLIENT_ERR_ALLOC;
-    }
-
-    lantern_signature_zero(&out_block->signatures.proposer_signature);
-
-    if (lantern_attestation_signatures_copy(
-            &out_block->signatures.attestation_signatures,
-            signatures)
         != 0)
     {
         return LANTERN_CLIENT_ERR_ALLOC;
@@ -1777,6 +1766,85 @@ static lantern_client_error validator_build_block_compute_post_state(
     {
         result = LANTERN_CLIENT_ERR_RUNTIME;
     }
+    lantern_client_unlock_state(client, state_locked);
+    return result;
+}
+
+static lantern_client_error validator_build_block_merge_proof(
+    struct lantern_client *client,
+    const struct lantern_local_validator *local,
+    const LanternRoot *block_root,
+    const LanternAttestationSignatures *attestation_proofs,
+    const LanternSignature *proposer_signature,
+    LanternSignedBlock *out_block)
+{
+    if (!client || !local || !block_root || !attestation_proofs || !proposer_signature || !out_block)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (local->global_index >= LANTERN_VALIDATOR_REGISTRY_LIMIT)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    bool state_locked = lantern_client_lock_state(client);
+    if (!state_locked)
+    {
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+
+    LanternAggregatedSignatureProof proposer_proof;
+    struct lantern_bitlist proposer_participants;
+    lantern_aggregated_signature_proof_init(&proposer_proof);
+    lantern_bitlist_init(&proposer_participants);
+
+    lantern_client_error result = LANTERN_CLIENT_OK;
+    const uint8_t *proposer_pubkey =
+        lantern_state_validator_proposal_pubkey(&client->state, (size_t)local->global_index);
+    if (!proposer_pubkey || lantern_validator_pubkey_is_zero(proposer_pubkey))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    if (lantern_bitlist_resize(&proposer_participants, (size_t)local->global_index + 1u) != 0
+        || lantern_bitlist_set(&proposer_participants, (size_t)local->global_index, true) != 0)
+    {
+        result = LANTERN_CLIENT_ERR_ALLOC;
+        goto cleanup;
+    }
+
+    LanternRawXmssSignature raw_proposer = {
+        .pubkey = proposer_pubkey,
+        .signature = proposer_signature,
+    };
+    if (!lantern_aggregated_signature_proof_aggregate(
+            &client->state,
+            &proposer_participants,
+            NULL,
+            0u,
+            &raw_proposer,
+            1u,
+            block_root,
+            out_block->block.slot,
+            &proposer_proof))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    if (!lantern_signature_merge_block_type2_proof(
+            &client->state,
+            &out_block->block,
+            attestation_proofs,
+            &proposer_proof,
+            &out_block->proof))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+
+cleanup:
+    lantern_bitlist_reset(&proposer_participants);
+    lantern_aggregated_signature_proof_reset(&proposer_proof);
     lantern_client_unlock_state(client, state_locked);
     return result;
 }
@@ -1845,7 +1913,6 @@ static int validator_build_block_internal(
         local->global_index,
         &parent_root,
         &attestations,
-        &signatures,
         out_block);
     if (result != LANTERN_CLIENT_OK)
     {
@@ -1873,14 +1940,27 @@ static int validator_build_block_internal(
     if (out_block_root) {
         *out_block_root = block_root;
     }
+    LanternSignature proposer_signature;
+    lantern_signature_zero(&proposer_signature);
     if (validator_sign_with_key(
             local,
             slot,
             &block_root,
             true,
-            &out_block->signatures.proposer_signature)
+            &proposer_signature)
         != LANTERN_CLIENT_OK) {
         result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    result = validator_build_block_merge_proof(
+        client,
+        local,
+        &block_root,
+        &signatures,
+        &proposer_signature,
+        out_block);
+    if (result != LANTERN_CLIENT_OK)
+    {
         goto cleanup;
     }
     result = LANTERN_CLIENT_OK;
@@ -2249,6 +2329,12 @@ int validator_build_block(
  */
 int validator_propose_block(struct lantern_client *client, uint64_t slot, size_t local_index)
 {
+    if (slot == 0u)
+    {
+        validator_log_duty_skipped(client, slot, "genesis_slot");
+        return LANTERN_CLIENT_OK;
+    }
+
     const char *skip_reason = validator_service_skip_reason(client);
     if (skip_reason)
     {
