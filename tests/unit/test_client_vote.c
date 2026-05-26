@@ -3941,6 +3941,29 @@ cleanup:
     return rc;
 }
 
+static int test_validator_propose_block_skips_genesis_slot(void) {
+    struct lantern_client client;
+    memset(&client, 0, sizeof(client));
+    client.has_state = true;
+    client.has_runtime = true;
+    client.has_fork_choice = true;
+    client.gossip_running = true;
+    client.local_validator_count = 1u;
+    client.sync_state = LANTERN_SYNC_STATE_SYNCED;
+
+    if (validator_propose_block(&client, 0u, 0u) != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "genesis slot proposal should be skipped successfully\n");
+        return -1;
+    }
+    if (!client.has_last_duty_skip_slot
+        || client.last_duty_skip_slot != 0u
+        || strcmp(client.last_duty_skip_reason, "genesis_slot") != 0) {
+        fprintf(stderr, "genesis slot proposal did not record the expected skip reason\n");
+        return -1;
+    }
+    return 0;
+}
+
 int main(void) {
     if (test_record_vote_accepts_known_roots() != 0) {
         return 1;
@@ -4045,6 +4068,9 @@ int main(void) {
         return 1;
     }
     if (test_interval_2_aggregation_trigger_respects_aggregator_role() != 0) {
+        return 1;
+    }
+    if (test_validator_propose_block_skips_genesis_slot() != 0) {
         return 1;
     }
     puts("lantern_client_vote_test OK");
