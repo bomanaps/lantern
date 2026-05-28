@@ -3481,7 +3481,7 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
 
     if (client_test_setup_vote_validation_client_with_validator_count(
             &client,
-            "vote_subnet_filter",
+            "vote_multi_subnet_aggregation",
             8u,
             &pub,
             &secret,
@@ -3505,18 +3505,18 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
     if (make_signed_vote_for_validator(&client, secret, 0u, &anchor_root, &child_root, &vote0) != 0
         || make_signed_vote_for_validator(&client, secret, 1u, &anchor_root, &child_root, &vote1) != 0
         || make_signed_vote_for_validator(&client, secret, 4u, &anchor_root, &child_root, &vote4) != 0) {
-        fprintf(stderr, "failed to build signed votes for subnet filter test\n");
+        fprintf(stderr, "failed to build signed votes for multi-subnet aggregation test\n");
         goto cleanup;
     }
 
     if (lantern_client_debug_record_vote(&client, &vote0, "subnet_vote_0") != 0
         || lantern_client_debug_record_vote(&client, &vote1, "subnet_vote_1") != 0
         || lantern_client_debug_record_vote(&client, &vote4, "subnet_vote_4") != 0) {
-        fprintf(stderr, "failed to record votes for subnet filter test\n");
+        fprintf(stderr, "failed to record votes for multi-subnet aggregation test\n");
         goto cleanup;
     }
     if (client.store.attestation_signatures.length != 3u) {
-        fprintf(stderr, "expected all gossip signatures to be cached before subnet filtering\n");
+        fprintf(stderr, "expected all gossip signatures to be cached before aggregation\n");
         goto cleanup;
     }
     if (lantern_hash_tree_root_attestation_data(&vote0.data.data, &data_root) != SSZ_SUCCESS) {
@@ -3544,9 +3544,10 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
         goto cleanup;
     }
     if (!lantern_bitlist_get(&decoded.proof.participants, 0u)
+        || !lantern_bitlist_get(&decoded.proof.participants, 1u)
         || !lantern_bitlist_get(&decoded.proof.participants, 4u)
-        || lantern_bitlist_get(&decoded.proof.participants, 1u)) {
-        fprintf(stderr, "published aggregated proof participants should still match the local subnet\n");
+        || lantern_bitlist_get(&decoded.proof.participants, 2u)) {
+        fprintf(stderr, "published aggregated proof participants should include all collected subnet votes\n");
         goto cleanup;
     }
     if (client.store.attestation_signatures.length != 0u) {
@@ -3554,19 +3555,16 @@ static int test_publish_aggregated_attestations_collects_any_slot_and_prunes_gos
         goto cleanup;
     }
     if (lantern_store_get_attestation_signature(&client.store, &vote0_key, &cached_signature) == 0
+        || lantern_store_get_attestation_signature(&client.store, &vote1_key, &cached_signature) == 0
         || lantern_store_get_attestation_signature(&client.store, &vote4_key, &cached_signature) == 0) {
-        fprintf(stderr, "aggregated subnet votes should have been removed from gossip cache\n");
-        goto cleanup;
-    }
-    if (lantern_store_get_attestation_signature(&client.store, &vote1_key, &cached_signature) == 0) {
-        fprintf(stderr, "cross-subnet gossip vote should never enter the gossip signature cache\n");
+        fprintf(stderr, "aggregated votes should have been removed from gossip cache\n");
         goto cleanup;
     }
 
     LanternAttestationData cached_vote1_data;
     memset(&cached_vote1_data, 0, sizeof(cached_vote1_data));
     if (lantern_store_get_attestation_data(&client.store, &data_root, &cached_vote1_data) != 0) {
-        fprintf(stderr, "cross-subnet gossip vote should still retain attestation data\n");
+        fprintf(stderr, "aggregated vote should still retain attestation data\n");
         goto cleanup;
     }
     if (memcmp(&cached_vote1_data, &vote1.data.data, sizeof(cached_vote1_data)) != 0) {

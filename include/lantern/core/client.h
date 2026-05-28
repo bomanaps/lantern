@@ -83,6 +83,9 @@ struct lantern_client_options {
     uint64_t attestation_committee_count_override;
     bool has_attestation_committee_count_override;
     bool is_aggregator;
+    size_t *aggregate_subnet_ids;
+    size_t aggregate_subnet_id_count;
+    size_t aggregate_subnet_id_capacity;
 };
 
 struct lantern_peer_status_entry;
@@ -320,6 +323,8 @@ struct lantern_client {
     bool debug_disable_block_requests;
     bool debug_disable_fork_choice_time;
     size_t debug_attestation_committee_count;
+    size_t *aggregate_subnet_ids;
+    size_t aggregate_subnet_id_count;
     char *xmss_key_dir;
     char *xmss_public_template;
     char *xmss_secret_template;
@@ -338,6 +343,9 @@ lantern_client_error lantern_client_options_add_bootnodes_from_file(
 lantern_client_error lantern_client_options_add_bootnodes_argument(
     struct lantern_client_options *options,
     const char *value);
+lantern_client_error lantern_client_options_add_aggregate_subnet_id(
+    struct lantern_client_options *options,
+    size_t subnet_id);
 
 lantern_client_error lantern_init(
     struct lantern_client *client,

@@ -62,9 +62,8 @@ static size_t validator_attestation_committee_count(const struct lantern_client 
 }
 
 static int validator_publish_aggregated_attestations(struct lantern_client *client, uint64_t slot);
-static lantern_client_error collect_subnet_votes(
+static lantern_client_error collect_aggregation_votes(
     struct lantern_client *client,
-    size_t subnet_id,
     LanternAttestations *out_attestations,
     LanternSignatureList *out_signatures);
 
@@ -1346,17 +1345,11 @@ lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
     lantern_attestations_init(&attestations);
     lantern_signature_list_init(&signatures);
 
-    size_t subnet_id = 0;
     lantern_client_error rc = LANTERN_CLIENT_OK;
-    if (lantern_client_aggregation_subnet_id(client, &subnet_id) != 0)
-    {
-        rc = LANTERN_CLIENT_ERR_VALIDATOR;
-    }
     if (rc == LANTERN_CLIENT_OK)
     {
-        rc = collect_subnet_votes(
+        rc = collect_aggregation_votes(
             client,
-            subnet_id,
             &attestations,
             &signatures);
     }
@@ -2766,6 +2759,10 @@ int validator_build_block(
  */
 int validator_propose_block(struct lantern_client *client, uint64_t slot, size_t local_index)
 {
+    if (!client)
+    {
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
     if (slot == 0u)
     {
         validator_log_duty_skipped(client, slot, "genesis_slot");
@@ -2963,9 +2960,8 @@ int validator_publish_attestations(struct lantern_client *client, uint64_t slot)
     return result;
 }
 
-static lantern_client_error collect_subnet_votes(
+static lantern_client_error collect_aggregation_votes(
     struct lantern_client *client,
-    size_t subnet_id,
     LanternAttestations *out_attestations,
     LanternSignatureList *out_signatures) {
     if (!client || !out_attestations || !out_signatures) {
@@ -2994,17 +2990,6 @@ static lantern_client_error collect_subnet_votes(
         LanternAttestationData data;
         memset(&data, 0, sizeof(data));
         if (lantern_store_get_attestation_data(&client->store, &entry->key.data_root, &data) != 0) {
-            continue;
-        }
-        size_t vote_subnet = 0;
-        if (lantern_validator_index_compute_subnet_id(
-                entry->key.validator_index,
-                validator_attestation_committee_count(client),
-                &vote_subnet)
-            != 0) {
-            continue;
-        }
-        if (vote_subnet != subnet_id) {
             continue;
         }
         LanternVote vote;
