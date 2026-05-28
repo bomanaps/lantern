@@ -566,6 +566,9 @@ void lantern_client_options_init(struct lantern_client_options *options)
     options->attestation_committee_count_override = 0;
     options->has_attestation_committee_count_override = false;
     options->is_aggregator = false;
+    options->aggregate_subnet_ids = NULL;
+    options->aggregate_subnet_id_count = 0;
+    options->aggregate_subnet_id_capacity = 0;
 }
 
 
@@ -586,6 +589,10 @@ void lantern_client_options_free(struct lantern_client_options *options)
         return;
     }
     lantern_string_list_reset(&options->bootnodes);
+    free(options->aggregate_subnet_ids);
+    options->aggregate_subnet_ids = NULL;
+    options->aggregate_subnet_id_count = 0;
+    options->aggregate_subnet_id_capacity = 0;
 }
 
 
@@ -615,6 +622,43 @@ lantern_client_error lantern_client_options_add_bootnode(
     return lantern_string_list_append(&options->bootnodes, bootnode) == 0
                ? LANTERN_CLIENT_OK
                : LANTERN_CLIENT_ERR_ALLOC;
+}
+
+lantern_client_error lantern_client_options_add_aggregate_subnet_id(
+    struct lantern_client_options *options,
+    size_t subnet_id)
+{
+    if (!options)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (options->aggregate_subnet_id_count == options->aggregate_subnet_id_capacity)
+    {
+        if (options->aggregate_subnet_id_capacity > SIZE_MAX / 2u)
+        {
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        size_t next_capacity =
+            options->aggregate_subnet_id_capacity == 0
+                ? 4u
+                : options->aggregate_subnet_id_capacity * 2u;
+        if (next_capacity < options->aggregate_subnet_id_count
+            || next_capacity > SIZE_MAX / sizeof(*options->aggregate_subnet_ids))
+        {
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        size_t *next = realloc(
+            options->aggregate_subnet_ids,
+            next_capacity * sizeof(*next));
+        if (!next)
+        {
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        options->aggregate_subnet_ids = next;
+        options->aggregate_subnet_id_capacity = next_capacity;
+    }
+    options->aggregate_subnet_ids[options->aggregate_subnet_id_count++] = subnet_id;
+    return LANTERN_CLIENT_OK;
 }
 
 
@@ -932,6 +976,25 @@ static lantern_client_error client_apply_options(
     {
         client->debug_attestation_committee_count =
             (size_t)options->attestation_committee_count_override;
+    }
+    if (options->aggregate_subnet_id_count > 0)
+    {
+        size_t bytes =
+            options->aggregate_subnet_id_count * sizeof(*client->aggregate_subnet_ids);
+        if (bytes / sizeof(*client->aggregate_subnet_ids) != options->aggregate_subnet_id_count)
+        {
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        client->aggregate_subnet_ids = malloc(bytes);
+        if (!client->aggregate_subnet_ids)
+        {
+            return LANTERN_CLIENT_ERR_ALLOC;
+        }
+        memcpy(
+            client->aggregate_subnet_ids,
+            options->aggregate_subnet_ids,
+            bytes);
+        client->aggregate_subnet_id_count = options->aggregate_subnet_id_count;
     }
     return LANTERN_CLIENT_OK;
 }
@@ -3157,6 +3220,109 @@ static lantern_client_error client_start_network(
     return LANTERN_CLIENT_OK;
 }
 
+static bool subnet_id_list_contains(
+    const size_t *subnet_ids,
+    size_t count,
+    size_t subnet_id)
+{
+    for (size_t i = 0; i < count; ++i)
+    {
+        if (subnet_ids[i] == subnet_id)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int subnet_id_list_append_unique(
+    size_t **subnet_ids,
+    size_t *count,
+    size_t subnet_id)
+{
+    if (!subnet_ids || !count)
+    {
+        return -1;
+    }
+    if (subnet_id_list_contains(*subnet_ids, *count, subnet_id))
+    {
+        return 0;
+    }
+    if (*count == SIZE_MAX || (*count + 1u) > SIZE_MAX / sizeof(**subnet_ids))
+    {
+        return -1;
+    }
+    size_t new_count = *count + 1u;
+    size_t *next = realloc(*subnet_ids, new_count * sizeof(*next));
+    if (!next)
+    {
+        return -1;
+    }
+    next[*count] = subnet_id;
+    *subnet_ids = next;
+    *count = new_count;
+    return 0;
+}
+
+static int collect_startup_attestation_subnets(
+    const struct lantern_client *client,
+    size_t attestation_committee_count,
+    size_t primary_subnet_id,
+    size_t **out_subnet_ids,
+    size_t *out_count)
+{
+    if (!client || !out_subnet_ids || !out_count)
+    {
+        return -1;
+    }
+    *out_subnet_ids = NULL;
+    *out_count = 0;
+
+    if (subnet_id_list_append_unique(out_subnet_ids, out_count, primary_subnet_id) != 0)
+    {
+        return -1;
+    }
+
+    bool is_aggregator =
+        client->assigned_validators && client->assigned_validators->enr.is_aggregator;
+    if (is_aggregator)
+    {
+        for (size_t i = 0; i < client->aggregate_subnet_id_count; ++i)
+        {
+            if (subnet_id_list_append_unique(
+                    out_subnet_ids,
+                    out_count,
+                    client->aggregate_subnet_ids[i])
+                != 0)
+            {
+                return -1;
+            }
+        }
+    }
+
+    if (client->local_validators && client->local_validator_count > 0)
+    {
+        for (size_t i = 0; i < client->local_validator_count; ++i)
+        {
+            size_t validator_subnet_id = 0;
+            if (lantern_validator_index_compute_subnet_id(
+                    client->local_validators[i].global_index,
+                    attestation_committee_count,
+                    &validator_subnet_id)
+                != 0)
+            {
+                return -1;
+            }
+            if (subnet_id_list_append_unique(out_subnet_ids, out_count, validator_subnet_id) != 0)
+            {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 
 /**
  * @brief Start gossipsub and request/response protocols.
@@ -3179,7 +3345,13 @@ static lantern_client_error client_start_protocols(
     uint8_t fork_digest[4] = {0};
     char topic_network_name[32];
     size_t subnet_id = 0;
+    size_t *subscription_subnet_ids = NULL;
+    size_t subscription_subnet_id_count = 0;
     size_t attestation_committee_count = lantern_client_attestation_committee_count(client);
+    bool is_aggregator =
+        client->assigned_validators && client->assigned_validators->enr.is_aggregator;
+    bool has_explicit_aggregate_subnets =
+        is_aggregator && client->aggregate_subnet_id_count > 0;
     bool have_fork_digest = client_resolve_gossip_fork_digest(client, fork_digest) == 0;
     if (have_fork_digest) {
         if (lantern_gossip_fork_digest_to_hex(fork_digest, topic_network_name) != 0) {
@@ -3204,7 +3376,16 @@ static lantern_client_error client_start_protocols(
         }
         snprintf(topic_network_name, sizeof(topic_network_name), "%s", client->devnet);
     }
-    if (client->local_validators && client->local_validator_count > 0) {
+    if (has_explicit_aggregate_subnets) {
+        subnet_id = client->aggregate_subnet_ids[0];
+        lantern_log_info(
+            "gossip",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "aggregator subnet ids configured count=%zu primary=%zu committee_count=%zu",
+            client->aggregate_subnet_id_count,
+            subnet_id,
+            attestation_committee_count);
+    } else if (client->local_validators && client->local_validator_count > 0) {
         if (lantern_validator_index_compute_subnet_id(
                 client->local_validators[0].global_index,
                 attestation_committee_count,
@@ -3218,7 +3399,8 @@ static lantern_client_error client_start_protocols(
             return LANTERN_CLIENT_ERR_NETWORK;
         }
     }
-    if (client->assigned_validators
+    if (!has_explicit_aggregate_subnets
+        && client->assigned_validators
         && client->assigned_validators->enr.is_aggregator
         && client->assigned_validators->has_subnet) {
         if (lantern_client_aggregation_subnet_id(client, &subnet_id) != 0) {
@@ -3234,6 +3416,20 @@ static lantern_client_error client_start_protocols(
             "aggregator subnet configured subnet=%zu committee_count=%zu",
             subnet_id,
             attestation_committee_count);
+    }
+    if (collect_startup_attestation_subnets(
+            client,
+            attestation_committee_count,
+            subnet_id,
+            &subscription_subnet_ids,
+            &subscription_subnet_id_count)
+        != 0) {
+        free(subscription_subnet_ids);
+        lantern_log_error(
+            "client",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "failed to resolve attestation subnet subscriptions");
+        return LANTERN_CLIENT_ERR_NETWORK;
     }
     struct lantern_gossipsub_config gossip_cfg = {
         .network = &client->network,
@@ -3256,49 +3452,43 @@ static lantern_client_error client_start_protocols(
             "client",
             &(const struct lantern_log_metadata){.validator = client->node_id},
             "failed to start gossipsub service");
+        free(subscription_subnet_ids);
         return LANTERN_CLIENT_ERR_NETWORK;
     }
     client->gossip_running = true;
-    if (client->local_validators && client->local_validator_count > 0) {
-        for (size_t i = 0; i < client->local_validator_count; ++i) {
-            size_t validator_subnet_id = 0;
-            if (lantern_validator_index_compute_subnet_id(
-                    client->local_validators[i].global_index,
-                    attestation_committee_count,
-                    &validator_subnet_id)
-                != 0) {
-                lantern_log_error(
-                    "client",
-                    &(const struct lantern_log_metadata){.validator = client->node_id},
-                    "failed to compute attestation subnet validator=%" PRIu64,
-                    client->local_validators[i].global_index);
-                lantern_gossipsub_service_reset(&client->gossip);
-                client->gossip_running = false;
-                return LANTERN_CLIENT_ERR_NETWORK;
-            }
+
+    for (size_t i = 0; i < subscription_subnet_id_count; ++i) {
+        size_t current_subnet_id = subscription_subnet_ids[i];
+        if (current_subnet_id != subnet_id) {
             if (lantern_gossipsub_service_subscribe_attestation_subnet(
                     &client->gossip,
-                    validator_subnet_id)
+                    current_subnet_id)
                 != 0) {
                 lantern_log_error(
                     "client",
                     &(const struct lantern_log_metadata){.validator = client->node_id},
-                    "failed to subscribe attestation subnet validator=%" PRIu64 " subnet=%zu",
-                    client->local_validators[i].global_index,
-                    validator_subnet_id);
+                    "failed to subscribe attestation subnet subnet=%zu",
+                    current_subnet_id);
                 lantern_gossipsub_service_reset(&client->gossip);
                 client->gossip_running = false;
+                free(subscription_subnet_ids);
                 return LANTERN_CLIENT_ERR_NETWORK;
             }
-            lantern_log_info(
-                "gossip",
-                &(const struct lantern_log_metadata){.validator = client->node_id},
-                "attestation subnet subscribed validator=%" PRIu64 " subnet=%zu committee_count=%zu",
-                client->local_validators[i].global_index,
-                validator_subnet_id,
-                attestation_committee_count);
         }
+        lantern_log_info(
+            "gossip",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "attestation subnet subscribed subnet=%zu committee_count=%zu explicit_aggregate_subnets=%s",
+            current_subnet_id,
+            attestation_committee_count,
+            has_explicit_aggregate_subnets ? "true" : "false");
     }
+    lantern_log_info(
+        "gossip",
+        &(const struct lantern_log_metadata){.validator = client->node_id},
+        "gossip subscriptions: block + aggregation + %zu attestation subnet(s)",
+        subscription_subnet_id_count);
+    free(subscription_subnet_ids);
 
     struct lantern_reqresp_service_callbacks req_callbacks;
     memset(&req_callbacks, 0, sizeof(req_callbacks));
@@ -3667,6 +3857,9 @@ static void shutdown_strings_and_lists(struct lantern_client *client)
     client->listen_address = NULL;
     free(client->devnet);
     client->devnet = NULL;
+    free(client->aggregate_subnet_ids);
+    client->aggregate_subnet_ids = NULL;
+    client->aggregate_subnet_id_count = 0;
 }
 
 

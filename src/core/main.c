@@ -55,6 +55,7 @@ enum {
     OPT_XMSS_SECRET_TEMPLATE,
     OPT_IS_AGGREGATOR,
     OPT_ATTESTATION_COMMITTEE_COUNT,
+    OPT_AGGREGATE_SUBNET_IDS,
     /* Deprecated: legacy file-path flags retained so pre-migration
      * lean-quickstart wrappers keep working. Each resolves to the parent
      * directory of the given file and feeds validator_config_dir. */
@@ -102,6 +103,9 @@ static lantern_client_error handle_xmss_option(
     struct lantern_client_options *options,
     int opt,
     const char *optarg);
+static lantern_client_error handle_aggregate_subnet_ids_option(
+    struct lantern_client_options *options,
+    const char *optarg);
 static lantern_client_error parse_arguments(
     struct lantern_client_options *options,
     int argc,
@@ -113,6 +117,7 @@ static lantern_client_error validate_required_options(
 static lantern_client_error run_main_loop(struct lantern_client *client);
 static void print_usage(const char *prog);
 static lantern_client_error parse_u16(const char *text, uint16_t *out_value);
+static lantern_client_error parse_size_t_nonnegative(const char *text, size_t *out_value);
 static lantern_client_error parse_size_t_positive(const char *text, size_t *out_value);
 
 /** Flag indicating whether the main loop should continue running. */
@@ -326,6 +331,8 @@ static lantern_client_error apply_option(
         options->has_attestation_committee_count_override = true;
         return LANTERN_CLIENT_OK;
     }
+    case OPT_AGGREGATE_SUBNET_IDS:
+        return handle_aggregate_subnet_ids_option(options, optarg);
     default:
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
@@ -459,6 +466,89 @@ static lantern_client_error handle_xmss_option(
     }
 }
 
+static char *trim_mutable(char *text)
+{
+    if (!text)
+    {
+        return NULL;
+    }
+    while (*text && isspace((unsigned char)*text))
+    {
+        ++text;
+    }
+    char *end = text + strlen(text);
+    while (end > text && isspace((unsigned char)*(end - 1)))
+    {
+        --end;
+    }
+    *end = '\0';
+    return text;
+}
+
+static lantern_client_error handle_aggregate_subnet_ids_option(
+    struct lantern_client_options *options,
+    const char *optarg)
+{
+    if (!options || !optarg)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    char *copy = strdup(optarg);
+    if (!copy)
+    {
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+
+    size_t added = 0;
+    char *cursor = copy;
+    lantern_client_error result = LANTERN_CLIENT_OK;
+    while (cursor)
+    {
+        char *comma = strchr(cursor, ',');
+        if (comma)
+        {
+            *comma = '\0';
+        }
+        char *part = trim_mutable(cursor);
+        if (part && *part != '\0')
+        {
+            size_t subnet_id = 0;
+            if (parse_size_t_nonnegative(part, &subnet_id) != LANTERN_CLIENT_OK)
+            {
+                lantern_log_error(
+                    "cli",
+                    &(const struct lantern_log_metadata){.validator = options->node_id},
+                    "invalid aggregate-subnet-ids entry '%s'",
+                    part);
+                result = LANTERN_CLIENT_ERR_INVALID_PARAM;
+                break;
+            }
+            result = lantern_client_options_add_aggregate_subnet_id(options, subnet_id);
+            if (result != LANTERN_CLIENT_OK)
+            {
+                break;
+            }
+            added += 1u;
+        }
+        cursor = comma ? comma + 1 : NULL;
+    }
+
+    free(copy);
+    if (result != LANTERN_CLIENT_OK)
+    {
+        return result;
+    }
+    if (added == 0)
+    {
+        lantern_log_error(
+            "cli",
+            &(const struct lantern_log_metadata){.validator = options->node_id},
+            "--aggregate-subnet-ids requires at least one subnet id");
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    return LANTERN_CLIENT_OK;
+}
+
 
 /**
  * Parse CLI arguments and populate client options.
@@ -522,6 +612,7 @@ static lantern_client_error parse_arguments(
         {"xmss-secret-template", required_argument, NULL, OPT_XMSS_SECRET_TEMPLATE},
         {"is-aggregator", no_argument, NULL, OPT_IS_AGGREGATOR},
         {"attestation-committee-count", required_argument, NULL, OPT_ATTESTATION_COMMITTEE_COUNT},
+        {"aggregate-subnet-ids", required_argument, NULL, OPT_AGGREGATE_SUBNET_IDS},
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'v'},
         {0, 0, 0, 0},
@@ -553,6 +644,14 @@ static lantern_client_error parse_arguments(
             "cli",
             &(const struct lantern_log_metadata){.validator = options->node_id},
             "specify only one of --node-key or --node-key-path");
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (options->aggregate_subnet_id_count > 0 && !options->is_aggregator)
+    {
+        lantern_log_error(
+            "cli",
+            &(const struct lantern_log_metadata){.validator = options->node_id},
+            "--aggregate-subnet-ids requires --is-aggregator");
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
 
@@ -850,6 +949,10 @@ static void print_usage_network(void)
         "main",
         NULL,
         "  --is-aggregator              Mark this node as the subnet aggregator");
+    lantern_log_info(
+        "main",
+        NULL,
+        "  --aggregate-subnet-ids IDS   Comma-separated attestation subnets this aggregator imports");
 }
 
 
@@ -964,6 +1067,42 @@ static lantern_client_error parse_u16(const char *text, uint16_t *out_value)
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
     *out_value = (uint16_t)parsed;
+    return LANTERN_CLIENT_OK;
+}
+
+static lantern_client_error parse_size_t_nonnegative(const char *text, size_t *out_value)
+{
+    if (!text || !out_value)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    while (*text && isspace((unsigned char)*text))
+    {
+        ++text;
+    }
+    if (*text == '-')
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(text, &end, 10);
+    if (errno != 0 || end == text)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    while (end && *end != '\0' && isspace((unsigned char)*end))
+    {
+        ++end;
+    }
+    if ((end && *end != '\0') || parsed > (unsigned long long)SIZE_MAX)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    *out_value = (size_t)parsed;
     return LANTERN_CLIENT_OK;
 }
 
