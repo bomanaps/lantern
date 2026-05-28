@@ -1,5 +1,6 @@
 #include "lantern/networking/gossipsub_service.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,6 +20,10 @@
 static int topic_eq(const libp2p_gossipsub_bytes_t topic, const char *expected) {
     return expected && strlen(expected) == topic.len && memcmp(topic.data, expected, topic.len) == 0;
 }
+
+static bool topic_is_vote_topic(
+    const struct lantern_gossipsub_service *service,
+    const libp2p_gossipsub_bytes_t topic);
 
 static void peer_id_to_text_safe(const struct lantern_peer_id *peer, char *out, size_t out_len) {
     if (!out || out_len == 0) {
@@ -514,7 +519,7 @@ static int deliver_message(
         return rc;
     }
 
-    if (topic_eq(event->topic, service->vote_topic) || topic_eq(event->topic, service->vote_subnet_topic)) {
+    if (topic_is_vote_topic(service, event->topic)) {
         LanternSignedVote vote;
         memset(&vote, 0, sizeof(vote));
         int rc = lantern_gossip_decode_signed_vote_snappy(&vote, event->message.data.data, event->message.data.len);
@@ -682,6 +687,57 @@ static int subscribe_topic(struct lantern_gossipsub_service *service, const char
         .idontwant_min_message_bytes = LIBP2P_GOSSIPSUB_DEFAULT_IDONTWANT_MIN_BYTES,
     };
     return libp2p_gossipsub_subscribe(service->gossipsub, &topic_config) == LIBP2P_GOSSIPSUB_OK ? 0 : -1;
+}
+
+static bool topic_is_vote_topic(
+    const struct lantern_gossipsub_service *service,
+    const libp2p_gossipsub_bytes_t topic) {
+    if (topic_eq(topic, service->vote_topic) || topic_eq(topic, service->vote_subnet_topic)) {
+        return true;
+    }
+    for (size_t i = 0; i < service->extra_vote_subnet_topic_count; ++i) {
+        if (topic_eq(topic, service->extra_vote_subnet_topics[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int remember_vote_subnet_topic(
+    struct lantern_gossipsub_service *service,
+    size_t subnet_id,
+    const char *topic) {
+    if (!service || !topic || topic[0] == '\0') {
+        return -1;
+    }
+    if (subnet_id == service->attestation_subnet_id) {
+        snprintf(service->vote_subnet_topic, sizeof(service->vote_subnet_topic), "%s", topic);
+        return 0;
+    }
+    for (size_t i = 0; i < service->extra_vote_subnet_topic_count; ++i) {
+        if (strcmp(service->extra_vote_subnet_topics[i], topic) == 0) {
+            return 0;
+        }
+    }
+    if (service->extra_vote_subnet_topic_count == SIZE_MAX ||
+        (service->extra_vote_subnet_topic_count + 1u) > SIZE_MAX / sizeof(*service->extra_vote_subnet_topics)) {
+        return -1;
+    }
+    size_t next_count = service->extra_vote_subnet_topic_count + 1u;
+    char (*next_topics)[128] = realloc(
+        service->extra_vote_subnet_topics,
+        next_count * sizeof(*next_topics));
+    if (!next_topics) {
+        return -1;
+    }
+    service->extra_vote_subnet_topics = next_topics;
+    snprintf(
+        service->extra_vote_subnet_topics[service->extra_vote_subnet_topic_count],
+        sizeof(service->extra_vote_subnet_topics[service->extra_vote_subnet_topic_count]),
+        "%s",
+        topic);
+    service->extra_vote_subnet_topic_count = next_count;
+    return 0;
 }
 
 static int setup_topics(struct lantern_gossipsub_service *service, const struct lantern_gossipsub_config *config) {
@@ -972,10 +1028,7 @@ int lantern_gossipsub_service_subscribe_attestation_subnet(
             return -1;
         }
     }
-    if (subnet_id == service->attestation_subnet_id) {
-        snprintf(service->vote_subnet_topic, sizeof(service->vote_subnet_topic), "%s", topic);
-    }
-    return 0;
+    return remember_vote_subnet_topic(service, subnet_id, topic);
 }
 
 size_t lantern_gossipsub_service_mesh_peer_count(const struct lantern_gossipsub_service *service) {

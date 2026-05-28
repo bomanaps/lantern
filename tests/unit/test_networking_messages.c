@@ -1389,6 +1389,30 @@ static void test_gossipsub_service_loopback(void) {
     lantern_gossipsub_service_reset(&service);
 }
 
+static void test_gossipsub_service_remembers_extra_attestation_subnets(void) {
+    struct lantern_gossipsub_service service;
+    lantern_gossipsub_service_init(&service);
+    snprintf(service.topic_network_name, sizeof(service.topic_network_name), "devnet0");
+    service.attestation_subnet_id = 0u;
+
+    CHECK(lantern_gossipsub_service_subscribe_attestation_subnet(&service, 1u) == 0);
+    CHECK(service.extra_vote_subnet_topic_count == 1u);
+    CHECK(strcmp(
+        service.extra_vote_subnet_topics[0],
+        "/leanconsensus/devnet0/attestation_1/ssz_snappy") == 0);
+
+    CHECK(lantern_gossipsub_service_subscribe_attestation_subnet(&service, 1u) == 0);
+    CHECK(service.extra_vote_subnet_topic_count == 1u);
+
+    CHECK(lantern_gossipsub_service_subscribe_attestation_subnet(&service, 0u) == 0);
+    CHECK(strcmp(
+        service.vote_subnet_topic,
+        "/leanconsensus/devnet0/attestation_0/ssz_snappy") == 0);
+    CHECK(service.extra_vote_subnet_topic_count == 1u);
+
+    lantern_gossipsub_service_reset(&service);
+}
+
 static void test_client_publish_block_loopback(void) {
     struct lantern_client client;
     memset(&client, 0, sizeof(client));
@@ -1439,6 +1463,7 @@ int main(void) {
         puts("skipping test_replay_devnet_block_payloads (consensus fixtures not present)");
     }
     test_gossipsub_service_loopback();
+    test_gossipsub_service_remembers_extra_attestation_subnets();
     test_client_publish_block_loopback();
     test_gossip_helpers();
     puts("lantern_networking_messages_test OK");
