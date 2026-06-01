@@ -45,6 +45,7 @@ Environment overrides (start):
   DOCKER_BUILD       1 to build image before start (default: 1)
   DOCKER_BUILD_ARGS  Extra args passed to docker build (optional)
   DOCKER_LISTEN_IP   Listen IP for docker nodes (default: 127.0.0.1 for host, per-node docker IP otherwise)
+  DOCKER_RAYON_NUM_THREADS Rayon worker threads per docker node (default: 0, Rayon's default)
   ENABLE_COREDUMP    1 to enable core dumps for crashes (default: 0)
 
 Example:
@@ -133,6 +134,7 @@ DOCKER_IP_START=${DOCKER_IP_START:-10}
 DOCKER_BUILD=${DOCKER_BUILD:-1}
 DOCKER_BUILD_ARGS=${DOCKER_BUILD_ARGS:-}
 DOCKER_LISTEN_IP=${DOCKER_LISTEN_IP:-}
+DOCKER_RAYON_NUM_THREADS=${DOCKER_RAYON_NUM_THREADS:-0}
 ENABLE_COREDUMP=${ENABLE_COREDUMP:-0}
 
 PIDS_FILE="${RUN_DIR}/pids"
@@ -696,6 +698,7 @@ for i in $(seq 0 $((NODES-1))); do
       -e "LANTERN_NODES_FILE=/genesis/nodes.yaml"
       -e "LANTERN_GENESIS_STATE=/genesis/genesis.ssz"
       -e "LANTERN_VALIDATOR_CONFIG_DIR=/genesis"
+      -e "RAYON_NUM_THREADS=${DOCKER_RAYON_NUM_THREADS}"
       -e "LANTERN_EXTRA_ARGS=--hash-sig-key-dir /genesis/${HASH_SIG_KEYS_DIR_NAME} --log-level ${LOG_LEVEL}${CHECKPOINT_SYNC_URL:+ --checkpoint-sync-url ${CHECKPOINT_SYNC_URL}}"
     )
     if [[ "${ENABLE_COREDUMP}" == "1" ]]; then

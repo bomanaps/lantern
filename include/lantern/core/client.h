@@ -88,6 +88,7 @@ struct lantern_client_options {
 struct lantern_peer_status_entry;
 struct lantern_active_blocks_request;
 struct lantern_async_block_import_job;
+struct lantern_async_block_proposal_job;
 struct lantern_backfill_entry {
     LanternRoot root;
     LanternRoot parent_root;
@@ -248,6 +249,15 @@ struct lantern_client {
     pthread_t validator_thread;
     bool validator_thread_started;
     int validator_stop_flag;
+    struct lantern_async_block_proposal_job *block_proposal_job;
+    pthread_mutex_t block_proposal_lock;
+    pthread_cond_t block_proposal_cond;
+    pthread_t block_proposal_thread;
+    bool block_proposal_lock_initialized;
+    bool block_proposal_cond_initialized;
+    bool block_proposal_thread_started;
+    bool block_proposal_stop;
+    bool block_proposal_inflight;
     struct lantern_metrics_server metrics_server;
     bool metrics_running;
     uint64_t start_time_seconds;
