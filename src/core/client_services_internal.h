@@ -192,6 +192,9 @@ int validator_build_block(
  */
 int validator_propose_block(struct lantern_client *client, uint64_t slot, size_t local_index);
 
+int start_block_proposal_worker(struct lantern_client *client);
+void stop_block_proposal_worker(struct lantern_client *client);
+
 
 /**
  * Publish attestations for all enabled validators.

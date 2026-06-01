@@ -777,6 +777,17 @@ int lantern_store_add_known_aggregated_payload(
         target_slot);
 }
 
+int lantern_store_add_attestation_data(
+    LanternStore *store,
+    const LanternRoot *data_root,
+    const LanternAttestationData *data,
+    uint64_t target_slot) {
+    if (!store) {
+        return -1;
+    }
+    return attestation_data_by_root_add(&store->attestation_data_by_root, data_root, data, target_slot);
+}
+
 void lantern_store_clear_new_aggregated_payloads(LanternStore *store) {
     if (!store) {
         return;

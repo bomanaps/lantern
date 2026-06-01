@@ -12,15 +12,19 @@
 #define LANTERN_SIGNATURE_SIZE 2536
 #endif
 #define LANTERN_MAX_ATTESTATIONS 4096
-#define LANTERN_MAX_ATTESTATIONS_DATA UINT8_C(16)
+#define LANTERN_MAX_ATTESTATIONS_DATA UINT8_C(8)
 #define LANTERN_VALIDATOR_PUBKEY_SIZE 52
 #define LANTERN_VALIDATOR_REGISTRY_LIMIT 4096
 #define LANTERN_MAX_BLOCK_SIGNATURES LANTERN_VALIDATOR_REGISTRY_LIMIT
 #define LANTERN_HISTORICAL_ROOTS_LIMIT 262144
 #define LANTERN_JUSTIFICATION_VALIDATORS_LIMIT ((size_t)LANTERN_HISTORICAL_ROOTS_LIMIT * (size_t)LANTERN_VALIDATOR_REGISTRY_LIMIT)
-#define LANTERN_AGG_PROOF_MAX_BYTES (1024u * 1024u)
+#define LANTERN_AGG_PROOF_MAX_BYTES (512u * 1024u)
+#ifndef LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE
 #define LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE 2u
+#endif
+#ifndef LANTERN_INVERSE_PROOF_SIZE
 #define LANTERN_INVERSE_PROOF_SIZE 2u
+#endif
 
 struct lantern_bitlist {
     uint8_t *bytes;
@@ -131,11 +135,6 @@ typedef struct {
 } LanternAttestationSignatures;
 
 typedef struct {
-    LanternAttestationSignatures attestation_signatures;
-    LanternSignature proposer_signature;
-} LanternBlockSignatures;
-
-typedef struct {
     LanternAggregatedAttestations attestations;
 } LanternBlockBody;
 
@@ -163,7 +162,7 @@ typedef struct {
 
 typedef struct {
     LanternBlock block;
-    LanternBlockSignatures signatures;
+    LanternByteList proof;
 } LanternSignedBlock;
 
 void lantern_attestations_init(LanternAttestations *list);
@@ -255,10 +254,6 @@ void lantern_signature_list_init(LanternSignatureList *list);
 void lantern_signature_list_reset(LanternSignatureList *list);
 int lantern_signature_list_append(LanternSignatureList *list, const LanternSignature *signature);
 int lantern_signature_list_resize(LanternSignatureList *list, size_t new_length);
-
-void lantern_block_signatures_init(LanternBlockSignatures *signatures);
-void lantern_block_signatures_reset(LanternBlockSignatures *signatures);
-int lantern_block_signatures_copy(LanternBlockSignatures *dst, const LanternBlockSignatures *src);
 
 void lantern_block_init(LanternBlock *block);
 void lantern_block_reset(LanternBlock *block);

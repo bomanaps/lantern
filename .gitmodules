@@ -9,7 +9,7 @@
 	url = https://github.com/zserge/jsmn.git
 [submodule "tools/leanSpec"]
 	path = tools/leanSpec
-	url = https://github.com/Pier-Two/leanSpec.git
+	url = https://github.com/leanEthereum/leanSpec.git
 [submodule "tools/lean-quickstart"]
 	path = tools/lean-quickstart
 	url = https://github.com/blockblaz/lean-quickstart.git

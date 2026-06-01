@@ -99,6 +99,68 @@ static int set_test_validator_pubkey(
     return rc;
 }
 
+static int build_proposer_only_block_proof(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternRoot *block_root,
+    const LanternSignature *proposer_signature,
+    LanternByteList *out_proof) {
+    if (!state || !block || !block_root || !proposer_signature || !out_proof) {
+        return -1;
+    }
+
+    int rc = -1;
+    LanternAggregatedSignatureProof proposer_proof;
+    LanternAttestationSignatures attestation_proofs;
+    struct lantern_bitlist proposer_participants;
+    lantern_aggregated_signature_proof_init(&proposer_proof);
+    lantern_attestation_signatures_init(&attestation_proofs);
+    lantern_bitlist_init(&proposer_participants);
+
+    size_t proposer_index = (size_t)block->proposer_index;
+    const uint8_t *proposer_pubkey = lantern_state_validator_proposal_pubkey(state, proposer_index);
+    if (!proposer_pubkey) {
+        goto cleanup;
+    }
+    if (lantern_bitlist_resize(&proposer_participants, proposer_index + 1u) != 0
+        || lantern_bitlist_set(&proposer_participants, proposer_index, true) != 0) {
+        goto cleanup;
+    }
+
+    LanternRawXmssSignature raw_proposer = {
+        .pubkey = proposer_pubkey,
+        .signature = proposer_signature,
+    };
+    if (!lantern_aggregated_signature_proof_aggregate(
+            state,
+            &proposer_participants,
+            NULL,
+            0u,
+            &raw_proposer,
+            1u,
+            block_root,
+            block->slot,
+            &proposer_proof)) {
+        goto cleanup;
+    }
+    if (!lantern_signature_merge_block_type2_proof(
+            state,
+            block,
+            &attestation_proofs,
+            &proposer_proof,
+            out_proof)) {
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_bitlist_reset(&proposer_participants);
+    lantern_attestation_signatures_reset(&attestation_proofs);
+    lantern_aggregated_signature_proof_reset(&proposer_proof);
+    return rc;
+}
+
 static int serialize_test_pubkey(
     struct PQSignatureSchemePublicKey *pubkey,
     uint8_t out_bytes[LANTERN_VALIDATOR_PUBKEY_SIZE]) {
@@ -429,7 +491,7 @@ static int test_genesis_justification_bits(void) {
     expect_ssz_success(lantern_hash_tree_root_block_header(&state.latest_block_header, &parent_root), "hash genesis header");
     block.parent_root = parent_root;
 
-    expect_zero(lantern_state_process_block(&state, &block, NULL, NULL), "process first block");
+    expect_zero(lantern_state_process_block(&state, &block), "process first block");
     /* Finalized boundary (slot 0) is implicit; bitlist starts at slot 1. */
     assert(state.justified_slots.bit_length == 0);
 
@@ -494,7 +556,7 @@ static int test_block_header_rejects_duplicate_slot(void) {
     make_block(&state, 1, &genesis_header_root, &first_block, &first_block_root);
     (void)first_block_root;
 
-    if (lantern_state_process_block(&state, &first_block, NULL, NULL) != 0) {
+    if (lantern_state_process_block(&state, &first_block) != 0) {
         fprintf(stderr, "failed to process first block in duplicate slot test\n");
         lantern_block_body_reset(&first_block.body);
         lantern_state_reset(&state);
@@ -511,7 +573,7 @@ static int test_block_header_rejects_duplicate_slot(void) {
     make_block(&state, first_block.slot, &latest_header_root, &duplicate_block, &duplicate_block_root);
     (void)duplicate_block_root;
 
-    if (lantern_state_process_block(&state, &duplicate_block, NULL, NULL) == 0) {
+    if (lantern_state_process_block(&state, &duplicate_block) == 0) {
         fprintf(stderr, "duplicate slot block was incorrectly accepted\n");
         lantern_block_body_reset(&duplicate_block.body);
         lantern_block_body_reset(&first_block.body);
@@ -540,7 +602,7 @@ static int test_block_header_rejects_zero_parent_root(void) {
     make_block(&state, 1, &zero_parent, &block, &block_root);
     (void)block_root;
 
-    if (lantern_state_process_block(&state, &block, NULL, NULL) == 0) {
+    if (lantern_state_process_block(&state, &block) == 0) {
         fprintf(stderr, "zero parent root block was incorrectly accepted\n");
         lantern_block_body_reset(&block.body);
         lantern_state_reset(&state);
@@ -622,7 +684,7 @@ static int test_state_transition_applies_block(void) {
     LanternRoot parent_root;
     expect_ssz_success(lantern_hash_tree_root_block_header(&expected.latest_block_header, &parent_root), "hash parent header");
     block.parent_root = parent_root;
-    expect_zero(lantern_state_process_block(&expected, &block, NULL, NULL), "expected process block");
+    expect_zero(lantern_state_process_block(&expected, &block), "expected process block");
     LanternRoot expected_state_root;
     expect_ssz_success(lantern_hash_tree_root_state(&expected, &expected_state_root), "hash expected state");
     block.state_root = expected_state_root;
@@ -634,12 +696,30 @@ static int test_state_transition_applies_block(void) {
     expect_ssz_success(
         lantern_hash_tree_root_block(&signed_block.block, &proposer_block_root),
         "hash proposer block");
+    LanternSignature proposer_signature;
+    memset(&proposer_signature, 0, sizeof(proposer_signature));
     if (!lantern_signature_sign(
             proposer_secret,
             signed_block.block.slot,
             &proposer_block_root,
-            &signed_block.signatures.proposer_signature)) {
+            &proposer_signature)) {
         fprintf(stderr, "sign proposer block failed\n");
+        lantern_block_body_reset(&block.body);
+        pq_secret_key_free(proposer_secret);
+        pq_public_key_free(proposer_pub);
+        lantern_state_reset(&state);
+        lantern_state_reset(&expected);
+        return 1;
+    }
+    if (build_proposer_only_block_proof(
+            &state,
+            &signed_block.block,
+            &proposer_block_root,
+            &proposer_signature,
+            &signed_block.proof)
+        != 0) {
+        fprintf(stderr, "build proposer block proof failed\n");
+        lantern_byte_list_reset(&signed_block.proof);
         lantern_block_body_reset(&block.body);
         pq_secret_key_free(proposer_secret);
         pq_public_key_free(proposer_pub);
@@ -657,6 +737,7 @@ static int test_state_transition_applies_block(void) {
     assert(state.slot == expected.slot);
     assert(state.historical_block_hashes.length == expected.historical_block_hashes.length);
 
+    lantern_byte_list_reset(&signed_block.proof);
     lantern_block_body_reset(&block.body);
     pq_secret_key_free(proposer_secret);
     pq_public_key_free(proposer_pub);
@@ -665,7 +746,7 @@ static int test_state_transition_applies_block(void) {
     return 0;
 }
 
-static int test_state_transition_rejects_missing_proposer_signature(void) {
+static int test_state_transition_rejects_missing_block_proof(void) {
     const uint64_t genesis_time = 501;
     const uint64_t validator_count = 1;
 
@@ -675,32 +756,32 @@ static int test_state_transition_rejects_missing_proposer_signature(void) {
 
     struct PQSignatureSchemePublicKey *proposer_pub = NULL;
     struct PQSignatureSchemeSecretKey *proposer_secret = NULL;
-    expect_zero(generate_test_keypair(&proposer_pub, &proposer_secret), "generate missing-signature keypair");
+    expect_zero(generate_test_keypair(&proposer_pub, &proposer_secret), "generate missing-proof keypair");
     expect_zero(
         set_test_validator_pubkey(&state, (size_t)validator_count, 0u, proposer_pub),
-        "set missing-signature pubkey");
+        "set missing-proof pubkey");
 
     LanternState expected;
     lantern_state_init(&expected);
     expect_zero(lantern_state_generate_genesis(&expected, genesis_time, validator_count), "generate expected signed state");
     expect_zero(
         set_test_validator_pubkey(&expected, (size_t)validator_count, 0u, proposer_pub),
-        "set expected missing-signature pubkey");
+        "set expected missing-proof pubkey");
 
     LanternBlock block;
     memset(&block, 0, sizeof(block));
     block.slot = 1;
-    expect_zero(lantern_proposer_for_slot(block.slot, validator_count, &block.proposer_index), "compute missing-signature proposer");
+    expect_zero(lantern_proposer_for_slot(block.slot, validator_count, &block.proposer_index), "compute missing-proof proposer");
     lantern_block_body_init(&block.body);
 
     expect_zero(lantern_state_process_slots(&expected, block.slot), "advance expected signed slots");
     LanternRoot parent_root;
     expect_ssz_success(
         lantern_hash_tree_root_block_header(&expected.latest_block_header, &parent_root),
-        "hash missing-signature parent");
+        "hash missing-proof parent");
     block.parent_root = parent_root;
     LanternRoot expected_state_root;
-    expect_zero(lantern_state_process_block(&expected, &block, NULL, NULL), "apply expected unsigned block");
+    expect_zero(lantern_state_process_block(&expected, &block), "apply expected unsigned block");
     expect_ssz_success(lantern_hash_tree_root_state(&expected, &expected_state_root), "hash expected unsigned post state");
     block.state_root = expected_state_root;
 
@@ -709,7 +790,7 @@ static int test_state_transition_rejects_missing_proposer_signature(void) {
     signed_block.block = block;
 
     if (lantern_state_transition(&state, &signed_block) == 0) {
-        fprintf(stderr, "state transition accepted block without proposer signature\n");
+        fprintf(stderr, "state transition accepted block without block proof\n");
         lantern_block_body_reset(&block.body);
         pq_secret_key_free(proposer_secret);
         pq_public_key_free(proposer_pub);
@@ -718,7 +799,7 @@ static int test_state_transition_rejects_missing_proposer_signature(void) {
         return 1;
     }
     if (state.slot != 0u) {
-        fprintf(stderr, "state transition mutated slot on signature failure (slot=%" PRIu64 ")\n", state.slot);
+        fprintf(stderr, "state transition mutated slot on proof failure (slot=%" PRIu64 ")\n", state.slot);
         lantern_block_body_reset(&block.body);
         pq_secret_key_free(proposer_secret);
         pq_public_key_free(proposer_pub);
@@ -2158,7 +2239,7 @@ static int test_process_block_accepts_mixed_attestations(void) {
     }
 
     expect_zero(lantern_state_process_slots(&state, block.slot), "advance slots for mixed attestation block");
-    int process_rc = lantern_state_process_block(&state, &block, NULL, NULL);
+    int process_rc = lantern_state_process_block(&state, &block);
     if (process_rc == 0) {
         fprintf(stderr, "expected mixed aggregated attestations to be rejected\n");
         lantern_attestations_reset(&votes);
@@ -2396,7 +2477,7 @@ static int test_process_block_rejects_duplicate_attestation_data(void) {
         return 1;
     }
 
-    if (lantern_state_process_block(&state, &block, NULL, NULL) == 0) {
+    if (lantern_state_process_block(&state, &block) == 0) {
         fprintf(stderr, "duplicate attestation data block was incorrectly accepted\n");
         lantern_block_body_reset(&block.body);
         lantern_state_reset(&state);
@@ -2446,7 +2527,7 @@ static int test_process_block_rejects_too_many_attestation_data_entries(void) {
             "append max attestation-data block vote");
     }
 
-    if (lantern_state_process_block(&state, &block, NULL, NULL) == 0) {
+    if (lantern_state_process_block(&state, &block) == 0) {
         fprintf(stderr, "block with too many distinct attestation data entries was incorrectly accepted\n");
         lantern_block_body_reset(&block.body);
         lantern_state_reset(&state);
@@ -2589,11 +2670,13 @@ static int test_process_block_defers_proposer_attestation(void) {
     expect_ssz_success(
         lantern_hash_tree_root_block(block, &proposer_block_root),
         "hash proposer block root");
+    LanternSignature proposer_signature;
+    memset(&proposer_signature, 0, sizeof(proposer_signature));
     if (!lantern_signature_sign(
             proposer_secret,
             block->slot,
             &proposer_block_root,
-            &signed_block.signatures.proposer_signature)) {
+            &proposer_signature)) {
         fprintf(stderr, "sign proposer block failed\n");
         lantern_block_body_reset(&block->body);
         pq_secret_key_free(proposer_secret);
@@ -2601,12 +2684,28 @@ static int test_process_block_defers_proposer_attestation(void) {
         lantern_state_reset(&state);
         return 1;
     }
+    if (build_proposer_only_block_proof(
+            &state,
+            block,
+            &proposer_block_root,
+            &proposer_signature,
+            &signed_block.proof)
+        != 0) {
+        fprintf(stderr, "build proposer block proof failed\n");
+        lantern_byte_list_reset(&signed_block.proof);
+        lantern_block_body_reset(&block->body);
+        pq_secret_key_free(proposer_secret);
+        pq_public_key_free(proposer_pub);
+        lantern_state_reset(&state);
+        return 1;
+    }
 
-    expect_zero(lantern_state_transition(&state, &signed_block), "import block with proposer signature");
+    expect_zero(lantern_state_transition(&state, &signed_block), "import block with proposer proof");
     assert(state.latest_justified.slot == base.slot);
 
     if (lantern_state_validator_has_vote(&state, (size_t)block->proposer_index)) {
-        fprintf(stderr, "proposer signature should not stage a validator vote\n");
+        fprintf(stderr, "proposer proof should not stage a validator vote\n");
+        lantern_byte_list_reset(&signed_block.proof);
         lantern_block_body_reset(&block->body);
         pq_secret_key_free(proposer_secret);
         pq_public_key_free(proposer_pub);
@@ -2618,6 +2717,7 @@ static int test_process_block_defers_proposer_attestation(void) {
     LanternStore *store = lantern_test_state_store_ensure(&state);
     if (!store) {
         fprintf(stderr, "state store missing after proposer import\n");
+        lantern_byte_list_reset(&signed_block.proof);
         lantern_block_body_reset(&block->body);
         pq_secret_key_free(proposer_secret);
         pq_public_key_free(proposer_pub);
@@ -2633,6 +2733,7 @@ static int test_process_block_defers_proposer_attestation(void) {
     expect_zero(lantern_fork_choice_current_head(&fork_choice, &head), "fork choice head after proposer import");
     assert(memcmp(head.bytes, proposer_block_root.bytes, LANTERN_ROOT_SIZE) == 0);
 
+    lantern_byte_list_reset(&signed_block.proof);
     lantern_block_body_reset(&block->body);
     pq_secret_key_free(proposer_secret);
     pq_public_key_free(proposer_pub);
@@ -3130,7 +3231,7 @@ static int test_collect_attestations_ignores_store_justified_when_parent_state_l
     expect_zero(lantern_state_clone(&state, &parent_state), "clone lagging parent state");
     expect_zero(lantern_state_process_slots(&parent_state, block_one.slot), "advance lagging parent state");
     expect_zero(
-        lantern_state_process_block(&parent_state, &block_one, NULL, NULL),
+        lantern_state_process_block(&parent_state, &block_one),
         "process lagging parent block");
     expect_ssz_success(lantern_hash_tree_root_state(&parent_state, &block_one_state_root), "hash lagging parent state");
     block_one.state_root = block_one_state_root;
@@ -3337,7 +3438,7 @@ static int test_validator_helpers_use_cached_fork_choice_head_state(void) {
         "prepare block one validator votes");
     expect_zero(lantern_state_process_slots(&block_one_state, block_one.slot), "advance block one state");
     expect_zero(
-        lantern_state_process_block(&block_one_state, &block_one, NULL, NULL),
+        lantern_state_process_block(&block_one_state, &block_one),
         "process block one state");
     expect_ssz_success(lantern_hash_tree_root_state(&block_one_state, &block_one_state_root), "hash block one state");
     block_one.state_root = block_one_state_root;
@@ -3399,7 +3500,7 @@ static int test_validator_helpers_use_cached_fork_choice_head_state(void) {
         "prepare expected-state validator votes");
     expect_zero(lantern_state_process_slots(&expected_state, signed_block.block.slot), "advance expected state");
     expect_zero(
-        lantern_state_process_block(&expected_state, &signed_block.block, NULL, NULL),
+        lantern_state_process_block(&expected_state, &signed_block.block),
         "process preview block on cached head state");
     expect_ssz_success(lantern_hash_tree_root_state(&expected_state, &expected_state_root), "hash expected preview state");
 
@@ -3470,7 +3571,7 @@ static int test_compute_post_state_matches_process_block_and_votes(void) {
     expect_zero(lantern_state_clone(&state, &expected_state), "clone expected state");
     expect_zero(lantern_state_process_slots(&expected_state, signed_block.block.slot), "advance expected state");
     expect_zero(
-        lantern_state_process_block(&expected_state, &signed_block.block, NULL, NULL),
+        lantern_state_process_block(&expected_state, &signed_block.block),
         "process block for expected post-state");
     expect_ssz_success(lantern_hash_tree_root_state(&expected_state, &expected_state_root), "hash expected post-state");
 
@@ -3543,7 +3644,7 @@ static int test_compute_post_state_ignores_store_justified_for_hash(void) {
     expect_zero(lantern_state_clone(&state, &block_one_state), "clone cached parent seal state");
     expect_zero(lantern_state_process_slots(&block_one_state, block_one.slot), "advance cached parent seal state");
     expect_zero(
-        lantern_state_process_block(&block_one_state, &block_one, NULL, NULL),
+        lantern_state_process_block(&block_one_state, &block_one),
         "process cached parent seal block");
     expect_ssz_success(
         lantern_hash_tree_root_state(&block_one_state, &block_one_state_root),
@@ -3588,7 +3689,7 @@ static int test_compute_post_state_ignores_store_justified_for_hash(void) {
     expect_zero(lantern_state_clone(&block_one_state, &expected_state), "clone expected cached parent state");
     expect_zero(lantern_state_process_slots(&expected_state, signed_block.block.slot), "advance expected cached parent state");
     expect_zero(
-        lantern_state_process_block(&expected_state, &signed_block.block, NULL, NULL),
+        lantern_state_process_block(&expected_state, &signed_block.block),
         "process expected cached parent block");
     expect_ssz_success(lantern_hash_tree_root_state(&expected_state, &expected_state_root), "hash expected cached parent state");
 
@@ -4345,7 +4446,7 @@ int main(void) {
     if (test_state_transition_applies_block() != 0) {
         return 1;
     }
-    if (test_state_transition_rejects_missing_proposer_signature() != 0) {
+    if (test_state_transition_rejects_missing_block_proof() != 0) {
         return 1;
     }
     if (test_state_transition_rejects_genesis_state_root_mismatch() != 0) {

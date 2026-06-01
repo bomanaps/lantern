@@ -8,6 +8,7 @@
 #include <time.h>
 
 #include "lantern/metrics/lean_metrics.h"
+#include "lantern/consensus/hash.h"
 #include "lantern/support/log.h"
 #include "lantern/support/strings.h"
 #include "pq-bindings-c-rust.h"
@@ -189,6 +190,274 @@ static void log_agg_proof_preview(const LanternByteList *proof) {
         proof->length,
         hex[0] ? hex : "-",
         ellipsis);
+}
+
+static const char *pq_error_detail_or_dash(const char *detail) {
+    return detail && detail[0] ? detail : "-";
+}
+
+static void log_pq_prover_setup_error_if_any(void) {
+    char *detail = pq_take_last_error_message();
+    if (!detail) {
+        return;
+    }
+    lantern_log_error("signature", NULL, "%s", pq_error_detail_or_dash(detail));
+    pq_string_free(detail);
+}
+
+static bool write_type2_container(const LanternByteList *raw_proof, LanternByteList *out_encoded) {
+    if (!raw_proof || !out_encoded) {
+        return false;
+    }
+    if (raw_proof->length == 0u || !raw_proof->data) {
+        return false;
+    }
+    if (raw_proof->length > LANTERN_AGG_PROOF_MAX_BYTES - 4u) {
+        return false;
+    }
+    size_t encoded_len = raw_proof->length + 4u;
+    if (lantern_byte_list_resize(out_encoded, encoded_len) != 0) {
+        return false;
+    }
+    out_encoded->data[0] = 4u;
+    out_encoded->data[1] = 0u;
+    out_encoded->data[2] = 0u;
+    out_encoded->data[3] = 0u;
+    memcpy(out_encoded->data + 4u, raw_proof->data, raw_proof->length);
+    return true;
+}
+
+bool lantern_signature_wrap_type2_proof(
+    const LanternByteList *raw_proof,
+    LanternByteList *out_encoded) {
+    return write_type2_container(raw_proof, out_encoded);
+}
+
+bool lantern_signature_unwrap_type2_proof(
+    const LanternByteList *encoded_proof,
+    LanternByteList *out_raw) {
+    if (!encoded_proof || !out_raw) {
+        return false;
+    }
+    if (encoded_proof->length < 5u || !encoded_proof->data) {
+        return false;
+    }
+    uint32_t offset = (uint32_t)encoded_proof->data[0]
+        | ((uint32_t)encoded_proof->data[1] << 8)
+        | ((uint32_t)encoded_proof->data[2] << 16)
+        | ((uint32_t)encoded_proof->data[3] << 24);
+    if (offset != 4u || offset > encoded_proof->length) {
+        return false;
+    }
+    size_t raw_len = encoded_proof->length - (size_t)offset;
+    if (raw_len == 0u || raw_len > LANTERN_AGG_PROOF_MAX_BYTES) {
+        return false;
+    }
+    if (lantern_byte_list_resize(out_raw, raw_len) != 0) {
+        return false;
+    }
+    memcpy(out_raw->data, encoded_proof->data + offset, raw_len);
+    return true;
+}
+
+struct lantern_type2_component_work {
+    struct PQSignatureSchemePublicKey **pubkey_handles;
+    size_t pubkey_count;
+};
+
+static void type2_component_work_reset(struct lantern_type2_component_work *work) {
+    if (!work) {
+        return;
+    }
+    if (work->pubkey_handles) {
+        for (size_t i = 0; i < work->pubkey_count; ++i) {
+            if (work->pubkey_handles[i]) {
+                pq_public_key_free(work->pubkey_handles[i]);
+            }
+        }
+    }
+    free(work->pubkey_handles);
+    memset(work, 0, sizeof(*work));
+}
+
+static bool type2_component_init_from_pubkeys(
+    const uint8_t *const *pubkeys,
+    size_t pubkey_count,
+    struct lantern_type2_component_work *work,
+    struct PQTypeTwoComponent *component) {
+    if (!pubkeys || pubkey_count == 0u || !work || !component) {
+        return false;
+    }
+    work->pubkey_handles = calloc(pubkey_count, sizeof(*work->pubkey_handles));
+    if (!work->pubkey_handles) {
+        return false;
+    }
+    work->pubkey_count = pubkey_count;
+    for (size_t i = 0; i < pubkey_count; ++i) {
+        if (!pubkeys[i] || validator_pubkey_bytes_are_zero(pubkeys[i])) {
+            return false;
+        }
+        enum PQSigningError pk_err = pq_public_key_deserialize(
+            pubkeys[i],
+            LANTERN_VALIDATOR_PUBKEY_SIZE,
+            &work->pubkey_handles[i]);
+        if (pk_err != Success || !work->pubkey_handles[i]) {
+            return false;
+        }
+    }
+    component->pubkeys = (const struct PQSignatureSchemePublicKey *const *)work->pubkey_handles;
+    component->pubkey_count = pubkey_count;
+    return true;
+}
+
+static size_t bitlist_count_set_bits(const struct lantern_bitlist *bits) {
+    if (!bits || bits->bit_length == 0u || !bits->bytes) {
+        return 0u;
+    }
+    size_t count = 0u;
+    for (size_t i = 0; i < bits->bit_length; ++i) {
+        if (lantern_bitlist_get(bits, i)) {
+            count += 1u;
+        }
+    }
+    return count;
+}
+
+static bool bitlist_equal(const struct lantern_bitlist *a, const struct lantern_bitlist *b) {
+    if (!a || !b || a->bit_length != b->bit_length) {
+        return false;
+    }
+    size_t byte_len = (a->bit_length + 7u) / 8u;
+    if (byte_len == 0u) {
+        return true;
+    }
+    return a->bytes && b->bytes && memcmp(a->bytes, b->bytes, byte_len) == 0;
+}
+
+static bool singleton_participant_matches(
+    const struct lantern_bitlist *participants,
+    LanternValidatorIndex expected) {
+    if (!participants || participants->bit_length == 0u || !participants->bytes) {
+        return false;
+    }
+    if (expected >= participants->bit_length || !lantern_bitlist_get(participants, (size_t)expected)) {
+        return false;
+    }
+    return bitlist_count_set_bits(participants) == 1u;
+}
+
+static bool build_type2_attestation_component(
+    const LanternState *state,
+    const struct lantern_bitlist *participants,
+    struct lantern_type2_component_work *work,
+    struct PQTypeTwoComponent *component) {
+    if (!state || !participants || !work || !component) {
+        return false;
+    }
+    size_t validator_count = lantern_state_validator_count(state);
+    if (participants->bit_length > validator_count) {
+        return false;
+    }
+    size_t pubkey_count = bitlist_count_set_bits(participants);
+    if (pubkey_count == 0u) {
+        return false;
+    }
+    const uint8_t **pubkeys = calloc(pubkey_count, sizeof(*pubkeys));
+    if (!pubkeys) {
+        return false;
+    }
+    size_t pubkey_index = 0u;
+    for (size_t i = 0; i < participants->bit_length; ++i) {
+        if (!lantern_bitlist_get(participants, i)) {
+            continue;
+        }
+        const uint8_t *pubkey = lantern_state_validator_attestation_pubkey(state, i);
+        if (!pubkey || validator_pubkey_bytes_are_zero(pubkey)) {
+            free(pubkeys);
+            return false;
+        }
+        pubkeys[pubkey_index++] = pubkey;
+    }
+    bool ok = type2_component_init_from_pubkeys(pubkeys, pubkey_count, work, component);
+    free(pubkeys);
+    return ok;
+}
+
+static bool build_type2_proposer_component(
+    const LanternState *state,
+    LanternValidatorIndex proposer_index,
+    struct lantern_type2_component_work *work,
+    struct PQTypeTwoComponent *component) {
+    if (!state || !work || !component) {
+        return false;
+    }
+    size_t validator_count = lantern_state_validator_count(state);
+    if (proposer_index >= validator_count) {
+        return false;
+    }
+    const uint8_t *pubkey = lantern_state_validator_proposal_pubkey(state, (size_t)proposer_index);
+    return type2_component_init_from_pubkeys(&pubkey, 1u, work, component);
+}
+
+static void reset_type2_component_set(
+    struct lantern_type2_component_work *work,
+    size_t component_count) {
+    if (!work) {
+        return;
+    }
+    for (size_t i = 0; i < component_count; ++i) {
+        type2_component_work_reset(&work[i]);
+    }
+}
+
+static bool build_type2_component_set_for_block(
+    const LanternState *state,
+    const LanternBlock *block,
+    struct lantern_type2_component_work *work,
+    struct PQTypeTwoComponent *components,
+    struct PQTypeTwoMessageBinding *bindings,
+    LanternRoot *message_roots,
+    size_t component_count) {
+    if (!state || !block || !work || !components || !bindings || !message_roots) {
+        return false;
+    }
+    size_t attestation_count = block->body.attestations.length;
+    if (component_count != attestation_count + 1u) {
+        return false;
+    }
+    if (attestation_count > 0u && !block->body.attestations.data) {
+        return false;
+    }
+    for (size_t i = 0; i < attestation_count; ++i) {
+        const LanternAggregatedAttestation *attestation = &block->body.attestations.data[i];
+        if (!build_type2_attestation_component(
+                state,
+                &attestation->aggregation_bits,
+                &work[i],
+                &components[i])) {
+            return false;
+        }
+        if (lantern_hash_tree_root_attestation_data(&attestation->data, &message_roots[i]) != SSZ_SUCCESS) {
+            return false;
+        }
+        bindings[i].message = message_roots[i].bytes;
+        bindings[i].message_len = LANTERN_ROOT_SIZE;
+        bindings[i].epoch = attestation->data.slot;
+    }
+    if (!build_type2_proposer_component(
+            state,
+            block->proposer_index,
+            &work[attestation_count],
+            &components[attestation_count])) {
+        return false;
+    }
+    if (lantern_hash_tree_root_block(block, &message_roots[attestation_count]) != SSZ_SUCCESS) {
+        return false;
+    }
+    bindings[attestation_count].message = message_roots[attestation_count].bytes;
+    bindings[attestation_count].message_len = LANTERN_ROOT_SIZE;
+    bindings[attestation_count].epoch = block->slot;
+    return true;
 }
 
 bool lantern_signature_is_zero(const LanternSignature *signature) {
@@ -381,6 +650,7 @@ bool lantern_signature_aggregate(
     double elapsed = 0.0;
     if (ok) {
         ensure_xmss_prover_setup();
+        log_pq_prover_setup_error_if_any();
         uintptr_t written_len = 0;
         double start = get_time_seconds();
         enum PQSigningError err = pq_aggregate_signatures(
@@ -390,18 +660,22 @@ bool lantern_signature_aggregate(
             message->bytes,
             LANTERN_ROOT_SIZE,
             epoch,
+            LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE,
             out_proof->data,
             out_proof->length,
             &written_len);
         if (err != Success || written_len == 0 || written_len > out_proof->length) {
+            char *detail = pq_take_last_error_message();
             lantern_log_error(
                 "signature",
                 NULL,
-                "aggregation failed err=%d written=%zu buffer=%zu count=%zu",
+                "aggregation failed err=%d written=%zu buffer=%zu count=%zu detail=%s",
                 (int)err,
                 (size_t)written_len,
                 (size_t)out_proof->length,
-                count);
+                count,
+                pq_error_detail_or_dash(detail));
+            pq_string_free(detail);
             ok = false;
         } else if (lantern_byte_list_resize(out_proof, (size_t)written_len) != 0) {
             lantern_log_error(
@@ -517,11 +791,8 @@ bool lantern_aggregated_signature_proof_aggregate(
     }
 
     if (child_count == 1u && raw_xmss_count == 0u) {
-        if (children[0].proof_data.length == 0u || !children[0].proof_data.data) {
-            (void)lantern_byte_list_resize(&out_proof->proof_data, 0u);
-            return false;
-        }
-        return lantern_byte_list_copy(&out_proof->proof_data, &children[0].proof_data) == 0;
+        (void)lantern_byte_list_resize(&out_proof->proof_data, 0u);
+        return false;
     }
 
     if (child_count > 0u) {
@@ -601,6 +872,7 @@ bool lantern_aggregated_signature_proof_aggregate(
 
         if (ok) {
             ensure_xmss_prover_setup();
+            log_pq_prover_setup_error_if_any();
             uintptr_t written_len = 0u;
             double start = get_time_seconds();
             enum PQSigningError agg_err = pq_aggregate_signatures_recursive(
@@ -616,15 +888,18 @@ bool lantern_aggregated_signature_proof_aggregate(
                 out_proof->proof_data.length,
                 &written_len);
             if (agg_err != Success || written_len == 0u || written_len > out_proof->proof_data.length) {
+                char *detail = pq_take_last_error_message();
                 lantern_log_error(
                     "signature",
                     NULL,
-                    "recursive aggregation failed child_count=%zu raw_xmss=%zu err=%d written=%zu buffer=%zu",
+                    "recursive aggregation failed child_count=%zu raw_xmss=%zu err=%d written=%zu buffer=%zu detail=%s",
                     child_count,
                     raw_xmss_count,
                     (int)agg_err,
                     (size_t)written_len,
-                    (size_t)out_proof->proof_data.length);
+                    (size_t)out_proof->proof_data.length,
+                    pq_error_detail_or_dash(detail));
+                pq_string_free(detail);
                 ok = false;
             } else if (lantern_byte_list_resize(&out_proof->proof_data, (size_t)written_len) != 0) {
                 ok = false;
@@ -806,4 +1081,285 @@ bool lantern_signature_verify_aggregated(
             epoch);
     }
     return verify_rc == 1;
+}
+
+bool lantern_signature_merge_block_type2_proof(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternAttestationSignatures *attestation_proofs,
+    const LanternAggregatedSignatureProof *proposer_proof,
+    LanternByteList *out_encoded_proof) {
+    if (!state || !block || !attestation_proofs || !proposer_proof || !out_encoded_proof) {
+        return false;
+    }
+    size_t attestation_count = block->body.attestations.length;
+    if (attestation_proofs->length != attestation_count) {
+        return false;
+    }
+    if (attestation_count > 0u
+        && (!block->body.attestations.data || !attestation_proofs->data)) {
+        return false;
+    }
+
+    size_t component_count = attestation_count + 1u;
+    struct lantern_type2_component_work *work =
+        calloc(component_count, sizeof(*work));
+    struct PQTypeTwoComponent *components =
+        calloc(component_count, sizeof(*components));
+    struct PQTypeTwoMessageBinding *bindings =
+        calloc(component_count, sizeof(*bindings));
+    LanternRoot *message_roots = calloc(component_count, sizeof(*message_roots));
+    struct PQAggregatedSignatureChild *entries =
+        calloc(component_count, sizeof(*entries));
+    LanternByteList raw_type2;
+    lantern_byte_list_init(&raw_type2);
+
+    bool ok = false;
+    if (!work || !components || !bindings || !message_roots || !entries) {
+        goto cleanup;
+    }
+    if (!build_type2_component_set_for_block(
+            state,
+            block,
+            work,
+            components,
+            bindings,
+            message_roots,
+            component_count)) {
+        goto cleanup;
+    }
+
+    for (size_t i = 0; i < attestation_count; ++i) {
+        const LanternAggregatedAttestation *attestation = &block->body.attestations.data[i];
+        const LanternAggregatedSignatureProof *proof = &attestation_proofs->data[i];
+        if (!bitlist_equal(&attestation->aggregation_bits, &proof->participants)) {
+            goto cleanup;
+        }
+        if (proof->proof_data.length == 0u || !proof->proof_data.data) {
+            goto cleanup;
+        }
+        entries[i].pubkeys = components[i].pubkeys;
+        entries[i].pubkey_count = components[i].pubkey_count;
+        entries[i].agg_bytes = proof->proof_data.data;
+        entries[i].agg_len = proof->proof_data.length;
+    }
+
+    if (!singleton_participant_matches(
+            &proposer_proof->participants,
+            block->proposer_index)) {
+        goto cleanup;
+    }
+    if (proposer_proof->proof_data.length == 0u || !proposer_proof->proof_data.data) {
+        goto cleanup;
+    }
+    entries[attestation_count].pubkeys = components[attestation_count].pubkeys;
+    entries[attestation_count].pubkey_count = components[attestation_count].pubkey_count;
+    entries[attestation_count].agg_bytes = proposer_proof->proof_data.data;
+    entries[attestation_count].agg_len = proposer_proof->proof_data.length;
+
+    ensure_xmss_prover_setup();
+    log_pq_prover_setup_error_if_any();
+    if (lantern_byte_list_resize(&raw_type2, LANTERN_AGG_PROOF_MAX_BYTES) != 0) {
+        goto cleanup;
+    }
+    uintptr_t written_len = 0u;
+    enum PQSigningError merge_rc = pq_merge_many_type_1(
+        entries,
+        component_count,
+        LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE,
+        raw_type2.data,
+        raw_type2.length,
+        &written_len);
+    if (merge_rc != Success || written_len == 0u || written_len > raw_type2.length) {
+        char *detail = pq_take_last_error_message();
+        lantern_log_error(
+            "signature",
+            NULL,
+            "block Type-2 merge failed err=%d entries=%zu written=%zu detail=%s",
+            (int)merge_rc,
+            component_count,
+            (size_t)written_len,
+            pq_error_detail_or_dash(detail));
+        pq_string_free(detail);
+        goto cleanup;
+    }
+    if (lantern_byte_list_resize(&raw_type2, (size_t)written_len) != 0) {
+        goto cleanup;
+    }
+    ok = lantern_signature_wrap_type2_proof(&raw_type2, out_encoded_proof);
+
+cleanup:
+    if (!ok) {
+        (void)lantern_byte_list_resize(out_encoded_proof, 0u);
+    }
+    lantern_byte_list_reset(&raw_type2);
+    reset_type2_component_set(work, component_count);
+    free(entries);
+    free(message_roots);
+    free(bindings);
+    free(components);
+    free(work);
+    return ok;
+}
+
+bool lantern_signature_verify_block_type2_proof(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternByteList *encoded_proof) {
+    if (!state || !block || !encoded_proof) {
+        return false;
+    }
+    size_t attestation_count = block->body.attestations.length;
+    if (attestation_count > 0u && !block->body.attestations.data) {
+        return false;
+    }
+
+    size_t component_count = attestation_count + 1u;
+    struct lantern_type2_component_work *work =
+        calloc(component_count, sizeof(*work));
+    struct PQTypeTwoComponent *components =
+        calloc(component_count, sizeof(*components));
+    struct PQTypeTwoMessageBinding *bindings =
+        calloc(component_count, sizeof(*bindings));
+    LanternRoot *message_roots = calloc(component_count, sizeof(*message_roots));
+    LanternByteList raw_type2;
+    lantern_byte_list_init(&raw_type2);
+
+    bool ok = false;
+    if (!work || !components || !bindings || !message_roots) {
+        goto cleanup;
+    }
+    if (!lantern_signature_unwrap_type2_proof(encoded_proof, &raw_type2)) {
+        goto cleanup;
+    }
+    if (!build_type2_component_set_for_block(
+            state,
+            block,
+            work,
+            components,
+            bindings,
+            message_roots,
+            component_count)) {
+        goto cleanup;
+    }
+
+    ensure_xmss_verifier_setup();
+    double start = get_time_seconds();
+    int verify_rc = pq_verify_type_2_with_messages(
+        components,
+        component_count,
+        bindings,
+        component_count,
+        raw_type2.data,
+        raw_type2.length);
+    double elapsed = get_time_seconds() - start;
+    lean_metrics_record_pq_block_aggregated_signatures_verification(elapsed);
+    ok = (verify_rc == 1);
+    if (!ok) {
+        lantern_log_warn(
+            "signature",
+            &(const struct lantern_log_metadata){.has_slot = true, .slot = block->slot},
+            "block Type-2 proof verification failed rc=%d components=%zu proof_len=%zu",
+            verify_rc,
+            component_count,
+            encoded_proof->length);
+    }
+
+cleanup:
+    lantern_byte_list_reset(&raw_type2);
+    reset_type2_component_set(work, component_count);
+    free(message_roots);
+    free(bindings);
+    free(components);
+    free(work);
+    return ok;
+}
+
+bool lantern_signature_split_block_type2_proof_by_message(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternByteList *encoded_proof,
+    const LanternRoot *message,
+    LanternByteList *out_type1_raw) {
+    if (!state || !block || !encoded_proof || !message || !out_type1_raw) {
+        return false;
+    }
+    size_t attestation_count = block->body.attestations.length;
+    if (attestation_count > 0u && !block->body.attestations.data) {
+        return false;
+    }
+
+    size_t component_count = attestation_count + 1u;
+    struct lantern_type2_component_work *work =
+        calloc(component_count, sizeof(*work));
+    struct PQTypeTwoComponent *components =
+        calloc(component_count, sizeof(*components));
+    struct PQTypeTwoMessageBinding *bindings =
+        calloc(component_count, sizeof(*bindings));
+    LanternRoot *message_roots = calloc(component_count, sizeof(*message_roots));
+    LanternByteList raw_type2;
+    lantern_byte_list_init(&raw_type2);
+
+    bool ok = false;
+    if (!work || !components || !bindings || !message_roots) {
+        goto cleanup;
+    }
+    if (!lantern_signature_unwrap_type2_proof(encoded_proof, &raw_type2)) {
+        goto cleanup;
+    }
+    if (!build_type2_component_set_for_block(
+            state,
+            block,
+            work,
+            components,
+            bindings,
+            message_roots,
+            component_count)) {
+        goto cleanup;
+    }
+
+    ensure_xmss_prover_setup();
+    log_pq_prover_setup_error_if_any();
+    if (lantern_byte_list_resize(out_type1_raw, LANTERN_AGG_PROOF_MAX_BYTES) != 0) {
+        goto cleanup;
+    }
+    uintptr_t written_len = 0u;
+    enum PQSigningError split_rc = pq_split_type_2_by_message(
+        components,
+        component_count,
+        raw_type2.data,
+        raw_type2.length,
+        message->bytes,
+        LANTERN_ROOT_SIZE,
+        LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE,
+        out_type1_raw->data,
+        out_type1_raw->length,
+        &written_len);
+    if (split_rc != Success || written_len == 0u || written_len > out_type1_raw->length) {
+        char *detail = pq_take_last_error_message();
+        lantern_log_error(
+            "signature",
+            NULL,
+            "block Type-2 split failed err=%d components=%zu written=%zu buffer=%zu detail=%s",
+            (int)split_rc,
+            component_count,
+            (size_t)written_len,
+            (size_t)out_type1_raw->length,
+            pq_error_detail_or_dash(detail));
+        pq_string_free(detail);
+        goto cleanup;
+    }
+    ok = lantern_byte_list_resize(out_type1_raw, (size_t)written_len) == 0;
+
+cleanup:
+    if (!ok) {
+        (void)lantern_byte_list_resize(out_type1_raw, 0u);
+    }
+    lantern_byte_list_reset(&raw_type2);
+    reset_type2_component_set(work, component_count);
+    free(message_roots);
+    free(bindings);
+    free(components);
+    free(work);
+    return ok;
 }

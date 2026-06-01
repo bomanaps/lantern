@@ -182,41 +182,18 @@ static void check_aggregated_attestation_equal(
     check_bitlist_equal(&expected->aggregation_bits, &actual->aggregation_bits);
 }
 
-static void check_signature_proof_equal(
-    const LanternAggregatedSignatureProof *expected,
-    const LanternAggregatedSignatureProof *actual) {
+static void check_byte_list_equal(
+    const LanternByteList *expected,
+    const LanternByteList *actual) {
     CHECK(expected != NULL);
     CHECK(actual != NULL);
-    check_bitlist_equal(&expected->participants, &actual->participants);
-    CHECK(expected->proof_data.length == actual->proof_data.length);
-    if (expected->proof_data.length == 0) {
+    CHECK(expected->length == actual->length);
+    if (expected->length == 0) {
         return;
     }
-    CHECK(expected->proof_data.data != NULL);
-    CHECK(actual->proof_data.data != NULL);
-    CHECK(memcmp(expected->proof_data.data, actual->proof_data.data, expected->proof_data.length) == 0);
-}
-
-static void check_block_signatures_equal(
-    const LanternBlockSignatures *expected,
-    const LanternBlockSignatures *actual) {
-    CHECK(expected != NULL);
-    CHECK(actual != NULL);
-    CHECK(expected->attestation_signatures.length == actual->attestation_signatures.length);
-    if (expected->attestation_signatures.length > 0) {
-        CHECK(expected->attestation_signatures.data != NULL);
-        CHECK(actual->attestation_signatures.data != NULL);
-        for (size_t i = 0; i < expected->attestation_signatures.length; ++i) {
-            check_signature_proof_equal(
-                &expected->attestation_signatures.data[i],
-                &actual->attestation_signatures.data[i]);
-        }
-    }
-    CHECK(memcmp(
-              expected->proposer_signature.bytes,
-              actual->proposer_signature.bytes,
-              LANTERN_SIGNATURE_SIZE)
-          == 0);
+    CHECK(expected->data != NULL);
+    CHECK(actual->data != NULL);
+    CHECK(memcmp(expected->data, actual->data, expected->length) == 0);
 }
 
 static uint32_t rng_state = UINT32_C(0x6ac1e39d);
@@ -300,13 +277,6 @@ static void build_aggregated_attestation_from_vote(
     check_zero(lantern_bitlist_set(&out_attestation->aggregation_bits, (size_t)vote->validator_id, true), "agg bits set");
 }
 
-static void fill_proof_data(LanternAggregatedSignatureProof *proof, uint8_t seed, size_t length) {
-    check_zero(lantern_byte_list_resize(&proof->proof_data, length), "proof data resize");
-    if (length > 0 && proof->proof_data.data) {
-        fill_bytes(proof->proof_data.data, length, seed);
-    }
-}
-
 static void populate_block(LanternSignedBlock *signed_block, uint8_t seed) {
     lantern_signed_block_init(signed_block);
     signed_block->block.slot = 100 + seed;
@@ -320,23 +290,8 @@ static void populate_block(LanternSignedBlock *signed_block, uint8_t seed) {
         lantern_aggregated_attestations_append(&signed_block->block.body.attestations, &agg),
         "attestation append");
     lantern_aggregated_attestation_reset(&agg);
-    size_t att_count = signed_block->block.body.attestations.length;
-    check_zero(
-        lantern_attestation_signatures_resize(&signed_block->signatures.attestation_signatures, att_count),
-        "signature resize");
-    for (size_t i = 0; i < att_count; ++i) {
-        LanternAggregatedSignatureProof *proof = &signed_block->signatures.attestation_signatures.data[i];
-        const LanternAggregatedAttestation *attestation = &signed_block->block.body.attestations.data[i];
-        check_zero(
-            lantern_bitlist_resize(&proof->participants, attestation->aggregation_bits.bit_length),
-            "participants resize");
-        size_t byte_len = (attestation->aggregation_bits.bit_length + 7u) / 8u;
-        if (byte_len > 0) {
-            memcpy(proof->participants.bytes, attestation->aggregation_bits.bytes, byte_len);
-        }
-        fill_proof_data(proof, (uint8_t)(0xC0 + seed), 8);
-    }
-    fill_signature(&signed_block->signatures.proposer_signature, (uint8_t)(0xD0 + seed));
+    check_zero(lantern_byte_list_resize(&signed_block->proof, 12u), "signed block proof resize");
+    fill_bytes(signed_block->proof.data, signed_block->proof.length, (uint8_t)(0xE0 + seed));
 }
 
 struct block_hook_ctx {
@@ -372,7 +327,7 @@ static int block_publish_hook(
     CHECK(decoded.block.slot == expected->block.slot);
     CHECK(decoded.block.proposer_index == expected->block.proposer_index);
     CHECK(decoded.block.body.attestations.length == expected->block.body.attestations.length);
-    check_block_signatures_equal(&decoded.signatures, &expected->signatures);
+    check_byte_list_equal(&decoded.proof, &expected->proof);
     lantern_signed_block_reset(&decoded);
     ctx->called += 1;
     return 0;
@@ -490,20 +445,6 @@ static void test_replay_devnet_block_payloads(void) {
         lantern_signed_block_init(&original);
         CHECK(load_signed_block_fixture(&cases[i], &original) == 0);
         normalize_signed_block_for_gossip_sanity(&original);
-        size_t sig_count = original.block.body.attestations.length;
-        CHECK(lantern_attestation_signatures_resize(&original.signatures.attestation_signatures, sig_count) == 0);
-        for (size_t sig_idx = 0; sig_idx < sig_count; ++sig_idx) {
-            LanternAggregatedSignatureProof *proof = &original.signatures.attestation_signatures.data[sig_idx];
-            const LanternAggregatedAttestation *att = &original.block.body.attestations.data[sig_idx];
-            CHECK(lantern_bitlist_resize(&proof->participants, att->aggregation_bits.bit_length) == 0);
-            size_t byte_len = (att->aggregation_bits.bit_length + 7u) / 8u;
-            if (byte_len > 0) {
-                memcpy(proof->participants.bytes, att->aggregation_bits.bytes, byte_len);
-            }
-            fill_proof_data(proof, (uint8_t)(0x80 + sig_idx + i), 8);
-        }
-        fill_signature(&original.signatures.proposer_signature, (uint8_t)(0x80 + sig_count + i));
-
         LanternRoot original_block_root;
         memset(&original_block_root, 0, sizeof(original_block_root));
         CHECK(lantern_hash_tree_root_block(&original.block, &original_block_root) == SSZ_SUCCESS);
@@ -531,7 +472,7 @@ static void test_replay_devnet_block_payloads(void) {
         CHECK(memcmp(decoded.block.parent_root.bytes, original.block.parent_root.bytes, LANTERN_ROOT_SIZE) == 0);
         CHECK(memcmp(decoded.block.state_root.bytes, original.block.state_root.bytes, LANTERN_ROOT_SIZE) == 0);
 
-        check_block_signatures_equal(&decoded.signatures, &original.signatures);
+        check_byte_list_equal(&decoded.proof, &original.proof);
         CHECK(decoded.block.body.attestations.length == original.block.body.attestations.length);
         if (decoded.block.body.attestations.length > 0) {
             CHECK(decoded.block.body.attestations.data != NULL);
@@ -1038,7 +979,7 @@ static void test_signed_block_list(void) {
     lantern_signed_block_list_init(&decoded);
     check_zero(lantern_network_signed_block_list_decode(&decoded, encoded, written), "response decode");
     CHECK(decoded.length == resp.length);
-    check_block_signatures_equal(&decoded.blocks[1].signatures, &resp.blocks[1].signatures);
+    check_byte_list_equal(&decoded.blocks[1].proof, &resp.blocks[1].proof);
 
     size_t max_compressed = 0;
     CHECK(lantern_snappy_max_compressed_size(written, &max_compressed) == LANTERN_SNAPPY_OK);
@@ -1229,7 +1170,7 @@ static void test_gossip_signed_block_payload(void) {
         "decode signed block gossip");
     CHECK(decoded.block.slot == block.block.slot);
     CHECK(decoded.block.body.attestations.length == block.block.body.attestations.length);
-    check_block_signatures_equal(&decoded.signatures, &block.signatures);
+    check_byte_list_equal(&decoded.proof, &block.proof);
 
     uint8_t invalid_payload[] = {0xFF};
     CHECK(lantern_gossip_decode_signed_block_snappy(&decoded, invalid_payload, sizeof(invalid_payload), NULL, NULL) != 0);
@@ -1311,22 +1252,8 @@ static void test_gossip_block_snappy_roundtrip_random(void) {
             lantern_aggregated_attestation_reset(&agg);
         }
 
-        CHECK(lantern_attestation_signatures_resize(&original.signatures.attestation_signatures, att_count) == 0);
-        for (size_t sig_idx = 0; sig_idx < att_count; ++sig_idx) {
-            LanternAggregatedSignatureProof *proof = &original.signatures.attestation_signatures.data[sig_idx];
-            const LanternAggregatedAttestation *att = &original.block.body.attestations.data[sig_idx];
-            CHECK(lantern_bitlist_resize(&proof->participants, att->aggregation_bits.bit_length) == 0);
-            size_t byte_len = (att->aggregation_bits.bit_length + 7u) / 8u;
-            if (byte_len > 0) {
-                memcpy(proof->participants.bytes, att->aggregation_bits.bytes, byte_len);
-            }
-            size_t proof_len = 4u + (sig_idx % 4u);
-            CHECK(lantern_byte_list_resize(&proof->proof_data, proof_len) == 0);
-            if (proof_len > 0 && proof->proof_data.data) {
-                rng_fill_bytes(proof->proof_data.data, proof_len);
-            }
-        }
-        rng_fill_bytes(original.signatures.proposer_signature.bytes, LANTERN_SIGNATURE_SIZE);
+        CHECK(lantern_byte_list_resize(&original.proof, 8u + rng_uniform(32)) == 0);
+        rng_fill_bytes(original.proof.data, original.proof.length);
 
         size_t raw_estimate = signed_block_min_capacity_for_test(&original);
         CHECK(raw_estimate > 0);
@@ -1357,7 +1284,7 @@ static void test_gossip_block_snappy_roundtrip_random(void) {
             const LanternAggregatedAttestation *actual = &decoded.block.body.attestations.data[j];
             check_aggregated_attestation_equal(expected, actual);
         }
-        check_block_signatures_equal(&decoded.signatures, &original.signatures);
+        check_byte_list_equal(&decoded.proof, &original.proof);
 
         free(compressed);
         lantern_signed_block_reset(&original);

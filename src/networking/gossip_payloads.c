@@ -86,28 +86,6 @@ static size_t aggregated_signature_proof_encoded_size(const LanternAggregatedSig
     return fixed_section + participants_size + proof->proof_data.length;
 }
 
-static size_t attestation_signatures_encoded_size(const LanternAttestationSignatures *signatures) {
-    if (!signatures) {
-        return 0;
-    }
-    if (signatures->length == 0) {
-        return 0;
-    }
-    if (signatures->length > LANTERN_MAX_BLOCK_SIGNATURES || !signatures->data) {
-        return 0;
-    }
-    size_t offset_table = signatures->length * SSZ_BYTES_PER_LENGTH_OFFSET;
-    size_t total = offset_table;
-    for (size_t i = 0; i < signatures->length; ++i) {
-        size_t entry = aggregated_signature_proof_encoded_size(&signatures->data[i]);
-        if (entry == 0 || entry > SIZE_MAX - total) {
-            return 0;
-        }
-        total += entry;
-    }
-    return total;
-}
-
 static size_t signed_block_base_ssz_size(void) {
     size_t block_fixed = (sizeof(uint64_t) * 2u)
         + (LANTERN_ROOT_SIZE * 2u)
@@ -127,13 +105,10 @@ static size_t signed_block_max_ssz_size(void) {
         return SIZE_MAX;
     }
     size_t total = base + attestations_max;
-    size_t proof_entry_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
-    size_t signatures_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE
-        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTES_PER_LENGTH_OFFSET + proof_entry_max));
-    if (signatures_max > SIZE_MAX - total) {
+    if (LANTERN_AGG_PROOF_MAX_BYTES > SIZE_MAX - total) {
         return SIZE_MAX;
     }
-    return total + signatures_max;
+    return total + LANTERN_AGG_PROOF_MAX_BYTES;
 }
 
 static size_t signed_block_min_capacity(const LanternSignedBlock *block) {
@@ -151,16 +126,16 @@ static size_t signed_block_min_capacity(const LanternSignedBlock *block) {
         return 0;
     }
     total += att_bytes;
-    size_t sig_count = block->signatures.attestation_signatures.length;
-    size_t sig_list_bytes = attestation_signatures_encoded_size(&block->signatures.attestation_signatures);
-    if (sig_count > 0 && sig_list_bytes == 0) {
+    if (block->proof.length > LANTERN_AGG_PROOF_MAX_BYTES) {
         return 0;
     }
-    size_t signature_bytes = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE + sig_list_bytes;
-    if (signature_bytes > SIZE_MAX - total) {
+    if (block->proof.length > 0u && !block->proof.data) {
         return 0;
     }
-    return total + signature_bytes;
+    if (block->proof.length > SIZE_MAX - total) {
+        return 0;
+    }
+    return total + block->proof.length;
 }
 
 static int basic_attestation_data_sanity(const LanternAttestationData *data) {
@@ -197,12 +172,9 @@ static int basic_block_sanity(const LanternSignedBlock *block) {
             return -1;
         }
     }
-    size_t sig_count = block->signatures.attestation_signatures.length;
     size_t att_count = message->body.attestations.length;
-    if (sig_count > LANTERN_MAX_BLOCK_SIGNATURES) {
-        return -1;
-    }
-    if (sig_count != att_count) {
+    (void)att_count;
+    if (block->proof.length > LANTERN_AGG_PROOF_MAX_BYTES) {
         return -1;
     }
     return 0;

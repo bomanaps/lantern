@@ -22,9 +22,6 @@ ssz_error_t lantern_hash_tree_root_aggregated_signature_proof(
 ssz_error_t lantern_hash_tree_root_signed_aggregated_attestation(
     const LanternSignedAggregatedAttestation *attestation,
     LanternRoot *out_root);
-ssz_error_t lantern_hash_tree_root_block_signatures(
-    const LanternBlockSignatures *signatures,
-    LanternRoot *out_root);
 ssz_error_t lantern_hash_tree_root_block_body(const LanternBlockBody *body, LanternRoot *out_root);
 ssz_error_t lantern_hash_tree_root_block_header(const LanternBlockHeader *header, LanternRoot *out_root);
 ssz_error_t lantern_hash_tree_root_block(const LanternBlock *block, LanternRoot *out_root);

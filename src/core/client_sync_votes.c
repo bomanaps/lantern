@@ -19,6 +19,7 @@
 #include "client_internal.h"
 
 #include <inttypes.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "lantern/consensus/fork_choice.h"
@@ -573,7 +574,6 @@ static enum lantern_vote_record_status lantern_client_record_vote_internal(
             &rejection,
             &meta);
     }
-
     if (vote_processed)
     {
         lantern_log_info(

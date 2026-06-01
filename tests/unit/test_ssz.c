@@ -98,23 +98,20 @@ static void assert_aggregated_attestation_equal(
     assert_bitlist_equal(&lhs->aggregation_bits, &rhs->aggregation_bits);
 }
 
-static void assert_signature_proof_equal(
-    const LanternAggregatedSignatureProof *lhs,
-    const LanternAggregatedSignatureProof *rhs) {
-    assert_bitlist_equal(&lhs->participants, &rhs->participants);
-    if (lhs->proof_data.length != rhs->proof_data.length) {
-        fprintf(stderr, "signature proof length mismatch\n");
+static void assert_byte_list_equal(const LanternByteList *lhs, const LanternByteList *rhs) {
+    if (lhs->length != rhs->length) {
+        fprintf(stderr, "byte list length mismatch\n");
         abort();
     }
-    if (lhs->proof_data.length == 0) {
+    if (lhs->length == 0) {
         return;
     }
-    if (!lhs->proof_data.data || !rhs->proof_data.data) {
-        fprintf(stderr, "signature proof bytes missing\n");
+    if (!lhs->data || !rhs->data) {
+        fprintf(stderr, "byte list bytes missing\n");
         abort();
     }
-    if (memcmp(lhs->proof_data.data, rhs->proof_data.data, lhs->proof_data.length) != 0) {
-        fprintf(stderr, "signature proof bytes mismatch\n");
+    if (memcmp(lhs->data, rhs->data, lhs->length) != 0) {
+        fprintf(stderr, "byte list bytes mismatch\n");
         abort();
     }
 }
@@ -379,6 +376,11 @@ static void populate_block(LanternBlock *block) {
     lantern_aggregated_attestation_reset(&agg_b);
 }
 
+static void populate_signed_block_proof(LanternSignedBlock *signed_block, uint8_t seed) {
+    assert(lantern_byte_list_resize(&signed_block->proof, 12u) == 0);
+    fill_bytes(signed_block->proof.data, signed_block->proof.length, seed);
+}
+
 static void reset_block(LanternBlock *block) {
     lantern_block_body_reset(&block->body);
 }
@@ -388,26 +390,6 @@ static void reset_signed_block(LanternSignedBlock *block) {
         return;
     }
     lantern_signed_block_with_attestation_reset(block);
-}
-
-static void expect_block_signatures_equal(
-    const LanternBlockSignatures *expected,
-    const LanternBlockSignatures *actual) {
-    assert(expected->attestation_signatures.length == actual->attestation_signatures.length);
-    if (expected->attestation_signatures.length > 0) {
-        assert(expected->attestation_signatures.data != NULL);
-        assert(actual->attestation_signatures.data != NULL);
-        for (size_t i = 0; i < expected->attestation_signatures.length; ++i) {
-            assert_signature_proof_equal(
-                &expected->attestation_signatures.data[i],
-                &actual->attestation_signatures.data[i]);
-        }
-    }
-    assert(memcmp(
-               expected->proposer_signature.bytes,
-               actual->proposer_signature.bytes,
-               LANTERN_SIGNATURE_SIZE)
-           == 0);
 }
 
 static void test_block_roundtrip(void) {
@@ -442,6 +424,7 @@ static void test_signed_block_roundtrip(void) {
     LanternSignedBlock signed_block;
     lantern_signed_block_with_attestation_init(&signed_block);
     populate_block(&signed_block.block);
+    populate_signed_block_proof(&signed_block, 0xC1);
 
     uint8_t buffer[SIGNED_BLOCK_TEST_BUFFER_SIZE];
     size_t written = 0;
@@ -452,7 +435,7 @@ static void test_signed_block_roundtrip(void) {
     assert(lantern_ssz_decode_signed_block(&decoded, buffer, written) == SSZ_SUCCESS);
 
     assert(decoded.block.slot == signed_block.block.slot);
-    expect_block_signatures_equal(&signed_block.signatures, &decoded.signatures);
+    assert_byte_list_equal(&signed_block.proof, &decoded.proof);
     assert(decoded.block.body.attestations.length
            == signed_block.block.body.attestations.length);
 
@@ -464,6 +447,7 @@ static void test_signed_block_signature_validation(void) {
     LanternSignedBlock signed_block;
     lantern_signed_block_with_attestation_init(&signed_block);
     populate_block(&signed_block.block);
+    populate_signed_block_proof(&signed_block, 0xD1);
 
     uint8_t buffer[SIGNED_BLOCK_TEST_BUFFER_SIZE];
     size_t written = 0;
@@ -475,9 +459,10 @@ static void test_signed_block_signature_validation(void) {
     assert(lantern_ssz_decode_signed_block(&decoded, buffer, written) != SSZ_SUCCESS);
     reset_signed_block(&decoded);
 
-    signed_block.signatures.attestation_signatures.length = LANTERN_MAX_BLOCK_SIGNATURES + 2;
-    signed_block.signatures.attestation_signatures.data = NULL;
+    lantern_byte_list_reset(&signed_block.proof);
+    signed_block.proof.length = LANTERN_AGG_PROOF_MAX_BYTES + 1u;
     assert(lantern_ssz_encode_signed_block(&signed_block, buffer, sizeof(buffer), &written) != SSZ_SUCCESS);
+    signed_block.proof.length = 0u;
 
     reset_signed_block(&signed_block);
 }
@@ -502,13 +487,14 @@ static void test_signed_block_decode_without_signature_section(void) {
 
     uint32_t message_offset = (uint32_t)(sizeof(uint32_t) * 2u);
     memcpy(encoded, &message_offset, sizeof(message_offset));
-    uint32_t signatures_offset = message_offset + (uint32_t)message_written;
-    memcpy(encoded + sizeof(uint32_t), &signatures_offset, sizeof(signatures_offset));
+    uint32_t proof_offset = message_offset + (uint32_t)message_written;
+    memcpy(encoded + sizeof(uint32_t), &proof_offset, sizeof(proof_offset));
     memcpy(encoded + (sizeof(uint32_t) * 2u), message_buf, message_written);
 
     LanternSignedBlock decoded;
     lantern_signed_block_with_attestation_init(&decoded);
-    assert(lantern_ssz_decode_signed_block(&decoded, encoded, encoded_len) != SSZ_SUCCESS);
+    assert(lantern_ssz_decode_signed_block(&decoded, encoded, encoded_len) == SSZ_SUCCESS);
+    assert(decoded.proof.length == 0u);
 
     reset_signed_block(&signed_block);
     reset_signed_block(&decoded);

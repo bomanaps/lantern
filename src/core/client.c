@@ -923,6 +923,14 @@ static void client_reset_base(struct lantern_client *client)
     lantern_fork_choice_init(&client->fork_choice);
     lantern_store_attach_fork_choice(&client->store, &client->fork_choice);
     client->has_fork_choice = false;
+    client->validator_thread_started = false;
+    client->validator_stop_flag = 1;
+    client->block_proposal_job = NULL;
+    client->block_proposal_lock_initialized = false;
+    client->block_proposal_cond_initialized = false;
+    client->block_proposal_thread_started = false;
+    client->block_proposal_stop = true;
+    client->block_proposal_inflight = false;
     client->timing_thread_started = false;
     client->timing_stop_flag = 1;
     client->dialer_thread_started = false;
@@ -1493,20 +1501,9 @@ static void client_log_genesis_anchors(
         body_hex,
         sizeof(body_hex));
     LanternSignedBlock genesis_signed;
-    int resize_result = 0;
     lantern_signed_block_with_attestation_init(&genesis_signed);
     genesis_signed.block = genesis_block;
-    resize_result = lantern_attestation_signatures_resize(
-        &genesis_signed.signatures.attestation_signatures,
-        0);
-    if (resize_result != 0)
-    {
-        lantern_log_error(
-            "client",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "failed to size genesis signatures list");
-    }
-    else if (lantern_hash_tree_root_signed_block(&genesis_signed, &genesis_signed_block_root) == SSZ_SUCCESS)
+    if (lantern_hash_tree_root_signed_block(&genesis_signed, &genesis_signed_block_root) == SSZ_SUCCESS)
     {
         format_root_hex(&genesis_signed_block_root, signed_block_hex, sizeof(signed_block_hex));
     }
@@ -3478,6 +3475,14 @@ static void client_start_background_services(struct lantern_client *client)
             "fork-choice timing inactive");
     }
 
+    if (start_block_proposal_worker(client) != 0)
+    {
+        lantern_log_warn(
+            "validator",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "block proposal worker inactive");
+    }
+
     if (start_validator_service(client) != 0)
     {
         lantern_log_warn(
@@ -3502,6 +3507,7 @@ static void shutdown_validator_and_keys(struct lantern_client *client)
 {
     stop_timing_service(client);
     stop_validator_service(client);
+    stop_block_proposal_worker(client);
     stop_peer_dialer(client);
     lantern_client_free_xmss_pubkeys(client);
     free(client->xmss_key_dir);

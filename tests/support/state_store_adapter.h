@@ -145,6 +145,13 @@ static inline void lantern_test_state_attach_fork_choice(
     }
 }
 
+static inline int lantern_test_state_process_block_with_store(
+    LanternState *state,
+    LanternStore *store,
+    const LanternBlock *block) {
+    return lantern_state_process_block_explicit(state, store, block);
+}
+
 #define lantern_state_init(state) lantern_test_state_init((state))
 #define lantern_state_reset(state) lantern_test_state_reset((state))
 #define lantern_state_clone(source, dest) lantern_test_state_clone((source), (dest))
@@ -173,12 +180,11 @@ static inline void lantern_test_state_attach_fork_choice(
         lantern_test_state_store_ensure((state)), \
         (attestations), \
         (signatures))
-#define lantern_state_process_block(state, block, signatures, proposer_attestation) \
+#define lantern_state_process_block(state, block) \
     lantern_state_process_block_explicit( \
         (state), \
         lantern_test_state_store_ensure((state)), \
-        (block), \
-        (signatures))
+        (block))
 #define lantern_state_transition(state, signed_block) \
     lantern_state_transition_explicit( \
         (state), \

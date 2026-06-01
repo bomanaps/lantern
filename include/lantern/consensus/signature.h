@@ -56,5 +56,27 @@ bool lantern_signature_verify_aggregated(
     const LanternRoot *message,
     const LanternByteList *proof,
     uint64_t epoch);
+bool lantern_signature_wrap_type2_proof(
+    const LanternByteList *raw_proof,
+    LanternByteList *out_encoded);
+bool lantern_signature_unwrap_type2_proof(
+    const LanternByteList *encoded_proof,
+    LanternByteList *out_raw);
+bool lantern_signature_merge_block_type2_proof(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternAttestationSignatures *attestation_proofs,
+    const LanternAggregatedSignatureProof *proposer_proof,
+    LanternByteList *out_encoded_proof);
+bool lantern_signature_verify_block_type2_proof(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternByteList *encoded_proof);
+bool lantern_signature_split_block_type2_proof_by_message(
+    const LanternState *state,
+    const LanternBlock *block,
+    const LanternByteList *encoded_proof,
+    const LanternRoot *message,
+    LanternByteList *out_type1_raw);
 
 #endif /* LANTERN_CONSENSUS_SIGNATURE_H */

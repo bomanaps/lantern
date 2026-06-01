@@ -67,6 +67,23 @@ static lantern_client_error collect_aggregation_votes(
     LanternAttestations *out_attestations,
     LanternSignatureList *out_signatures);
 
+struct lantern_async_block_proposal_job {
+    struct lantern_client *client;
+    uint64_t slot;
+    size_t local_index;
+    uint64_t proposer_index;
+    uint64_t build_started_ms;
+    uint64_t snapshot_finished_ms;
+    LanternRoot parent_root;
+    LanternRoot block_root;
+    LanternSignedBlock block;
+    LanternState proof_state;
+    LanternState post_state;
+    LanternStore post_store;
+    LanternAttestationSignatures attestation_signatures;
+    LanternSignature proposer_signature;
+};
+
 static bool timing_service_should_run(const struct lantern_client *client)
 {
     if (!client) {
@@ -1653,7 +1670,6 @@ static lantern_client_error validator_build_block_collect_attestations(
         result = LANTERN_CLIENT_ERR_RUNTIME;
         goto cleanup;
     }
-
 cleanup:
     lantern_client_unlock_state(client, state_locked);
     return result;
@@ -1686,10 +1702,9 @@ static lantern_client_error validator_build_block_populate_message(
     uint64_t proposer_index,
     const LanternRoot *parent_root,
     const LanternAggregatedAttestations *attestations,
-    const LanternAttestationSignatures *signatures,
     LanternSignedBlock *out_block)
 {
-    if (!parent_root || !attestations || !signatures || !out_block)
+    if (!parent_root || !attestations || !out_block)
     {
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
@@ -1703,16 +1718,6 @@ static lantern_client_error validator_build_block_populate_message(
     if (lantern_aggregated_attestations_copy(
             &message_block->body.attestations,
             attestations)
-        != 0)
-    {
-        return LANTERN_CLIENT_ERR_ALLOC;
-    }
-
-    lantern_signature_zero(&out_block->signatures.proposer_signature);
-
-    if (lantern_attestation_signatures_copy(
-            &out_block->signatures.attestation_signatures,
-            signatures)
         != 0)
     {
         return LANTERN_CLIENT_ERR_ALLOC;
@@ -1774,6 +1779,506 @@ static lantern_client_error validator_build_block_compute_post_state(
     return result;
 }
 
+static lantern_client_error validator_build_block_merge_proof_with_state(
+    const LanternState *state,
+    uint64_t proposer_index,
+    const LanternRoot *block_root,
+    const LanternAttestationSignatures *attestation_proofs,
+    const LanternSignature *proposer_signature,
+    LanternSignedBlock *out_block)
+{
+    if (!state || !block_root || !attestation_proofs || !proposer_signature || !out_block)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (proposer_index >= LANTERN_VALIDATOR_REGISTRY_LIMIT)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    LanternAggregatedSignatureProof proposer_proof;
+    struct lantern_bitlist proposer_participants;
+    lantern_aggregated_signature_proof_init(&proposer_proof);
+    lantern_bitlist_init(&proposer_participants);
+
+    lantern_client_error result = LANTERN_CLIENT_OK;
+    const uint8_t *proposer_pubkey =
+        lantern_state_validator_proposal_pubkey(state, (size_t)proposer_index);
+    if (!proposer_pubkey || lantern_validator_pubkey_is_zero(proposer_pubkey))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    if (lantern_bitlist_resize(&proposer_participants, (size_t)proposer_index + 1u) != 0
+        || lantern_bitlist_set(&proposer_participants, (size_t)proposer_index, true) != 0)
+    {
+        result = LANTERN_CLIENT_ERR_ALLOC;
+        goto cleanup;
+    }
+
+    LanternRawXmssSignature raw_proposer = {
+        .pubkey = proposer_pubkey,
+        .signature = proposer_signature,
+    };
+    if (!lantern_aggregated_signature_proof_aggregate(
+            state,
+            &proposer_participants,
+            NULL,
+            0u,
+            &raw_proposer,
+            1u,
+            block_root,
+            out_block->block.slot,
+            &proposer_proof))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    if (!lantern_signature_merge_block_type2_proof(
+            state,
+            &out_block->block,
+            attestation_proofs,
+            &proposer_proof,
+            &out_block->proof))
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+
+cleanup:
+    lantern_bitlist_reset(&proposer_participants);
+    lantern_aggregated_signature_proof_reset(&proposer_proof);
+    return result;
+}
+
+static lantern_client_error validator_build_block_merge_proof(
+    struct lantern_client *client,
+    const struct lantern_local_validator *local,
+    const LanternRoot *block_root,
+    const LanternAttestationSignatures *attestation_proofs,
+    const LanternSignature *proposer_signature,
+    LanternSignedBlock *out_block)
+{
+    if (!client || !local || !block_root || !attestation_proofs || !proposer_signature || !out_block)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    LanternState proof_state;
+    lantern_state_init(&proof_state);
+    bool state_locked = lantern_client_lock_state(client);
+    if (!state_locked)
+    {
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+    int clone_rc = lantern_state_clone(&client->state, &proof_state);
+    lantern_client_unlock_state(client, state_locked);
+    if (clone_rc != 0)
+    {
+        lantern_state_reset(&proof_state);
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+
+    lantern_client_error result = validator_build_block_merge_proof_with_state(
+        &proof_state,
+        local->global_index,
+        block_root,
+        attestation_proofs,
+        proposer_signature,
+        out_block);
+    lantern_state_reset(&proof_state);
+    return result;
+}
+
+static void block_proposal_job_init(
+    struct lantern_async_block_proposal_job *job,
+    struct lantern_client *client,
+    uint64_t slot,
+    size_t local_index)
+{
+    if (!job)
+    {
+        return;
+    }
+    memset(job, 0, sizeof(*job));
+    job->client = client;
+    job->slot = slot;
+    job->local_index = local_index;
+    job->build_started_ms = monotonic_millis();
+    lantern_signed_block_init(&job->block);
+    lantern_state_init(&job->proof_state);
+    lantern_state_init(&job->post_state);
+    lantern_store_init(&job->post_store);
+    lantern_attestation_signatures_init(&job->attestation_signatures);
+    lantern_signature_zero(&job->proposer_signature);
+}
+
+static void block_proposal_job_reset(struct lantern_async_block_proposal_job *job)
+{
+    if (!job)
+    {
+        return;
+    }
+    lantern_attestation_signatures_reset(&job->attestation_signatures);
+    lantern_store_reset(&job->post_store);
+    lantern_state_reset(&job->post_state);
+    lantern_state_reset(&job->proof_state);
+    lantern_signed_block_reset(&job->block);
+}
+
+static void block_proposal_job_free(struct lantern_async_block_proposal_job *job)
+{
+    if (!job)
+    {
+        return;
+    }
+    block_proposal_job_reset(job);
+    free(job);
+}
+
+static lantern_client_error validator_prepare_block_proposal_job(
+    struct lantern_client *client,
+    uint64_t slot,
+    size_t local_index,
+    struct lantern_async_block_proposal_job **out_job)
+{
+    if (out_job)
+    {
+        *out_job = NULL;
+    }
+    if (!client || !out_job)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (local_index >= client->local_validator_count || !client->local_validators)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    struct lantern_async_block_proposal_job *job = calloc(1u, sizeof(*job));
+    if (!job)
+    {
+        return LANTERN_CLIENT_ERR_ALLOC;
+    }
+    block_proposal_job_init(job, client, slot, local_index);
+
+    LanternAggregatedAttestations attestations;
+    lantern_aggregated_attestations_init(&attestations);
+    uint64_t collect_started_ms = monotonic_millis();
+    uint64_t collect_finished_ms = collect_started_ms;
+    lantern_client_error result = LANTERN_CLIENT_OK;
+    struct lantern_local_validator *local = &client->local_validators[local_index];
+    job->proposer_index = local->global_index;
+
+    bool state_locked = lantern_client_lock_state(client);
+    if (!state_locked)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        goto cleanup;
+    }
+
+    if (!client->has_state)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+
+    if (lantern_state_select_block_parent(&client->state, &client->store, &job->parent_root) != 0)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+    if (lantern_state_collect_attestations_for_block(
+            &client->state,
+            &client->store,
+            slot,
+            local->global_index,
+            &job->parent_root,
+            &attestations,
+            &job->attestation_signatures)
+        != 0)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+    collect_finished_ms = monotonic_millis();
+
+    result = validator_build_block_populate_message(
+        slot,
+        local->global_index,
+        &job->parent_root,
+        &attestations,
+        &job->block);
+    if (result != LANTERN_CLIENT_OK)
+    {
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+
+    LanternRoot computed_state_root;
+    if (lantern_state_compute_post_state(
+            &client->state,
+            &client->store,
+            &job->block,
+            &job->post_state,
+            &job->post_store,
+            &computed_state_root)
+        != 0)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+    job->block.block.state_root = computed_state_root;
+
+    if (lantern_state_clone(&client->state, &job->proof_state) != 0)
+    {
+        result = LANTERN_CLIENT_ERR_ALLOC;
+        lantern_client_unlock_state(client, state_locked);
+        goto cleanup;
+    }
+    lantern_client_unlock_state(client, state_locked);
+    state_locked = false;
+
+    if (lantern_hash_tree_root_block(&job->block.block, &job->block_root) != SSZ_SUCCESS)
+    {
+        result = LANTERN_CLIENT_ERR_RUNTIME;
+        goto cleanup;
+    }
+    if (validator_sign_with_key(
+            local,
+            slot,
+            &job->block_root,
+            true,
+            &job->proposer_signature)
+        != LANTERN_CLIENT_OK)
+    {
+        result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    job->snapshot_finished_ms = monotonic_millis();
+
+    lean_metrics_record_block_aggregated_payloads(attestations.length);
+    if (collect_finished_ms >= collect_started_ms)
+    {
+        lean_metrics_record_block_building_payload_aggregation_time(
+            (double)(collect_finished_ms - collect_started_ms) / 1000.0);
+    }
+
+    *out_job = job;
+    job = NULL;
+
+cleanup:
+    if (result != LANTERN_CLIENT_OK)
+    {
+        lean_metrics_record_block_building_failure();
+    }
+    lantern_aggregated_attestations_reset(&attestations);
+    block_proposal_job_free(job);
+    return result;
+}
+
+static int enqueue_block_proposal_job(
+    struct lantern_client *client,
+    struct lantern_async_block_proposal_job *job)
+{
+    if (!client || !job)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (!client->block_proposal_thread_started || !client->block_proposal_lock_initialized)
+    {
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+    if (pthread_mutex_lock(&client->block_proposal_lock) != 0)
+    {
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+    if (client->block_proposal_stop)
+    {
+        pthread_mutex_unlock(&client->block_proposal_lock);
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+    if (client->block_proposal_inflight || client->block_proposal_job)
+    {
+        pthread_mutex_unlock(&client->block_proposal_lock);
+        return LANTERN_CLIENT_ERR_IGNORED;
+    }
+    client->block_proposal_job = job;
+    client->block_proposal_inflight = true;
+    if (client->block_proposal_cond_initialized)
+    {
+        pthread_cond_signal(&client->block_proposal_cond);
+    }
+    pthread_mutex_unlock(&client->block_proposal_lock);
+    return LANTERN_CLIENT_OK;
+}
+
+static void block_proposal_mark_finished(struct lantern_client *client)
+{
+    if (!client || !client->block_proposal_lock_initialized)
+    {
+        return;
+    }
+    if (pthread_mutex_lock(&client->block_proposal_lock) != 0)
+    {
+        return;
+    }
+    client->block_proposal_inflight = false;
+    if (client->block_proposal_cond_initialized)
+    {
+        pthread_cond_broadcast(&client->block_proposal_cond);
+    }
+    pthread_mutex_unlock(&client->block_proposal_lock);
+}
+
+static void block_proposal_record_local_success(
+    struct lantern_client *client,
+    size_t local_index,
+    uint64_t slot)
+{
+    if (!client || !client->validator_lock_initialized)
+    {
+        return;
+    }
+    if (pthread_mutex_lock(&client->validator_lock) != 0)
+    {
+        return;
+    }
+    if (local_index < client->local_validator_count)
+    {
+        client->local_validators[local_index].last_proposed_slot = slot;
+    }
+    unlock_mutex_with_log(&client->validator_lock, client->node_id, "validator_lock");
+}
+
+static void process_block_proposal_job(struct lantern_async_block_proposal_job *job)
+{
+    if (!job || !job->client)
+    {
+        return;
+    }
+    struct lantern_client *client = job->client;
+    char root_hex[2 * LANTERN_ROOT_SIZE + 3];
+    format_root_hex(&job->block_root, root_hex, sizeof(root_hex));
+
+    uint64_t proof_started_ms = monotonic_millis();
+    lantern_client_error proof_rc = validator_build_block_merge_proof_with_state(
+        &job->proof_state,
+        job->proposer_index,
+        &job->block_root,
+        &job->attestation_signatures,
+        &job->proposer_signature,
+        &job->block);
+    uint64_t proof_finished_ms = monotonic_millis();
+    double proof_seconds = proof_finished_ms >= proof_started_ms
+        ? (double)(proof_finished_ms - proof_started_ms) / 1000.0
+        : 0.0;
+    double total_seconds = proof_finished_ms >= job->build_started_ms
+        ? (double)(proof_finished_ms - job->build_started_ms) / 1000.0
+        : 0.0;
+
+    if (proof_rc != LANTERN_CLIENT_OK)
+    {
+        lean_metrics_record_block_building_failure();
+        lantern_log_warn(
+            "propose",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "slot %" PRIu64 ", skipped, reason: proof_failed, rc %d, proof %.3fs",
+            job->slot,
+            proof_rc,
+            proof_seconds);
+        return;
+    }
+
+    lean_metrics_record_block_building_time(total_seconds);
+    lean_metrics_record_block_building_success();
+    lantern_log_info(
+        "propose",
+        &(const struct lantern_log_metadata){.validator = client->node_id},
+        "slot %" PRIu64 ", %s, proof ready, proof %.3fs, total %.3fs",
+        job->slot,
+        root_hex[0] ? root_hex : "0x0",
+        proof_seconds,
+        total_seconds);
+
+    int rc = lantern_client_commit_and_publish_current_local_block(
+        client,
+        &job->block,
+        &job->block_root,
+        &job->post_state,
+        &job->post_store);
+    if (rc == LANTERN_CLIENT_OK)
+    {
+        block_proposal_record_local_success(client, job->local_index, job->slot);
+        lantern_log_info(
+            "propose",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "slot %" PRIu64 ", %s, %zu attestations",
+            job->slot,
+            root_hex[0] ? root_hex : "0x0",
+            job->block.block.body.attestations.length);
+    }
+    else if (rc == LANTERN_CLIENT_ERR_IGNORED)
+    {
+        lantern_log_warn(
+            "propose",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "slot %" PRIu64 ", skipped, reason: stale_snapshot",
+            job->slot);
+    }
+    else
+    {
+        lantern_log_warn(
+            "propose",
+            &(const struct lantern_log_metadata){.validator = client->node_id},
+            "slot %" PRIu64 ", skipped, reason: publish_failed, rc %d",
+            job->slot,
+            rc);
+    }
+}
+
+static void *block_proposal_worker_main(void *arg)
+{
+    struct lantern_client *client = arg;
+    if (!client)
+    {
+        return NULL;
+    }
+
+    for (;;)
+    {
+        if (pthread_mutex_lock(&client->block_proposal_lock) != 0)
+        {
+            break;
+        }
+        while (!client->block_proposal_stop && !client->block_proposal_job)
+        {
+            (void)pthread_cond_wait(&client->block_proposal_cond, &client->block_proposal_lock);
+        }
+        if (client->block_proposal_stop)
+        {
+            struct lantern_async_block_proposal_job *queued = client->block_proposal_job;
+            client->block_proposal_job = NULL;
+            client->block_proposal_inflight = false;
+            pthread_mutex_unlock(&client->block_proposal_lock);
+            block_proposal_job_free(queued);
+            break;
+        }
+        struct lantern_async_block_proposal_job *job = client->block_proposal_job;
+        client->block_proposal_job = NULL;
+        pthread_mutex_unlock(&client->block_proposal_lock);
+
+        process_block_proposal_job(job);
+        block_proposal_job_free(job);
+        block_proposal_mark_finished(client);
+    }
+    return NULL;
+}
+
 static int validator_build_block_internal(
     struct lantern_client *client,
     uint64_t slot,
@@ -1787,7 +2292,7 @@ static int validator_build_block_internal(
     uint64_t build_started_ms = 0;
     uint64_t collect_started_ms = 0;
     uint64_t collect_finished_ms = 0;
-    LanternRoot parent_root;
+    LanternRoot parent_root = {0};
     LanternAggregatedAttestations attestations;
     LanternAttestationSignatures signatures;
     bool attestations_initialized = false;
@@ -1838,7 +2343,6 @@ static int validator_build_block_internal(
         local->global_index,
         &parent_root,
         &attestations,
-        &signatures,
         out_block);
     if (result != LANTERN_CLIENT_OK)
     {
@@ -1866,14 +2370,27 @@ static int validator_build_block_internal(
     if (out_block_root) {
         *out_block_root = block_root;
     }
+    LanternSignature proposer_signature;
+    lantern_signature_zero(&proposer_signature);
     if (validator_sign_with_key(
             local,
             slot,
             &block_root,
             true,
-            &out_block->signatures.proposer_signature)
+            &proposer_signature)
         != LANTERN_CLIENT_OK) {
         result = LANTERN_CLIENT_ERR_VALIDATOR;
+        goto cleanup;
+    }
+    result = validator_build_block_merge_proof(
+        client,
+        local,
+        &block_root,
+        &signatures,
+        &proposer_signature,
+        out_block);
+    if (result != LANTERN_CLIENT_OK)
+    {
         goto cleanup;
     }
     result = LANTERN_CLIENT_OK;
@@ -2258,23 +2775,13 @@ int validator_propose_block(struct lantern_client *client, uint64_t slot, size_t
         validator_log_duty_skipped(client, slot, skip_reason);
         return LANTERN_CLIENT_ERR_RUNTIME;
     }
-    LanternSignedBlock block;
-    lantern_signed_block_init(&block);
-    LanternState post_state;
-    lantern_state_init(&post_state);
-    LanternStore post_store;
-    lantern_store_init(&post_store);
-    LanternRoot block_root;
-    memset(&block_root, 0, sizeof(block_root));
 
-    int rc = validator_build_block_internal(
+    struct lantern_async_block_proposal_job *job = NULL;
+    int rc = validator_prepare_block_proposal_job(
         client,
         slot,
         local_index,
-        &block,
-        &post_state,
-        &post_store,
-        &block_root);
+        &job);
     if (rc != LANTERN_CLIENT_OK)
     {
         lantern_log_warn(
@@ -2283,51 +2790,24 @@ int validator_propose_block(struct lantern_client *client, uint64_t slot, size_t
             "slot %" PRIu64 ", skipped, reason: build_failed, rc %d",
             slot,
             rc);
-        lantern_store_reset(&post_store);
-        lantern_state_reset(&post_state);
-        lantern_signed_block_reset(&block);
         return rc;
     }
 
-    rc = lantern_client_commit_and_publish_local_block(
-        client,
-        &block,
-        &block_root,
-        &post_state,
-        &post_store);
-    lantern_store_reset(&post_store);
-    lantern_state_reset(&post_state);
-    if (client->validator_lock_initialized && pthread_mutex_lock(&client->validator_lock) == 0)
-    {
-        if (local_index < client->local_validator_count)
-        {
-            struct lantern_local_validator *local = &client->local_validators[local_index];
-            local->last_proposed_slot = slot;
-        }
-        unlock_mutex_with_log(&client->validator_lock, client->node_id, "validator_lock");
-    }
+    rc = enqueue_block_proposal_job(client, job);
     if (rc == LANTERN_CLIENT_OK)
     {
-        char root_hex[2 * LANTERN_ROOT_SIZE + 3];
-        format_root_hex(&block_root, root_hex, sizeof(root_hex));
-        lantern_log_info(
-            "propose",
-            &(const struct lantern_log_metadata){.validator = client->node_id},
-            "slot %" PRIu64 ", %s, %zu attestations",
-            slot,
-            root_hex[0] ? root_hex : "0x0",
-            block.block.body.attestations.length);
+        job = NULL;
     }
     else
     {
+        block_proposal_job_free(job);
         lantern_log_warn(
             "propose",
             &(const struct lantern_log_metadata){.validator = client->node_id},
-            "slot %" PRIu64 ", skipped, reason: publish_failed, rc %d",
+            "slot %" PRIu64 ", skipped, reason: proof_worker_busy, rc %d",
             slot,
             rc);
     }
-    lantern_signed_block_reset(&block);
     return rc;
 }
 
@@ -2387,7 +2867,6 @@ int validator_publish_attestations(struct lantern_client *client, uint64_t slot)
         return LANTERN_CLIENT_ERR_RUNTIME;
     }
     lantern_client_unlock_state(client, state_locked);
-
     bool have_lock = false;
     if (client->validator_lock_initialized)
     {
@@ -2763,6 +3242,109 @@ void *timing_thread(void *arg)
     }
 
     return NULL;
+}
+
+
+int start_block_proposal_worker(struct lantern_client *client)
+{
+    if (!client)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    if (client->block_proposal_thread_started)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+    if (client->local_validator_count == 0 || !client->has_runtime)
+    {
+        return LANTERN_CLIENT_OK;
+    }
+    if (!client->block_proposal_lock_initialized)
+    {
+        if (pthread_mutex_init(&client->block_proposal_lock, NULL) != 0)
+        {
+            return LANTERN_CLIENT_ERR_RUNTIME;
+        }
+        client->block_proposal_lock_initialized = true;
+    }
+    if (!client->block_proposal_cond_initialized)
+    {
+        if (pthread_cond_init(&client->block_proposal_cond, NULL) != 0)
+        {
+            pthread_mutex_destroy(&client->block_proposal_lock);
+            client->block_proposal_lock_initialized = false;
+            return LANTERN_CLIENT_ERR_RUNTIME;
+        }
+        client->block_proposal_cond_initialized = true;
+    }
+
+    client->block_proposal_stop = false;
+    client->block_proposal_inflight = false;
+    if (pthread_create(&client->block_proposal_thread, NULL, block_proposal_worker_main, client) != 0)
+    {
+        client->block_proposal_stop = true;
+        pthread_cond_destroy(&client->block_proposal_cond);
+        pthread_mutex_destroy(&client->block_proposal_lock);
+        client->block_proposal_cond_initialized = false;
+        client->block_proposal_lock_initialized = false;
+        return LANTERN_CLIENT_ERR_RUNTIME;
+    }
+    client->block_proposal_thread_started = true;
+    lantern_log_info(
+        "validator",
+        &(const struct lantern_log_metadata){.validator = client->node_id},
+        "block proposal worker started");
+    return LANTERN_CLIENT_OK;
+}
+
+void stop_block_proposal_worker(struct lantern_client *client)
+{
+    if (!client)
+    {
+        return;
+    }
+    if (client->block_proposal_lock_initialized
+        && pthread_mutex_lock(&client->block_proposal_lock) == 0)
+    {
+        client->block_proposal_stop = true;
+        if (client->block_proposal_cond_initialized)
+        {
+            pthread_cond_broadcast(&client->block_proposal_cond);
+        }
+        pthread_mutex_unlock(&client->block_proposal_lock);
+    }
+    if (client->block_proposal_thread_started)
+    {
+        int join_rc = pthread_join(client->block_proposal_thread, NULL);
+        if (join_rc != 0)
+        {
+            lantern_log_warn(
+                "validator",
+                &(const struct lantern_log_metadata){.validator = client->node_id},
+                "pthread_join failed: %d",
+                join_rc);
+        }
+        client->block_proposal_thread_started = false;
+    }
+    block_proposal_job_free(client->block_proposal_job);
+    client->block_proposal_job = NULL;
+    client->block_proposal_inflight = false;
+    client->block_proposal_stop = true;
+
+    if (client->block_proposal_cond_initialized)
+    {
+        pthread_cond_destroy(&client->block_proposal_cond);
+        client->block_proposal_cond_initialized = false;
+    }
+    if (client->block_proposal_lock_initialized)
+    {
+        pthread_mutex_destroy(&client->block_proposal_lock);
+        client->block_proposal_lock_initialized = false;
+    }
+    lantern_log_info(
+        "validator",
+        &(const struct lantern_log_metadata){.validator = client->node_id},
+        "block proposal worker stopped");
 }
 
 

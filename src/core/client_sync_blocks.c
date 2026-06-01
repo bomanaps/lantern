@@ -22,6 +22,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -239,29 +240,85 @@ void lantern_client_cache_block_aggregated_proofs_locked(
         return;
     }
     const LanternAggregatedAttestations *attestations = &block->block.body.attestations;
-    const LanternAttestationSignatures *proofs = &block->signatures.attestation_signatures;
-    if (!attestations->data || !proofs->data) {
+    if (attestations->length == 0u) {
         return;
     }
-    size_t count = attestations->length;
-    if (proofs->length < count) {
-        count = proofs->length;
-    }
-    if (count == 0) {
+    if (!attestations->data) {
         return;
     }
-    for (size_t i = 0; i < count; ++i) {
+
+    if (block->proof.length == 0u || !block->proof.data) {
+        return;
+    }
+
+    for (size_t i = 0; i < attestations->length; ++i) {
         LanternRoot data_root;
         if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != SSZ_SUCCESS) {
             continue;
         }
-        (void)lantern_client_add_known_aggregated_payload(
+        (void)lantern_store_add_attestation_data(
+            &client->store,
+            &data_root,
+            &attestations->data[i].data,
+            attestations->data[i].data.target.slot);
+    }
+
+#if LANTERN_AGGREGATED_SIGNATURE_PROOF_INVERSE_PROOF_SIZE <= 1u
+    return;
+#endif
+
+    LanternState scratch;
+    lantern_state_init(&scratch);
+    const LanternState *sig_state = lantern_client_state_for_root_local_locked(
+        client,
+        &block->block.parent_root,
+        &scratch,
+        NULL);
+    if (!sig_state) {
+        lantern_state_reset(&scratch);
+        return;
+    }
+
+    for (size_t i = 0; i < attestations->length; ++i) {
+        LanternRoot data_root;
+        if (lantern_hash_tree_root_attestation_data(&attestations->data[i].data, &data_root) != SSZ_SUCCESS) {
+            continue;
+        }
+        LanternAggregatedSignatureProof proof;
+        lantern_aggregated_signature_proof_init(&proof);
+        if (lantern_bitlist_resize(
+                &proof.participants,
+                attestations->data[i].aggregation_bits.bit_length)
+                != 0) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            continue;
+        }
+        size_t byte_len = (proof.participants.bit_length + 7u) / 8u;
+        if (byte_len > 0u) {
+            if (!proof.participants.bytes || !attestations->data[i].aggregation_bits.bytes) {
+                lantern_aggregated_signature_proof_reset(&proof);
+                continue;
+            }
+            memcpy(proof.participants.bytes, attestations->data[i].aggregation_bits.bytes, byte_len);
+        }
+        if (!lantern_signature_split_block_type2_proof_by_message(
+                sig_state,
+                &block->block,
+                &block->proof,
+                &data_root,
+                &proof.proof_data)) {
+            lantern_aggregated_signature_proof_reset(&proof);
+            continue;
+        }
+        (void)lantern_client_add_new_aggregated_payload(
             client,
             &data_root,
             &attestations->data[i].data,
-            &proofs->data[i],
+            &proof,
             attestations->data[i].data.target.slot);
+        lantern_aggregated_signature_proof_reset(&proof);
     }
+    lantern_state_reset(&scratch);
 }
 
 static bool sync_validator_votes_from_preview_locked(
@@ -312,12 +369,13 @@ static void persist_block_after_import(
     }
 }
 
-int lantern_client_commit_and_publish_local_block(
+static int commit_and_publish_local_block(
     struct lantern_client *client,
     const LanternSignedBlock *block,
     const LanternRoot *block_root,
     LanternState *post_state,
-    LanternStore *post_store)
+    LanternStore *post_store,
+    bool require_current_parent)
 {
     if (!client || !block || !block_root || !post_state || !post_store)
     {
@@ -371,6 +429,22 @@ int lantern_client_commit_and_publish_local_block(
                LANTERN_ROOT_SIZE)
             != 0)
     {
+        if (require_current_parent)
+        {
+            char parent_hex[ROOT_HEX_BUFFER_LEN];
+            char head_hex[ROOT_HEX_BUFFER_LEN];
+            format_root_hex(&block->block.parent_root, parent_hex, sizeof(parent_hex));
+            format_root_hex(&state_head_root, head_hex, sizeof(head_hex));
+            lantern_log_warn(
+                "propose",
+                &meta,
+                "slot %" PRIu64 ", skipped, reason: stale_parent, parent %s, current_head %s",
+                block->block.slot,
+                parent_hex[0] ? parent_hex : "0x0",
+                head_hex[0] ? head_hex : "0x0");
+            lantern_client_unlock_state(client, state_locked);
+            return LANTERN_CLIENT_ERR_IGNORED;
+        }
         lantern_client_unlock_state(client, state_locked);
         int publish_rc = lantern_client_publish_block(client, block);
         (void)lantern_client_import_block(
@@ -469,6 +543,38 @@ int lantern_client_commit_and_publish_local_block(
     return committed ? LANTERN_CLIENT_OK : LANTERN_CLIENT_ERR_RUNTIME;
 }
 
+int lantern_client_commit_and_publish_local_block(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    LanternState *post_state,
+    LanternStore *post_store)
+{
+    return commit_and_publish_local_block(
+        client,
+        block,
+        block_root,
+        post_state,
+        post_store,
+        false);
+}
+
+int lantern_client_commit_and_publish_current_local_block(
+    struct lantern_client *client,
+    const LanternSignedBlock *block,
+    const LanternRoot *block_root,
+    LanternState *post_state,
+    LanternStore *post_store)
+{
+    return commit_and_publish_local_block(
+        client,
+        block,
+        block_root,
+        post_state,
+        post_store,
+        true);
+}
+
 static size_t bitlist_encoded_size_bits(size_t bit_length)
 {
     if (bit_length == 0)
@@ -505,14 +611,11 @@ static size_t signed_block_max_ssz_size(void)
         return SIZE_MAX;
     }
     size_t total = base + attestations_max;
-    size_t proof_entry_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + att_bits_max + LANTERN_AGG_PROOF_MAX_BYTES;
-    size_t signatures_max = (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + LANTERN_SIGNATURE_SIZE
-        + ((size_t)LANTERN_MAX_BLOCK_SIGNATURES * (SSZ_BYTES_PER_LENGTH_OFFSET + proof_entry_max));
-    if (signatures_max > SIZE_MAX - total)
+    if (LANTERN_AGG_PROOF_MAX_BYTES > SIZE_MAX - total)
     {
         return SIZE_MAX;
     }
-    return total + signatures_max;
+    return total + LANTERN_AGG_PROOF_MAX_BYTES;
 }
 
 static int encode_block_ssz(

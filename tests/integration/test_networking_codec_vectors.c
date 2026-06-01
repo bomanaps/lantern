@@ -26,7 +26,7 @@
 #define LANTERN_CONSENSUS_FIXTURE_DIR "tools/leanSpec/fixtures/consensus"
 #endif
 
-#define NETWORKING_CODEC_FIXTURE_SUBDIR "networking_codec/devnet/networking"
+#define NETWORKING_CODEC_FIXTURE_SUBDIR "networking_codec/lstar/networking"
 #define BUFFER_PREVIEW_BYTES 32u
 #define FIXTURE_SKIPPED 1
 

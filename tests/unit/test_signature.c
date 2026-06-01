@@ -577,7 +577,7 @@ static int test_recursive_aggregated_signature_roundtrip(void) {
         goto fail;
     }
 
-    if (!lantern_aggregated_signature_proof_aggregate(
+    if (lantern_aggregated_signature_proof_aggregate(
             &state,
             NULL,
             &child_proof,
@@ -587,29 +587,10 @@ static int test_recursive_aggregated_signature_roundtrip(void) {
             &message,
             epoch,
             &single_child_rollup)) {
-        fprintf(stderr, "recursive aggregate: single-child rollup failed\n");
+        fprintf(stderr, "recursive aggregate: single-child rollup should be rejected\n");
         goto fail;
     }
-    if (!expect_aggregated_build_metrics(1u, 3u, "single-child rollup")) {
-        goto fail;
-    }
-    if (single_child_rollup.proof_data.length != child_proof.proof_data.length
-        || !single_child_rollup.proof_data.data
-        || memcmp(
-               single_child_rollup.proof_data.data,
-               child_proof.proof_data.data,
-               child_proof.proof_data.length)
-            != 0) {
-        fprintf(stderr, "recursive aggregate: single-child rollup did not preserve proof bytes\n");
-        goto fail;
-    }
-    if (!lantern_signature_verify_aggregated(
-            child_pubkey_ptrs,
-            2u,
-            &message,
-            &single_child_rollup.proof_data,
-            epoch)) {
-        fprintf(stderr, "recursive aggregate: single-child rollup verification failed\n");
+    if (!expect_aggregated_build_metrics(1u, 3u, "single-child rollup rejection")) {
         goto fail;
     }
 

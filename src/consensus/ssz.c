@@ -68,13 +68,6 @@ static const size_t SIGNED_AGGREGATED_ATTESTATION_FIELDS[] = {
 static const ssz_container_schema_t SIGNED_AGGREGATED_ATTESTATION_SCHEMA =
     SSZ_CONTAINER_SCHEMA_FROM_ARRAY(SIGNED_AGGREGATED_ATTESTATION_FIELDS);
 
-static const size_t BLOCK_SIGNATURES_FIELDS[] = {
-    0u,
-    LANTERN_SIGNATURE_SIZE,
-};
-static const ssz_container_schema_t BLOCK_SIGNATURES_SCHEMA =
-    SSZ_CONTAINER_SCHEMA_FROM_ARRAY(BLOCK_SIGNATURES_FIELDS);
-
 static const size_t BLOCK_BODY_FIELDS[] = {
     0u,
 };
@@ -1141,165 +1134,6 @@ ssz_error_t lantern_ssz_decode_aggregated_signature_proof(
     return decode_aggregated_signature_proof(proof, data, data_len);
 }
 
-struct attestation_signatures_codec_ctx {
-    const LanternAttestationSignatures *write;
-    LanternAttestationSignatures *read;
-};
-
-static ssz_error_t attestation_signatures_write(
-    const void *ctx,
-    uint64_t member_id,
-    uint8_t *out,
-    size_t out_len,
-    size_t *written) {
-    const struct attestation_signatures_codec_ctx *list_ctx = ctx;
-    if (!list_ctx || !list_ctx->write || member_id >= list_ctx->write->length) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    return encode_aggregated_signature_proof(&list_ctx->write->data[member_id], out, out_len, written);
-}
-
-static ssz_error_t attestation_signatures_read(void *ctx, uint64_t member_id, const uint8_t *data, size_t data_len) {
-    struct attestation_signatures_codec_ctx *list_ctx = ctx;
-    if (!list_ctx || !list_ctx->read || member_id != list_ctx->read->length) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    LanternAggregatedSignatureProof proof;
-    lantern_aggregated_signature_proof_init(&proof);
-    ssz_error_t err = decode_aggregated_signature_proof(&proof, data, data_len);
-    if (err == SSZ_SUCCESS) {
-        err = lantern_rc_to_ssz(lantern_attestation_signatures_append(list_ctx->read, &proof));
-    }
-    lantern_aggregated_signature_proof_reset(&proof);
-    return err;
-}
-
-static ssz_error_t encode_attestation_signatures(
-    const LanternAttestationSignatures *signatures,
-    uint8_t *out,
-    size_t out_len,
-    size_t *written) {
-    if (!signatures) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    if (signatures->length > LANTERN_MAX_BLOCK_SIGNATURES) {
-        return SSZ_ERR_LIMIT_EXCEEDED;
-    }
-    if (signatures->length > 0u && !signatures->data) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    struct attestation_signatures_codec_ctx ctx = {.write = signatures};
-    ssz_member_codec_t codec = {.ctx = &ctx, .write = attestation_signatures_write};
-    return ssz_serialize_list_variable(
-        signatures->length,
-        LANTERN_MAX_BLOCK_SIGNATURES,
-        &codec,
-        out,
-        out_len,
-        written);
-}
-
-static ssz_error_t decode_attestation_signatures(
-    LanternAttestationSignatures *signatures,
-    const uint8_t *data,
-    size_t data_len) {
-    if (!signatures) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    ssz_error_t err = lantern_rc_to_ssz(lantern_attestation_signatures_resize(signatures, 0u));
-    if (err != SSZ_SUCCESS) {
-        return err;
-    }
-    struct attestation_signatures_codec_ctx ctx = {.read = signatures};
-    ssz_member_codec_t codec = {.ctx = &ctx, .read = attestation_signatures_read};
-    uint64_t count = 0u;
-    err = ssz_deserialize_list_variable(
-        data,
-        data_len,
-        LANTERN_MAX_BLOCK_SIGNATURES,
-        (SSZ_BYTES_PER_LENGTH_OFFSET * 2u) + 1u,
-        &codec,
-        &count);
-    if (err == SSZ_SUCCESS && count != signatures->length) {
-        err = SSZ_ERR_ENCODING_INVALID;
-    }
-    return err;
-}
-
-struct block_signatures_codec_ctx {
-    const LanternBlockSignatures *write;
-    LanternBlockSignatures *read;
-};
-
-static ssz_error_t block_signatures_write(
-    const void *ctx,
-    uint64_t member_id,
-    uint8_t *out,
-    size_t out_len,
-    size_t *written) {
-    const struct block_signatures_codec_ctx *sig_ctx = ctx;
-    if (!sig_ctx || !sig_ctx->write) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    switch (member_id) {
-    case 0:
-        return encode_attestation_signatures(&sig_ctx->write->attestation_signatures, out, out_len, written);
-    case 1:
-        return write_signature(&sig_ctx->write->proposer_signature, out, out_len, written);
-    default:
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-}
-
-static ssz_error_t block_signatures_read(void *ctx, uint64_t member_id, const uint8_t *data, size_t data_len) {
-    struct block_signatures_codec_ctx *sig_ctx = ctx;
-    if (!sig_ctx || !sig_ctx->read) {
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-    switch (member_id) {
-    case 0:
-        return decode_attestation_signatures(&sig_ctx->read->attestation_signatures, data, data_len);
-    case 1:
-        return read_signature(data, data_len, &sig_ctx->read->proposer_signature);
-    default:
-        return SSZ_ERR_INVALID_ARGUMENT;
-    }
-}
-
-static ssz_error_t encode_block_signatures(
-    const LanternBlockSignatures *signatures,
-    uint8_t *out,
-    size_t out_len,
-    size_t *written) {
-    struct block_signatures_codec_ctx ctx = {.write = signatures};
-    ssz_member_codec_t codec = {.ctx = &ctx, .write = block_signatures_write};
-    return ssz_serialize_container(&BLOCK_SIGNATURES_SCHEMA, &codec, out, out_len, written);
-}
-
-static ssz_error_t decode_block_signatures(
-    LanternBlockSignatures *signatures,
-    const uint8_t *data,
-    size_t data_len) {
-    struct block_signatures_codec_ctx ctx = {.read = signatures};
-    ssz_member_codec_t codec = {.ctx = &ctx, .read = block_signatures_read};
-    return ssz_deserialize_container(data, data_len, &BLOCK_SIGNATURES_SCHEMA, &codec);
-}
-
-ssz_error_t lantern_ssz_encode_block_signatures(
-    const LanternBlockSignatures *signatures,
-    uint8_t *out,
-    size_t out_len,
-    size_t *written) {
-    return encode_block_signatures(signatures, out, out_len, written);
-}
-
-ssz_error_t lantern_ssz_decode_block_signatures(
-    LanternBlockSignatures *signatures,
-    const uint8_t *data,
-    size_t data_len) {
-    return decode_block_signatures(signatures, data, data_len);
-}
-
 struct block_header_codec_ctx {
     const LanternBlockHeader *write;
     LanternBlockHeader *read;
@@ -1506,7 +1340,7 @@ static ssz_error_t signed_block_write(
     case 0:
         return lantern_ssz_encode_block(&block_ctx->write->block, out, out_len, written);
     case 1:
-        return encode_block_signatures(&block_ctx->write->signatures, out, out_len, written);
+        return encode_byte_list(&block_ctx->write->proof, out, out_len, written);
     default:
         return SSZ_ERR_INVALID_ARGUMENT;
     }
@@ -1521,7 +1355,7 @@ static ssz_error_t signed_block_read(void *ctx, uint64_t member_id, const uint8_
     case 0:
         return lantern_ssz_decode_block(&block_ctx->read->block, data, data_len);
     case 1:
-        return decode_block_signatures(&block_ctx->read->signatures, data, data_len);
+        return decode_byte_list(&block_ctx->read->proof, data, data_len);
     default:
         return SSZ_ERR_INVALID_ARGUMENT;
     }
