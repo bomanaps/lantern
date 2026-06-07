@@ -99,11 +99,17 @@ for path in libdir.glob("*.so.*"):
             pass
 PY
 
-# Preserve leanMultisig sources needed at runtime for XMSS aggregation.
-# The runtime binary expects xmss_aggregate.lean_lang at the build-time cargo checkout path.
+# Preserve the leanVM checkout containing XMSS aggregation sources.
+# Runtime paths are compiled from Cargo's checkout location, so mirror it into the final image.
 RUN --mount=type=cache,target=/root/.cargo/git,sharing=locked,id=cargo-git-${TARGETPLATFORM} \
-    mkdir -p /opt/lantern/share/cargo-git-checkouts \
-    && cp -a /root/.cargo/git/checkouts/leanmultisig-* /opt/lantern/share/cargo-git-checkouts/
+    set -eux; \
+    mkdir -p /opt/lantern/share/cargo-git-checkouts; \
+    mapfile -t xmss_sources < <(find /root/.cargo/git/checkouts -path '*/crates/rec_aggregation/zkdsl_implem/xmss_aggregate.py' -print); \
+    test "${#xmss_sources[@]}" -gt 0; \
+    for xmss_source in "${xmss_sources[@]}"; do \
+        checkout_dir="${xmss_source%/*/crates/rec_aggregation/zkdsl_implem/xmss_aggregate.py}"; \
+        cp -a "${checkout_dir}" /opt/lantern/share/cargo-git-checkouts/; \
+    done
 
 FROM ubuntu:22.04
 
