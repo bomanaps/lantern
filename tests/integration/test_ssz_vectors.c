@@ -820,6 +820,11 @@ static int parse_public_key_object(
     }
     byte_buffer_reset(out_serialized);
 
+    const jsmntok_t *token = lantern_fixture_token(doc, object_index);
+    if (token && token->type == JSMN_STRING) {
+        return fixture_token_to_bytes(doc, object_index, out_serialized);
+    }
+
     int root_idx = lantern_fixture_object_get_field(doc, object_index, "root");
     int parameter_idx = lantern_fixture_object_get_field(doc, object_index, "parameter");
     struct byte_buffer root_bytes = {0};
