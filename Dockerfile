@@ -60,15 +60,10 @@ RUN if [ "${LANTERN_RUST_PROFILE}" = "1" ]; then \
     && echo "LANTERN_RUST_PROFILE=${LANTERN_RUST_PROFILE}" \
     && cat external/c-leanvm-xmss/.cargo/config.toml
 
+ARG LANTERN_FORCE_REBUILD=0
 RUN --mount=type=cache,target=/root/.cargo/registry,sharing=locked,id=cargo-registry-${TARGETPLATFORM} \
     --mount=type=cache,target=/root/.cargo/git,sharing=locked,id=cargo-git-${TARGETPLATFORM} \
-    --mount=type=cache,target=/usr/src/lantern/external/c-leanvm-xmss/target,sharing=locked,id=leanvm-xmss-target-${TARGETPLATFORM}-${LANTERN_RUST_PROFILE} \
-    cd external/c-leanvm-xmss \
-    && cargo build --release --locked \
-    && find target/release -name '*.a' -exec ranlib {} \;
-
-ARG LANTERN_FORCE_REBUILD=0
-RUN --mount=type=cache,target=/root/.ccache,sharing=locked,id=ccache-${TARGETPLATFORM} \
+    --mount=type=cache,target=/root/.ccache,sharing=locked,id=ccache-${TARGETPLATFORM} \
     --mount=type=cache,target=/usr/src/lantern/build,sharing=locked,id=lantern-build-${TARGETPLATFORM} \
     echo "LANTERN_FORCE_REBUILD=${LANTERN_FORCE_REBUILD}" \
     && cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DLANTERN_GIT_COMMIT="${GIT_COMMIT}" -DLANTERN_GIT_BRANCH="${GIT_BRANCH}" \
