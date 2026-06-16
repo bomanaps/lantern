@@ -443,6 +443,39 @@ static bool build_type2_component_set_for_block(
     return true;
 }
 
+static bool build_type2_merge_component_set_for_block(
+    const LanternState *state,
+    const LanternBlock *block,
+    struct lantern_type2_component_work *work,
+    struct PQTypeTwoComponent *components,
+    size_t component_count) {
+    if (!state || !block || !work || !components) {
+        return false;
+    }
+    size_t attestation_count = block->body.attestations.length;
+    if (component_count != attestation_count + 1u) {
+        return false;
+    }
+    if (attestation_count > 0u && !block->body.attestations.data) {
+        return false;
+    }
+    for (size_t i = 0; i < attestation_count; ++i) {
+        const LanternAggregatedAttestation *attestation = &block->body.attestations.data[i];
+        if (!build_type2_attestation_component(
+                state,
+                &attestation->aggregation_bits,
+                &work[i],
+                &components[i])) {
+            return false;
+        }
+    }
+    return build_type2_proposer_component(
+        state,
+        block->proposer_index,
+        &work[attestation_count],
+        &components[attestation_count]);
+}
+
 bool lantern_signature_is_zero(const LanternSignature *signature) {
     if (!signature) {
         return false;
@@ -1066,25 +1099,20 @@ bool lantern_signature_merge_block_type2_proof(
         calloc(component_count, sizeof(*work));
     struct PQTypeTwoComponent *components =
         calloc(component_count, sizeof(*components));
-    struct PQTypeTwoMessageBinding *bindings =
-        calloc(component_count, sizeof(*bindings));
-    LanternRoot *message_roots = calloc(component_count, sizeof(*message_roots));
     struct PQAggregatedSignatureChild *entries =
         calloc(component_count, sizeof(*entries));
     LanternByteList raw_type2;
     lantern_byte_list_init(&raw_type2);
 
     bool ok = false;
-    if (!work || !components || !bindings || !message_roots || !entries) {
+    if (!work || !components || !entries) {
         goto cleanup;
     }
-    if (!build_type2_component_set_for_block(
+    if (!build_type2_merge_component_set_for_block(
             state,
             block,
             work,
             components,
-            bindings,
-            message_roots,
             component_count)) {
         goto cleanup;
     }
@@ -1155,8 +1183,6 @@ cleanup:
     lantern_byte_list_reset(&raw_type2);
     reset_type2_component_set(work, component_count);
     free(entries);
-    free(message_roots);
-    free(bindings);
     free(components);
     free(work);
     return ok;
