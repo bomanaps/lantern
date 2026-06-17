@@ -115,7 +115,7 @@ static int parse_request_line(
     return LANTERN_HTTP_CORE_OK;
 }
 
-static bool locate_body(
+bool lantern_http_locate_body(
     const char *buffer,
     size_t buffer_len,
     const char **out_body,
@@ -143,7 +143,7 @@ static bool locate_body(
     return false;
 }
 
-static int parse_content_length(
+int lantern_http_parse_content_length(
     const char *buffer,
     size_t buffer_len,
     size_t *out_content_length)
@@ -199,12 +199,18 @@ static int parse_content_length(
             }
 
             size_t content_length = 0;
+            bool have_digit = false;
             while (value < line_end)
             {
+                if (*value == ' ' || *value == '\t')
+                {
+                    break;
+                }
                 if (*value < '0' || *value > '9')
                 {
                     return -1;
                 }
+                have_digit = true;
                 size_t digit = (size_t)(*value - '0');
                 if (content_length > (SIZE_MAX - digit) / 10u)
                 {
@@ -212,6 +218,14 @@ static int parse_content_length(
                 }
                 content_length = (content_length * 10u) + digit;
                 ++value;
+            }
+            while (value < line_end && (*value == ' ' || *value == '\t'))
+            {
+                ++value;
+            }
+            if (!have_digit || value != line_end)
+            {
+                return -1;
             }
             *out_content_length = content_length;
             return 0;
@@ -448,13 +462,13 @@ int lantern_http_request_read_body(
 
     const char *body_ptr = NULL;
     size_t available_len = 0;
-    if (!locate_body(request->raw, request->raw_len, &body_ptr, &available_len))
+    if (!lantern_http_locate_body(request->raw, request->raw_len, &body_ptr, &available_len))
     {
         return LANTERN_HTTP_CORE_ERR_MALFORMED_REQUEST;
     }
 
     size_t content_length = 0;
-    if (parse_content_length(request->raw, request->raw_len, &content_length) != 0)
+    if (lantern_http_parse_content_length(request->raw, request->raw_len, &content_length) != 0)
     {
         content_length = available_len;
     }
@@ -598,7 +612,7 @@ static void handle_client_connection(
 
     const char *body = NULL;
     size_t body_len = 0;
-    bool has_body = locate_body(buffer, (size_t)received, &body, &body_len);
+    bool has_body = lantern_http_locate_body(buffer, (size_t)received, &body, &body_len);
     struct lantern_http_request request = {
         .client_fd = client_fd,
         .method = method,

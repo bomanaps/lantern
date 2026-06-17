@@ -69,6 +69,7 @@ set(LANTERN_LIBRARY_SOURCES
     src/encoding/rlp.c
     src/metrics/lean_metrics.c
     src/metrics/server.c
+    src/http/client.c
     src/http/core.c
     src/http/server.c
     src/test_driver/driver.c

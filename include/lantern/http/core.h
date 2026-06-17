@@ -104,6 +104,16 @@ void lantern_http_buffer_free(struct lantern_http_buffer *buf);
 int lantern_http_buffer_reserve(struct lantern_http_buffer *buf, size_t extra);
 int lantern_http_buffer_appendf(struct lantern_http_buffer *buf, const char *fmt, ...);
 
+bool lantern_http_locate_body(
+    const char *buffer,
+    size_t buffer_len,
+    const char **out_body,
+    size_t *out_body_len);
+int lantern_http_parse_content_length(
+    const char *buffer,
+    size_t buffer_len,
+    size_t *out_content_length);
+
 int lantern_http_request_read_body(
     const struct lantern_http_request *request,
     size_t max_body_size,
