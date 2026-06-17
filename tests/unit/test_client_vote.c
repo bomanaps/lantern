@@ -77,12 +77,6 @@ int validator_build_block(
     uint64_t slot,
     size_t local_index,
     LanternSignedBlock *out_block);
-lantern_client_error lantern_client_aggregate_attestations_for_block(
-    struct lantern_client *client,
-    const LanternAttestations *att_list,
-    const LanternSignatureList *att_signatures,
-    LanternAggregatedAttestations *out_attestations,
-    LanternAttestationSignatures *out_signatures);
 lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
     struct lantern_client *client,
     LanternAggregatedAttestations *out_attestations,
@@ -3113,219 +3107,6 @@ cleanup:
     return rc;
 }
 
-static int test_validator_build_reuses_cached_group_proof(void) {
-    struct lantern_client client;
-    struct PQSignatureSchemePublicKey *pub = NULL;
-    struct PQSignatureSchemeSecretKey *secret = NULL;
-    LanternRoot anchor_root;
-    LanternRoot child_root;
-    LanternAggregatedSignatureProof cached_proof;
-    LanternAttestations att_list;
-    LanternSignatureList att_signatures;
-    LanternAggregatedAttestations out_attestations;
-    LanternAttestationSignatures out_signatures;
-    int rc = 1;
-
-    lantern_aggregated_signature_proof_init(&cached_proof);
-    lantern_attestations_init(&att_list);
-    lantern_signature_list_init(&att_signatures);
-    lantern_aggregated_attestations_init(&out_attestations);
-    lantern_attestation_signatures_init(&out_signatures);
-
-    if (client_test_setup_vote_validation_client(
-            &client,
-            "vote_cached_group",
-            &pub,
-            &secret,
-            &anchor_root,
-            &child_root)
-        != 0) {
-        return 1;
-    }
-
-    uint64_t child_slot = 0;
-    if (client_test_slot_for_root(&client, &child_root, &child_slot) != 0) {
-        fprintf(stderr, "failed to resolve child slot for cached proof reuse test\n");
-        goto cleanup;
-    }
-
-    LanternSignedVote valid_vote;
-    memset(&valid_vote, 0, sizeof(valid_vote));
-    valid_vote.data.validator_id = 0u;
-    valid_vote.data.slot = child_slot;
-    valid_vote.data.head.slot = child_slot;
-    valid_vote.data.head.root = child_root;
-    valid_vote.data.target.slot = child_slot;
-    valid_vote.data.target.root = child_root;
-    valid_vote.data.source.slot = 0u;
-    valid_vote.data.source.root = anchor_root;
-    if (client_test_sign_vote_with_secret(&valid_vote, secret) != 0) {
-        fprintf(stderr, "failed to sign valid vote for cached proof reuse test\n");
-        goto cleanup;
-    }
-
-    LanternRoot data_root;
-    if (lantern_hash_tree_root_attestation_data(&valid_vote.data.data, &data_root) != SSZ_SUCCESS) {
-        fprintf(stderr, "failed to hash vote data for cached proof reuse test\n");
-        goto cleanup;
-    }
-    const uint8_t *validator_pubkey = lantern_state_validator_attestation_pubkey(&client.state, 0u);
-    if (!validator_pubkey) {
-        fprintf(stderr, "missing validator pubkey for cached proof reuse test\n");
-        goto cleanup;
-    }
-
-    const uint8_t *pubkeys[1] = {validator_pubkey};
-    LanternSignature signatures[1] = {valid_vote.signature};
-    LanternByteList aggregated_proof_bytes;
-    lantern_byte_list_init(&aggregated_proof_bytes);
-    if (!lantern_signature_aggregate(
-            pubkeys,
-            signatures,
-            1u,
-            &data_root,
-            valid_vote.data.slot,
-            &aggregated_proof_bytes)) {
-        lantern_byte_list_reset(&aggregated_proof_bytes);
-        fprintf(stderr, "failed to aggregate valid signature for cache seed\n");
-        goto cleanup;
-    }
-    if (lantern_bitlist_resize(&cached_proof.participants, 1u) != 0
-        || lantern_bitlist_set(&cached_proof.participants, 0u, true) != 0
-        || lantern_byte_list_copy(&cached_proof.proof_data, &aggregated_proof_bytes) != 0) {
-        lantern_byte_list_reset(&aggregated_proof_bytes);
-        fprintf(stderr, "failed to build cached proof container\n");
-        goto cleanup;
-    }
-    lantern_byte_list_reset(&aggregated_proof_bytes);
-
-    if (lantern_client_add_known_aggregated_payload(
-            &client,
-            &data_root,
-            &valid_vote.data.data,
-            &cached_proof,
-            valid_vote.data.target.slot)
-        != 0) {
-        fprintf(stderr, "failed to seed proof cache\n");
-        goto cleanup;
-    }
-
-    LanternSignature corrupted_signature = valid_vote.signature;
-    memset(corrupted_signature.bytes, 0, sizeof(corrupted_signature.bytes));
-    corrupted_signature.bytes[0] = 0xFFu;
-    corrupted_signature.bytes[1] = 0xFFu;
-    corrupted_signature.bytes[2] = 0xFFu;
-    corrupted_signature.bytes[3] = 0xFFu;
-
-    if (lantern_attestations_append(&att_list, &valid_vote.data) != 0
-        || lantern_signature_list_append(&att_signatures, &corrupted_signature) != 0) {
-        fprintf(stderr, "failed to prepare attestation input for cache reuse test\n");
-        goto cleanup;
-    }
-
-    lantern_client_error agg_rc = lantern_client_aggregate_attestations_for_block(
-        &client,
-        &att_list,
-        &att_signatures,
-        &out_attestations,
-        &out_signatures);
-    if (agg_rc != LANTERN_CLIENT_OK) {
-        fprintf(stderr, "aggregation failed; expected cached proof reuse path rc=%d\n", (int)agg_rc);
-        goto cleanup;
-    }
-    if (out_attestations.length == 0
-        || !out_attestations.data
-        || out_signatures.length == 0
-        || !out_signatures.data) {
-        fprintf(stderr, "expected aggregated attestation signature in aggregation output\n");
-        goto cleanup;
-    }
-    if (!proof_payload_equals(&out_signatures.data[0], &cached_proof)) {
-        fprintf(stderr, "aggregation did not reuse cached aggregated proof payload\n");
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    lantern_attestation_signatures_reset(&out_signatures);
-    lantern_aggregated_attestations_reset(&out_attestations);
-    lantern_signature_list_reset(&att_signatures);
-    lantern_attestations_reset(&att_list);
-    lantern_aggregated_signature_proof_reset(&cached_proof);
-    test_reset_agg_cache(&client);
-    client_test_teardown_vote_validation_client(&client, pub, secret);
-    return rc;
-}
-
-static int test_validator_build_skips_raw_signatures_without_cached_proof(void) {
-    struct lantern_client client;
-    struct PQSignatureSchemePublicKey *pub = NULL;
-    struct PQSignatureSchemeSecretKey *secret = NULL;
-    LanternRoot anchor_root;
-    LanternRoot child_root;
-    LanternSignedVote vote;
-    LanternAttestations att_list;
-    LanternSignatureList att_signatures;
-    LanternAggregatedAttestations out_attestations;
-    LanternAttestationSignatures out_signatures;
-    int rc = 1;
-
-    memset(&vote, 0, sizeof(vote));
-    lantern_attestations_init(&att_list);
-    lantern_signature_list_init(&att_signatures);
-    lantern_aggregated_attestations_init(&out_attestations);
-    lantern_attestation_signatures_init(&out_signatures);
-
-    if (client_test_setup_vote_validation_client(
-            &client,
-            "vote_raw_signature_skip",
-            &pub,
-            &secret,
-            &anchor_root,
-            &child_root)
-        != 0) {
-        return 1;
-    }
-
-    if (make_signed_vote_for_validator(&client, secret, 0u, &anchor_root, &child_root, &vote) != 0) {
-        fprintf(stderr, "failed to build signed vote for raw-signature skip test\n");
-        goto cleanup;
-    }
-
-    if (lantern_attestations_append(&att_list, &vote.data) != 0
-        || lantern_signature_list_append(&att_signatures, &vote.signature) != 0) {
-        fprintf(stderr, "failed to prepare attestation input for raw-signature skip test\n");
-        goto cleanup;
-    }
-
-    lantern_client_error agg_rc = lantern_client_aggregate_attestations_for_block(
-        &client,
-        &att_list,
-        &att_signatures,
-        &out_attestations,
-        &out_signatures);
-    if (agg_rc != LANTERN_CLIENT_OK) {
-        fprintf(stderr, "cache-only aggregation failed rc=%d\n", (int)agg_rc);
-        goto cleanup;
-    }
-    if (out_attestations.length != 0 || out_signatures.length != 0) {
-        fprintf(stderr, "block aggregation should ignore uncached raw signatures\n");
-        goto cleanup;
-    }
-
-    rc = 0;
-
-cleanup:
-    lantern_attestation_signatures_reset(&out_signatures);
-    lantern_aggregated_attestations_reset(&out_attestations);
-    lantern_signature_list_reset(&att_signatures);
-    lantern_attestations_reset(&att_list);
-    test_reset_agg_cache(&client);
-    client_test_teardown_vote_validation_client(&client, pub, secret);
-    return rc;
-}
-
 static int test_block_build_keeps_known_payload_after_newer_raw_vote(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
@@ -4301,16 +4082,10 @@ int main(void) {
     if (test_attestation_material_prune_tracks_stale_data_roots() != 0) {
         return 1;
     }
-    if (test_validator_build_skips_raw_signatures_without_cached_proof() != 0) {
-        return 1;
-    }
     if (test_block_build_keeps_known_payload_after_newer_raw_vote() != 0) {
         return 1;
     }
     if (test_block_build_drops_target_not_after_source_payload() != 0) {
-        return 1;
-    }
-    if (test_validator_build_reuses_cached_group_proof() != 0) {
         return 1;
     }
     if (test_publish_attestations_includes_proposer() != 0) {

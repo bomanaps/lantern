@@ -345,19 +345,6 @@ int lantern_client_advance_fork_choice_time_locked(
     uint64_t now_milliseconds,
     bool has_proposal);
 
-/**
- * Select cached aggregated proofs for block attestations.
- *
- * @note Thread safety: Acquires state_lock internally.
- */
-lantern_client_error lantern_client_aggregate_attestations_for_block(
-    struct lantern_client *client,
-    const LanternAttestations *att_list,
-    const LanternSignatureList *att_signatures,
-    LanternAggregatedAttestations *out_attestations,
-    LanternAttestationSignatures *out_signatures);
-
-
 /* ============================================================================
  * Lock Functions
  * ============================================================================ */
