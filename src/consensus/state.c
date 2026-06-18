@@ -2498,21 +2498,26 @@ static int lantern_state_process_attestations_internal(
                     vote->target.slot);
             }
 
-            /* Finalization: if the target is the next valid justifiable slot after source
-             * relative to the current finalized boundary, finalize the source checkpoint.
+            /* Finalization: if the source is newer than the finalized boundary and
+             * the target is the next valid justifiable slot after source relative
+             * to that boundary, finalize the source checkpoint.
              */
-            bool has_justifiable_between = has_justifiable_slot_between(
-                vote->source.slot, vote->target.slot, finalized_slot);
-            bool vote_has_consecutive_source = !has_justifiable_between;
+            bool source_after_finalized = vote->source.slot > finalized_slot;
+            bool has_justifiable_between =
+                source_after_finalized
+                && has_justifiable_slot_between(vote->source.slot, vote->target.slot, finalized_slot);
+            bool vote_has_consecutive_source = source_after_finalized && !has_justifiable_between;
 
             if (trace_finalization) {
                 lantern_log_debug(
                     "state",
                     &meta,
-                    "finalization trace validator=%" PRIu64 " target_was_justified=%s vote_consecutive=%s "
-                    "latest_finalized=%" PRIu64 " latest_justified=%" PRIu64,
+                    "finalization trace validator=%" PRIu64 " target_was_justified=%s "
+                    "source_after_finalized=%s vote_consecutive=%s latest_finalized=%" PRIu64
+                    " latest_justified=%" PRIu64,
                     vote->validator_id,
                     target_was_justified ? "true" : "false",
+                    source_after_finalized ? "true" : "false",
                     vote_has_consecutive_source ? "true" : "false",
                     latest_finalized.slot,
                     latest_justified.slot);
@@ -3142,7 +3147,9 @@ int lantern_state_compute_vote_checkpoints(
     }
 
     if (has_safe) {
-        for (size_t i = 0; i < 3 && target_slot > safe_slot; ++i) {
+        uint64_t lower_bound_slot =
+            safe_slot > finalized_checkpoint.slot ? safe_slot : finalized_checkpoint.slot;
+        for (size_t i = 0; i < 3 && target_slot > lower_bound_slot; ++i) {
             LanternRoot parent_root;
             bool has_parent = false;
             if (lantern_fork_choice_block_info(

@@ -12,6 +12,7 @@
 #include "lantern/consensus/quorum.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/state.h"
+#include "lantern/metrics/lean_metrics.h"
 #include "pq-bindings-c-rust.h"
 #include "../support/state_store_adapter.h"
 
@@ -1658,6 +1659,67 @@ static int test_attestations_use_updated_finalized_slot_for_gap_check(void) {
 
     assert(state.latest_finalized.slot == first_source.slot);
     assert(state.latest_justified.slot == second_target.slot);
+
+    lantern_attestations_reset(&attestations);
+    lantern_signature_list_reset(&signatures);
+    lantern_state_reset(&state);
+    return 0;
+}
+
+static int test_attestations_do_not_refinalize_source_at_finalized_boundary(void) {
+    LanternState state;
+    lantern_state_init(&state);
+    const uint64_t validator_count = 3;
+    expect_zero(
+        lantern_state_generate_genesis(&state, 751, validator_count),
+        "genesis for no refinalize boundary test");
+    populate_historical_hashes_for_tests(&state, 2);
+
+    state.latest_finalized.slot = 1;
+    state.latest_finalized.root = get_historical_root_for_tests(&state, 1);
+    state.latest_justified = state.latest_finalized;
+
+    LanternCheckpoint source = state.latest_finalized;
+    LanternCheckpoint target = source;
+    target.slot = 2;
+    target.root = get_historical_root_for_tests(&state, target.slot);
+
+    LanternAttestations attestations;
+    lantern_attestations_init(&attestations);
+    LanternSignatureList signatures;
+    lantern_signature_list_init(&signatures);
+    size_t quorum = (size_t)lantern_consensus_quorum_threshold(validator_count);
+    expect_zero(
+        lantern_attestations_resize(&attestations, quorum),
+        "resize no refinalize boundary attestations");
+    expect_zero(
+        lantern_signature_list_resize(&signatures, quorum),
+        "resize no refinalize boundary signatures");
+    for (size_t i = 0; i < quorum; ++i) {
+        build_vote(
+            &attestations.data[i],
+            &signatures.data[i],
+            (uint64_t)i,
+            target.slot,
+            &source,
+            &target,
+            (uint8_t)(0xB0u + i));
+    }
+
+    lean_metrics_reset();
+    expect_zero(
+        lantern_state_process_attestations(&state, &attestations, &signatures),
+        "process no refinalize boundary attestations");
+
+    assert(state.latest_finalized.slot == source.slot);
+    assert(checkpoints_equal(&state.latest_finalized, &source));
+    assert(state.latest_justified.slot == target.slot);
+
+    struct lean_metrics_snapshot metrics;
+    lean_metrics_snapshot(&metrics);
+    assert(metrics.finalizations_success_total == 0);
+    assert(metrics.finalizations_error_total == 0);
+    lean_metrics_reset();
 
     lantern_attestations_reset(&attestations);
     lantern_signature_list_reset(&signatures);
@@ -4388,6 +4450,73 @@ static int test_compute_vote_checkpoints_advances_beyond_source(void) {
     return 0;
 }
 
+static int test_compute_vote_checkpoints_uses_finalized_lower_bound_when_safe_stale(void) {
+    LanternState state;
+    LanternForkChoice fork_choice;
+    LanternRoot genesis_root;
+    setup_state_and_fork_choice(&state, &fork_choice, 1850, 6, &genesis_root);
+
+    LanternRoot block_roots[6];
+    block_roots[0] = genesis_root;
+    LanternRoot parent_root = genesis_root;
+    for (uint64_t slot = 1; slot <= 5; ++slot) {
+        LanternBlock block;
+        LanternRoot block_root;
+        make_block(&state, slot, &parent_root, &block, &block_root);
+        expect_zero(
+            lantern_fork_choice_add_block(&fork_choice, &block, NULL, NULL, NULL, &block_root),
+            "add block for stale safe target lower-bound test");
+        block_roots[slot] = block_root;
+        parent_root = block_root;
+        lantern_block_body_reset(&block.body);
+    }
+
+    fork_choice.head = block_roots[5];
+    fork_choice.has_head = true;
+    fork_choice.safe_target = block_roots[1];
+    fork_choice.has_safe_target = true;
+
+    state.latest_finalized.slot = 4;
+    state.latest_finalized.root = block_roots[4];
+    state.latest_justified = state.latest_finalized;
+    expect_zero(
+        lantern_fork_choice_update_checkpoints(&fork_choice, &state.latest_justified, &state.latest_finalized),
+        "sync fork choice checkpoints for stale safe target lower-bound test");
+
+    LanternCheckpoint head;
+    LanternCheckpoint target;
+    LanternCheckpoint source;
+    if (lantern_state_compute_vote_checkpoints(&state, &head, &target, &source) != 0) {
+        fprintf(stderr, "compute vote checkpoints stale safe target lower-bound test failed\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (head.slot != 5 || memcmp(head.root.bytes, block_roots[5].bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "head checkpoint mismatch in stale safe target lower-bound test\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (target.slot != state.latest_finalized.slot
+        || memcmp(target.root.bytes, block_roots[4].bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "target walked below finalized lower bound when safe target was stale\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+    if (!checkpoints_equal(&source, &state.latest_justified)) {
+        fprintf(stderr, "source checkpoint mismatch in stale safe target lower-bound test\n");
+        lantern_state_reset(&state);
+        lantern_fork_choice_reset(&fork_choice);
+        return 1;
+    }
+
+    lantern_state_reset(&state);
+    lantern_fork_choice_reset(&fork_choice);
+    return 0;
+}
+
 static int test_history_limits_enforced(void) {
     const uint64_t genesis_time = 999;
     const uint64_t validator_count = 8;
@@ -4601,6 +4730,9 @@ int main(void) {
     if (test_attestations_use_updated_finalized_slot_for_gap_check() != 0) {
         return 1;
     }
+    if (test_attestations_do_not_refinalize_source_at_finalized_boundary() != 0) {
+        return 1;
+    }
     if (test_attestations_do_not_regress_latest_justified() != 0) {
         return 1;
     }
@@ -4677,6 +4809,9 @@ int main(void) {
         return 1;
     }
     if (test_compute_vote_checkpoints_advances_beyond_source() != 0) {
+        return 1;
+    }
+    if (test_compute_vote_checkpoints_uses_finalized_lower_bound_when_safe_stale() != 0) {
         return 1;
     }
     if (test_history_limits_enforced() != 0) {
