@@ -13,24 +13,7 @@
 
 enum {
     LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES = 4u,
-    LANTERN_SNAPPY_FRAME_CRC_BYTES = 4u,
-    LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN = 6u,
-    LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES =
-        LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES + LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN,
-    LANTERN_SNAPPY_FRAME_CHUNK_COMPRESSED = 0x00u,
-    LANTERN_SNAPPY_FRAME_CHUNK_UNCOMPRESSED = 0x01u,
-    LANTERN_SNAPPY_FRAME_CHUNK_PADDING_START = 0x02u,
-    LANTERN_SNAPPY_FRAME_CHUNK_PADDING_END = 0x7fu,
-    LANTERN_SNAPPY_FRAME_CHUNK_STREAM_IDENTIFIER = 0xffu,
-};
-
-static const uint8_t LANTERN_SNAPPY_FRAME_MAGIC[LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN] = {
-    's',
-    'N',
-    'a',
-    'P',
-    'p',
-    'Y',
+    LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES = 10u,
 };
 
 struct reqresp_buffer {
@@ -54,12 +37,6 @@ struct lantern_reqresp_exchange {
     LanternRoot *roots;
     size_t root_count;
     size_t responses_received;
-    size_t range_chunks_received;
-    uint64_t range_start_slot;
-    uint64_t range_count;
-    uint64_t range_previous_slot;
-    LanternRoot range_previous_root;
-    bool range_has_previous;
     uint64_t request_id;
     int completed;
     int request_complete;
@@ -279,11 +256,6 @@ static uint32_t read_le24(const uint8_t bytes[3]) {
     return (uint32_t)bytes[0] | ((uint32_t)bytes[1] << 8u) | ((uint32_t)bytes[2] << 16u);
 }
 
-static int is_snappy_padding_chunk(uint8_t type) {
-    return type >= (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_PADDING_START
-        && type <= (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_PADDING_END;
-}
-
 static int read_snappy_frame_payload(
     struct lantern_reqresp_stream *stream,
     size_t raw_len,
@@ -309,18 +281,14 @@ static int read_snappy_frame_payload(
     }
     len = (size_t)LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES;
 
-    if (payload[0] != (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_STREAM_IDENTIFIER
-        || read_le24(payload + 1u) != (uint32_t)LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN
-        || memcmp(
-               payload + (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES,
-               LANTERN_SNAPPY_FRAME_MAGIC,
-               sizeof(LANTERN_SNAPPY_FRAME_MAGIC))
-               != 0) {
+    size_t decoded_total = 0;
+    if (!lantern_snappy_is_framed(payload, len)
+        || lantern_snappy_uncompressed_length(payload, len, &decoded_total) != LANTERN_SNAPPY_OK
+        || decoded_total > raw_len) {
         free(payload);
         return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
     }
 
-    size_t decoded_total = 0;
     while (decoded_total < raw_len) {
         if (max_payload - len < (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES) {
             free(payload);
@@ -339,7 +307,6 @@ static int read_snappy_frame_payload(
         }
         len += (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES;
 
-        uint8_t chunk_type = payload[chunk_start];
         size_t chunk_len = (size_t)read_le24(payload + chunk_start + 1u);
         if (chunk_len > max_payload - len) {
             free(payload);
@@ -351,46 +318,12 @@ static int read_snappy_frame_payload(
             return rc;
         }
 
-        const uint8_t *chunk_payload = payload + len;
         len += chunk_len;
-
-        if (chunk_type == (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_STREAM_IDENTIFIER) {
-            if (chunk_len != (size_t)LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN
-                || memcmp(chunk_payload, LANTERN_SNAPPY_FRAME_MAGIC, sizeof(LANTERN_SNAPPY_FRAME_MAGIC)) != 0) {
-                free(payload);
-                return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-            }
-            continue;
-        }
-        if (is_snappy_padding_chunk(chunk_type)) {
-            continue;
-        }
-        if (chunk_type != (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_COMPRESSED
-            && chunk_type != (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_UNCOMPRESSED) {
+        if (lantern_snappy_uncompressed_length(payload, len, &decoded_total) != LANTERN_SNAPPY_OK
+            || decoded_total > raw_len) {
             free(payload);
             return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
         }
-        if (chunk_len < (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-        }
-
-        size_t chunk_raw_len = chunk_len - (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES;
-        if (chunk_type == (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_COMPRESSED) {
-            if (lantern_snappy_uncompressed_length_raw(
-                    chunk_payload + (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES,
-                    chunk_raw_len,
-                    &chunk_raw_len)
-                != LANTERN_SNAPPY_OK) {
-                free(payload);
-                return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-            }
-        }
-        if (chunk_raw_len > raw_len - decoded_total) {
-            free(payload);
-            return LANTERN_REQRESP_ERR_INVALID_PAYLOAD;
-        }
-        decoded_total += chunk_raw_len;
     }
 
     uint8_t *scratch = NULL;
@@ -433,21 +366,11 @@ static int snappy_frame_payload_len(
         }
         return 0;
     }
-    if (data[0] != (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_STREAM_IDENTIFIER
-        || read_le24(data + 1u) != (uint32_t)LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN
-        || memcmp(
-               data + (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES,
-               LANTERN_SNAPPY_FRAME_MAGIC,
-               sizeof(LANTERN_SNAPPY_FRAME_MAGIC))
-               != 0) {
+    if (!lantern_snappy_is_framed(data, data_len)) {
         return -1;
     }
     size_t offset = (size_t)LANTERN_SNAPPY_FRAME_STREAM_HEADER_BYTES;
     size_t decoded_total = 0;
-    if (raw_len == 0u) {
-        *out_frame_len = offset;
-        return 0;
-    }
     while (decoded_total < raw_len) {
         if (data_len - offset < (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES) {
             if (out_need_more) {
@@ -455,7 +378,6 @@ static int snappy_frame_payload_len(
             }
             return 0;
         }
-        uint8_t chunk_type = data[offset];
         size_t chunk_len = (size_t)read_le24(data + offset + 1u);
         offset += (size_t)LANTERN_SNAPPY_FRAME_CHUNK_HEADER_BYTES;
         if (chunk_len > data_len - offset) {
@@ -465,55 +387,13 @@ static int snappy_frame_payload_len(
             return 0;
         }
 
-        const uint8_t *chunk_payload = data + offset;
-        if (chunk_type == (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_STREAM_IDENTIFIER) {
-            if (chunk_len != (size_t)LANTERN_SNAPPY_FRAME_STREAM_IDENTIFIER_LEN
-                || memcmp(chunk_payload, LANTERN_SNAPPY_FRAME_MAGIC, sizeof(LANTERN_SNAPPY_FRAME_MAGIC)) != 0) {
-                return -1;
-            }
-        } else if (is_snappy_padding_chunk(chunk_type)) {
-            /* no decoded bytes */
-        } else if (chunk_type == (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_UNCOMPRESSED) {
-            if (chunk_len < (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES) {
-                return -1;
-            }
-            size_t chunk_raw_len = chunk_len - (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES;
-            if (chunk_raw_len > raw_len - decoded_total) {
-                return -1;
-            }
-            decoded_total += chunk_raw_len;
-        } else if (chunk_type == (uint8_t)LANTERN_SNAPPY_FRAME_CHUNK_COMPRESSED) {
-            if (chunk_len < (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES) {
-                return -1;
-            }
-            size_t chunk_raw_len = 0;
-            if (lantern_snappy_uncompressed_length_raw(
-                    chunk_payload + (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES,
-                    chunk_len - (size_t)LANTERN_SNAPPY_FRAME_CRC_BYTES,
-                    &chunk_raw_len)
-                != LANTERN_SNAPPY_OK) {
-                return -1;
-            }
-            if (chunk_raw_len > raw_len - decoded_total) {
-                return -1;
-            }
-            decoded_total += chunk_raw_len;
-        } else {
+        offset += chunk_len;
+        if (lantern_snappy_uncompressed_length(data, offset, &decoded_total) != LANTERN_SNAPPY_OK
+            || decoded_total > raw_len) {
             return -1;
         }
-        offset += chunk_len;
     }
     *out_frame_len = offset;
-    return 0;
-}
-
-static int encode_uvarint(uint64_t value, uint8_t out[10], size_t *written) {
-    if (!out || !written) {
-        return -1;
-    }
-    if (libp2p_uvarint_encode(value, out, 10u, written) != LIBP2P_UVARINT_OK) {
-        return -1;
-    }
     return 0;
 }
 
@@ -547,7 +427,8 @@ static int build_frame_from_raw(
     }
     uint8_t header[10];
     size_t header_len = 0;
-    if (encode_uvarint((uint64_t)raw_len, header, &header_len) != 0) {
+    if (libp2p_uvarint_encode((uint64_t)raw_len, header, sizeof(header), &header_len)
+        != LIBP2P_UVARINT_OK) {
         free(compressed);
         return -1;
     }
@@ -694,6 +575,38 @@ static int peer_from_conn(libp2p_host_conn_t *conn, struct lantern_peer_id *out_
     return 0;
 }
 
+static int reqresp_peer_id_cmp_bytes(
+    const uint8_t *left,
+    size_t left_len,
+    const uint8_t *right,
+    size_t right_len) {
+    size_t min_len = left_len < right_len ? left_len : right_len;
+    int cmp = memcmp(left, right, min_len);
+    if (cmp != 0) {
+        return cmp;
+    }
+    if (left_len < right_len) {
+        return -1;
+    }
+    if (left_len > right_len) {
+        return 1;
+    }
+    return 0;
+}
+
+static int reqresp_service_prefers_inbound_conn(
+    const struct lantern_reqresp_service *service,
+    const struct lantern_peer_id *peer) {
+    if (!service || !service->network || !peer || service->network->local_peer_id_len == 0) {
+        return 0;
+    }
+    return reqresp_peer_id_cmp_bytes(
+               service->network->local_peer_id,
+               service->network->local_peer_id_len,
+               peer->bytes,
+               peer->len) > 0;
+}
+
 static libp2p_host_conn_t *service_find_conn(
     struct lantern_reqresp_service *service,
     const struct lantern_peer_id *peer) {
@@ -716,7 +629,7 @@ static libp2p_host_conn_t *service_find_conn(
     return conn;
 }
 
-static void service_record_conn(struct lantern_reqresp_service *service, libp2p_host_conn_t *conn) {
+static void service_record_conn(struct lantern_reqresp_service *service, libp2p_host_conn_t *conn, int inbound) {
     if (!service || !conn) {
         return;
     }
@@ -724,12 +637,18 @@ static void service_record_conn(struct lantern_reqresp_service *service, libp2p_
     if (peer_from_conn(conn, &peer) != 0) {
         return;
     }
+    int prefer_inbound = reqresp_service_prefers_inbound_conn(service, &peer) ? 1 : 0;
+    int new_preferred = (inbound ? 1 : 0) == prefer_inbound;
     if (service->lock_initialized) {
         pthread_mutex_lock(&service->lock);
     }
     for (size_t i = 0; i < service->conn_count; ++i) {
         if (lantern_peer_id_equal(&service->conns[i].peer, &peer)) {
-            service->conns[i].conn = conn;
+            int existing_preferred = (service->conns[i].inbound ? 1 : 0) == prefer_inbound;
+            if (new_preferred || !existing_preferred) {
+                service->conns[i].conn = conn;
+                service->conns[i].inbound = inbound ? 1 : 0;
+            }
             if (service->lock_initialized) {
                 pthread_mutex_unlock(&service->lock);
             }
@@ -739,6 +658,7 @@ static void service_record_conn(struct lantern_reqresp_service *service, libp2p_
     if (service->conn_count < LANTERN_REQRESP_MAX_TRACKED_CONNECTIONS) {
         service->conns[service->conn_count].peer = peer;
         service->conns[service->conn_count].conn = conn;
+        service->conns[service->conn_count].inbound = inbound ? 1 : 0;
         service->conn_count++;
     }
     if (service->lock_initialized) {
@@ -848,29 +768,6 @@ static int build_blocks_request_frame(
     return rc;
 }
 
-static int build_blocks_by_range_request_frame(
-    uint64_t start_slot,
-    uint64_t count,
-    uint8_t **out_frame,
-    size_t *out_frame_len) {
-    if (count == 0u || count > LANTERN_MAX_REQUEST_BLOCKS || !out_frame || !out_frame_len) {
-        return -1;
-    }
-    if (count > UINT64_MAX - start_slot) {
-        return -1;
-    }
-    LanternBlocksByRangeRequest req = {
-        .start_slot = start_slot,
-        .count = count,
-    };
-    uint8_t raw[2u * sizeof(uint64_t)];
-    size_t raw_len = 0;
-    if (lantern_network_blocks_by_range_request_encode(&req, raw, sizeof(raw), &raw_len) != 0) {
-        return -1;
-    }
-    return build_frame_from_raw(raw, raw_len, 0, 0, out_frame, out_frame_len);
-}
-
 static int encode_signed_block_raw(const LanternSignedBlock *block, uint8_t **out_raw, size_t *out_raw_len) {
     if (!block || !out_raw || !out_raw_len) {
         return -1;
@@ -897,6 +794,30 @@ static int encode_signed_block_raw(const LanternSignedBlock *block, uint8_t **ou
         cap *= 2u;
     }
     return -1;
+}
+
+static int exchange_append_block_responses(
+    struct lantern_reqresp_exchange *exchange,
+    const LanternSignedBlockList *blocks) {
+    if (!exchange || !blocks) {
+        return -1;
+    }
+    for (size_t i = 0; i < blocks->length; ++i) {
+        uint8_t *block_raw = NULL;
+        size_t block_raw_len = 0;
+        if (encode_signed_block_raw(&blocks->blocks[i], &block_raw, &block_raw_len) != 0
+            || append_frame_from_raw(
+                   &exchange->read_buf,
+                   block_raw,
+                   block_raw_len,
+                   LANTERN_REQRESP_RESPONSE_SUCCESS)
+                   != 0) {
+            free(block_raw);
+            return -1;
+        }
+        free(block_raw);
+    }
+    return 0;
 }
 
 static int exchange_queue_error_response(struct lantern_reqresp_exchange *exchange, uint8_t code, const char *message) {
@@ -968,22 +889,10 @@ static int exchange_prepare_blocks_response(struct lantern_reqresp_exchange *exc
             LANTERN_REQRESP_RESPONSE_SERVER_ERROR,
             "Block lookup failed");
     }
-    for (size_t i = 0; i < blocks.length; ++i) {
-        uint8_t *block_raw = NULL;
-        size_t block_raw_len = 0;
-        if (encode_signed_block_raw(&blocks.blocks[i], &block_raw, &block_raw_len) != 0
-            || append_frame_from_raw(
-                   &exchange->read_buf,
-                   block_raw,
-                   block_raw_len,
-                   LANTERN_REQRESP_RESPONSE_SUCCESS)
-                   != 0) {
-            free(block_raw);
-            lantern_signed_block_list_reset(&blocks);
-            lantern_blocks_by_root_request_reset(&req);
-            return -1;
-        }
-        free(block_raw);
+    if (exchange_append_block_responses(exchange, &blocks) != 0) {
+        lantern_signed_block_list_reset(&blocks);
+        lantern_blocks_by_root_request_reset(&req);
+        return -1;
     }
     lantern_log_info(
         "network",
@@ -1059,21 +968,9 @@ static int exchange_prepare_blocks_by_range_response(
             LANTERN_REQRESP_RESPONSE_SERVER_ERROR,
             "Block range lookup failed");
     }
-    for (size_t i = 0; i < blocks.length; ++i) {
-        uint8_t *block_raw = NULL;
-        size_t block_raw_len = 0;
-        if (encode_signed_block_raw(&blocks.blocks[i], &block_raw, &block_raw_len) != 0
-            || append_frame_from_raw(
-                   &exchange->read_buf,
-                   block_raw,
-                   block_raw_len,
-                   LANTERN_REQRESP_RESPONSE_SUCCESS)
-                   != 0) {
-            free(block_raw);
-            lantern_signed_block_list_reset(&blocks);
-            return -1;
-        }
-        free(block_raw);
+    if (exchange_append_block_responses(exchange, &blocks) != 0) {
+        lantern_signed_block_list_reset(&blocks);
+        return -1;
     }
     lantern_signed_block_list_reset(&blocks);
     return 0;
@@ -1164,21 +1061,15 @@ static void exchange_fail(struct lantern_reqresp_exchange *exchange, int error) 
                 exchange->peer_id_text,
                 error);
         }
-    } else if (
-        exchange->outbound
-        && (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT
-            || exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_RANGE)) {
+    } else if (exchange->outbound && exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT) {
         if (exchange->service->callbacks.blocks_request_complete) {
-            int success = exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT
-                ? (exchange->responses_received > 0u ? 1 : 0)
-                : 0;
             exchange->service->callbacks.blocks_request_complete(
                 exchange->service->callbacks.context,
                 exchange->peer_id_text,
                 exchange->roots,
-                exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_ROOT ? exchange->root_count : 0u,
+                exchange->root_count,
                 exchange->request_id,
-                success);
+                exchange->responses_received > 0u ? 1 : 0);
         }
     }
 }
@@ -1208,90 +1099,6 @@ static int exchange_handle_outbound_status_frame(
             exchange->peer_id_text);
     }
     exchange->completed = 1;
-    return 0;
-}
-
-static int exchange_handle_outbound_range_frame(
-    struct lantern_reqresp_exchange *exchange,
-    uint8_t code,
-    uint8_t *raw,
-    size_t raw_len) {
-    if (!exchange) {
-        return -1;
-    }
-    if (exchange->range_count == 0u || exchange->range_chunks_received >= exchange->range_count) {
-        exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
-        return 0;
-    }
-    exchange->range_chunks_received += 1u;
-
-    if (code == LANTERN_REQRESP_RESPONSE_RESOURCE_UNAVAILABLE) {
-        return 0;
-    }
-    if (code != LANTERN_REQRESP_RESPONSE_SUCCESS) {
-        exchange->completed = 1;
-        if (exchange->service->callbacks.blocks_request_complete) {
-            exchange->service->callbacks.blocks_request_complete(
-                exchange->service->callbacks.context,
-                exchange->peer_id_text,
-                NULL,
-                0u,
-                exchange->request_id,
-                exchange->responses_received > 0u ? 1 : 0);
-        }
-        return 0;
-    }
-    if (!raw) {
-        exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
-        return 0;
-    }
-
-    LanternSignedBlock block;
-    lantern_signed_block_init(&block);
-    if (lantern_ssz_decode_signed_block(&block, raw, raw_len) != SSZ_SUCCESS) {
-        lantern_signed_block_reset(&block);
-        exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
-        return 0;
-    }
-
-    uint64_t block_slot = block.block.slot;
-    if (block_slot < exchange->range_start_slot
-        || (block_slot - exchange->range_start_slot) >= exchange->range_count
-        || (exchange->range_has_previous && block_slot <= exchange->range_previous_slot)
-        || (exchange->range_has_previous
-            && memcmp(
-                   block.block.parent_root.bytes,
-                   exchange->range_previous_root.bytes,
-                   LANTERN_ROOT_SIZE)
-                   != 0)) {
-        lantern_signed_block_reset(&block);
-        exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
-        return 0;
-    }
-
-    LanternRoot block_root = {0};
-    if (lantern_hash_tree_root_block(&block.block, &block_root) != SSZ_SUCCESS) {
-        lantern_signed_block_reset(&block);
-        exchange_fail(exchange, LANTERN_REQRESP_ERR_INVALID_PAYLOAD);
-        return 0;
-    }
-
-    int handled = 0;
-    if (exchange->service->callbacks.handle_block_response) {
-        handled = exchange->service->callbacks.handle_block_response(
-            exchange->service->callbacks.context,
-            &block,
-            raw,
-            raw_len,
-            exchange->peer_id_text);
-    }
-    lantern_signed_block_reset(&block);
-    if (handled == 0) {
-        exchange->responses_received += 1u;
-    }
-    exchange->range_previous_slot = block_slot;
-    exchange->range_previous_root = block_root;
-    exchange->range_has_previous = true;
     return 0;
 }
 
@@ -1364,8 +1171,6 @@ static int exchange_parse_outbound_frames(struct lantern_reqresp_exchange *excha
         }
         if (exchange->kind == LANTERN_REQRESP_PROTOCOL_STATUS) {
             (void)exchange_handle_outbound_status_frame(exchange, code, raw, raw_len);
-        } else if (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_RANGE) {
-            (void)exchange_handle_outbound_range_frame(exchange, code, raw, raw_len);
         } else {
             (void)exchange_handle_outbound_block_frame(exchange, code, raw, raw_len);
         }
@@ -1498,17 +1303,6 @@ static libp2p_host_err_t reqresp_on_event(
                         exchange->request_id,
                         1);
                 }
-            } else if (exchange->kind == LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_RANGE) {
-                exchange->completed = 1;
-                if (exchange->service->callbacks.blocks_request_complete) {
-                    exchange->service->callbacks.blocks_request_complete(
-                        exchange->service->callbacks.context,
-                        exchange->peer_id_text,
-                        NULL,
-                        0u,
-                        exchange->request_id,
-                        1);
-                }
             } else {
                 exchange_fail(exchange, LANTERN_REQRESP_ERR_STREAM_READ);
             }
@@ -1558,7 +1352,7 @@ static void reqresp_host_event(
         return;
     }
     if (event->type == LIBP2P_HOST_EVENT_CONN_ESTABLISHED && event->conn) {
-        service_record_conn(service, event->conn);
+        service_record_conn(service, event->conn, event->dial == NULL);
     } else if (event->type == LIBP2P_HOST_EVENT_CONN_CLOSED && event->conn) {
         service_remove_conn(service, event->conn);
     } else if (event->type == LIBP2P_HOST_EVENT_STREAM_OPEN_FAILED && event->user_data) {
@@ -1664,8 +1458,6 @@ static int service_open_exchange(
     size_t frame_len,
     const LanternRoot *roots,
     size_t root_count,
-    uint64_t range_start_slot,
-    uint64_t range_count,
     uint64_t request_id) {
     if (!service || !service->network || !service->network->host || !peer_id || !frame || frame_len == 0u) {
         free(frame);
@@ -1689,8 +1481,6 @@ static int service_open_exchange(
     exchange->write_buf = frame;
     exchange->write_len = frame_len;
     exchange->request_id = request_id;
-    exchange->range_start_slot = range_start_slot;
-    exchange->range_count = range_count;
     if (peer_id_text) {
         (void)lantern_string_copy(
             exchange->peer_id_text,
@@ -1753,8 +1543,6 @@ int lantern_reqresp_service_request_status(
             frame_len,
             NULL,
             0,
-            0,
-            0,
             0)
         != 0) {
         if (service && service->callbacks.status_failure) {
@@ -1789,34 +1577,6 @@ int lantern_reqresp_service_request_blocks(
         frame_len,
         roots,
         root_count,
-        0,
-        0,
-        request_id);
-}
-
-int lantern_reqresp_service_request_blocks_by_range(
-    struct lantern_reqresp_service *service,
-    const struct lantern_peer_id *peer_id,
-    const char *peer_id_text,
-    uint64_t start_slot,
-    uint64_t count,
-    uint64_t request_id) {
-    uint8_t *frame = NULL;
-    size_t frame_len = 0;
-    if (build_blocks_by_range_request_frame(start_slot, count, &frame, &frame_len) != 0) {
-        return -1;
-    }
-    return service_open_exchange(
-        service,
-        peer_id,
-        peer_id_text,
-        LANTERN_REQRESP_PROTOCOL_BLOCKS_BY_RANGE,
-        frame,
-        frame_len,
-        NULL,
-        0,
-        start_slot,
-        count,
         request_id);
 }
 
@@ -1914,22 +1674,4 @@ int lantern_reqresp_read_response_chunk(
         return LANTERN_REQRESP_ERR_PAYLOAD_TOO_LARGE;
     }
     return read_snappy_frame_payload(stream, (size_t)payload_len, out_data, out_len, out_err);
-}
-
-int stream_write_all(struct lantern_reqresp_stream *stream, const uint8_t *data, size_t length, ssize_t *out_err) {
-    if (!stream || (!data && length != 0)) {
-        return LANTERN_REQRESP_ERR_INVALID_PARAM;
-    }
-    size_t offset = 0;
-    while (offset < length) {
-        ssize_t n = stream_write(stream, data + offset, length - offset);
-        if (n <= 0) {
-            if (out_err) {
-                *out_err = n;
-            }
-            return LANTERN_REQRESP_ERR_STREAM_WRITE;
-        }
-        offset += (size_t)n;
-    }
-    return LANTERN_REQRESP_OK;
 }

@@ -190,14 +190,6 @@ static void bitlist_set(struct lantern_bitlist *bitlist, size_t index, bool valu
 }
 
 static void test_validator_index_helpers(void) {
-    assert(lantern_validator_index_is_valid((LanternValidatorIndex)0, 8));
-    assert(lantern_validator_index_is_valid((LanternValidatorIndex)7, 8));
-    assert(!lantern_validator_index_is_valid((LanternValidatorIndex)8, 8));
-
-    assert(lantern_validator_index_is_proposer_for((LanternValidatorIndex)3, 11, 8));
-    assert(!lantern_validator_index_is_proposer_for((LanternValidatorIndex)2, 11, 8));
-    assert(!lantern_validator_index_is_proposer_for((LanternValidatorIndex)0, 1, 0));
-
     size_t subnet_id = SIZE_MAX;
     assert(lantern_validator_index_compute_subnet_id((LanternValidatorIndex)9, 4, &subnet_id) == 0);
     assert(subnet_id == 1);

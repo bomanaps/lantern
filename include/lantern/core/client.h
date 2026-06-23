@@ -12,7 +12,7 @@
 #include "lantern/consensus/runtime.h"
 #include "lantern/consensus/fork_choice.h"
 #include "lantern/genesis/genesis.h"
-#include "lantern/http/metrics.h"
+#include "lantern/metrics/server.h"
 #include "lantern/http/server.h"
 #include "lantern/networking/libp2p.h"
 #include "lantern/networking/gossipsub_service.h"
@@ -128,24 +128,10 @@ struct lantern_pending_block {
     uint32_t backfill_depth;
 };
 
-struct lantern_pending_parent_index_entry {
-    LanternRoot parent_root;
-    LanternRoot *child_roots;
-    size_t length;
-    size_t capacity;
-};
-
-struct lantern_pending_parent_index {
-    struct lantern_pending_parent_index_entry *entries;
-    size_t length;
-    size_t capacity;
-};
-
 struct lantern_pending_block_list {
     struct lantern_pending_block *items;
     size_t length;
     size_t capacity;
-    struct lantern_pending_parent_index parent_index;
 };
 
 struct lantern_pending_vote {
@@ -179,6 +165,14 @@ struct lantern_validator_duty_state {
     bool pending_local_proposal;
     uint64_t pending_local_index;
     bool proposal_signal_pending;
+    bool duty_gate_closed;
+};
+
+struct lantern_connection_peer_ref {
+    const void *conn;
+    struct lantern_peer_id peer;
+    bool inbound;
+    bool closing;
 };
 
 struct lantern_local_validator {
@@ -276,6 +270,9 @@ struct lantern_client {
     struct lantern_string_list connected_peer_ids;
     struct lantern_string_list connected_peer_refs;
     struct lantern_string_list inbound_peer_ids;
+    struct lantern_connection_peer_ref *connection_peer_refs;
+    size_t connection_peer_ref_count;
+    size_t connection_peer_ref_capacity;
     struct lantern_string_list status_failure_peer_ids;
     struct lantern_pending_block_list pending_blocks;
     struct lantern_pending_vote_list pending_gossip_votes;

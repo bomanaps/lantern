@@ -173,13 +173,7 @@ int lantern_attestations_resize(LanternAttestations *list, size_t new_length);
 void lantern_validator_indices_init(LanternValidatorIndices *indices);
 void lantern_validator_indices_reset(LanternValidatorIndices *indices);
 int lantern_validator_indices_append(LanternValidatorIndices *indices, LanternValidatorIndex index);
-int lantern_validator_indices_copy(LanternValidatorIndices *dst, const LanternValidatorIndices *src);
 int lantern_validator_indices_resize(LanternValidatorIndices *indices, size_t new_length);
-bool lantern_validator_index_is_valid(LanternValidatorIndex index, size_t num_validators);
-bool lantern_validator_index_is_proposer_for(
-    LanternValidatorIndex index,
-    uint64_t slot,
-    size_t num_validators);
 int lantern_validator_index_compute_subnet_id(
     LanternValidatorIndex index,
     size_t num_committees,
@@ -221,12 +215,6 @@ int lantern_expand_aggregated_attestations(
     const LanternAggregatedAttestations *aggregated,
     size_t validator_count,
     LanternAttestations *out_attestations);
-int lantern_wrap_attestations_as_aggregated(
-    const LanternAttestations *attestations,
-    LanternAggregatedAttestations *out_aggregated);
-
-const uint8_t *lantern_validator_get_attestation_pubkey(const LanternValidator *validator);
-const uint8_t *lantern_validator_get_proposal_pubkey(const LanternValidator *validator);
 
 void lantern_aggregated_signature_proof_init(LanternAggregatedSignatureProof *proof);
 void lantern_aggregated_signature_proof_reset(LanternAggregatedSignatureProof *proof);
@@ -236,18 +224,12 @@ int lantern_aggregated_signature_proof_copy(
 
 void lantern_signed_aggregated_attestation_init(LanternSignedAggregatedAttestation *attestation);
 void lantern_signed_aggregated_attestation_reset(LanternSignedAggregatedAttestation *attestation);
-int lantern_signed_aggregated_attestation_copy(
-    LanternSignedAggregatedAttestation *dst,
-    const LanternSignedAggregatedAttestation *src);
 
 void lantern_attestation_signatures_init(LanternAttestationSignatures *list);
 void lantern_attestation_signatures_reset(LanternAttestationSignatures *list);
 int lantern_attestation_signatures_append(
     LanternAttestationSignatures *list,
     const LanternAggregatedSignatureProof *proof);
-int lantern_attestation_signatures_copy(
-    LanternAttestationSignatures *dst,
-    const LanternAttestationSignatures *src);
 int lantern_attestation_signatures_resize(LanternAttestationSignatures *list, size_t new_length);
 
 void lantern_signature_list_init(LanternSignatureList *list);

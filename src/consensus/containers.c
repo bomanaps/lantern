@@ -4,178 +4,49 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int ensure_capacity(LanternAttestations *list, size_t required) {
-    if (!list) {
-        return -1;
+static void *grow_capacity(
+    void *items,
+    size_t *capacity,
+    size_t required,
+    size_t element_size,
+    size_t initial_capacity) {
+    if (!capacity || element_size == 0 || initial_capacity == 0) {
+        return NULL;
     }
-    if (list->capacity >= required) {
-        return 0;
+    if (*capacity >= required) {
+        return items;
     }
-
-    size_t new_capacity = list->capacity == 0 ? 4 : list->capacity;
+    size_t new_capacity = *capacity == 0 ? initial_capacity : *capacity;
     while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
+        if (new_capacity > SIZE_MAX / 2) {
+            return NULL;
         }
         new_capacity *= 2;
     }
-
-    LanternVote *items = realloc(list->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
+    if (new_capacity > SIZE_MAX / element_size) {
+        return NULL;
     }
-
-    list->data = items;
-    list->capacity = new_capacity;
-    return 0;
+    void *grown = realloc(items, new_capacity * element_size);
+    if (!grown) {
+        return NULL;
+    }
+    *capacity = new_capacity;
+    return grown;
 }
 
-static int ensure_validator_indices_capacity(LanternValidatorIndices *indices, size_t required) {
-    if (!indices) {
-        return -1;
-    }
-    if (indices->capacity >= required) {
-        return 0;
-    }
-
-    size_t new_capacity = indices->capacity == 0 ? 4 : indices->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-
-    LanternValidatorIndex *items = realloc(indices->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
-    }
-
-    indices->data = items;
-    indices->capacity = new_capacity;
-    return 0;
-}
-
-static int ensure_signature_list_capacity(LanternSignatureList *list, size_t required) {
-    if (!list) {
-        return -1;
-    }
-    if (list->capacity >= required) {
-        return 0;
-    }
-
-    size_t new_capacity = list->capacity == 0 ? 4 : list->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-
-    LanternSignature *items = realloc(list->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
-    }
-
-    list->data = items;
-    list->capacity = new_capacity;
-    return 0;
-}
-
-static int ensure_aggregated_att_capacity(LanternAggregatedAttestations *list, size_t required) {
-    if (!list) {
-        return -1;
-    }
-    if (list->capacity >= required) {
-        return 0;
-    }
-    size_t new_capacity = list->capacity == 0 ? 4 : list->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-
-    LanternAggregatedAttestation *items = realloc(list->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
-    }
-    list->data = items;
-    list->capacity = new_capacity;
-    return 0;
-}
-
-static int ensure_attestation_signature_capacity(LanternAttestationSignatures *list, size_t required) {
-    if (!list) {
-        return -1;
-    }
-    if (list->capacity >= required) {
-        return 0;
-    }
-    size_t new_capacity = list->capacity == 0 ? 4 : list->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-
-    LanternAggregatedSignatureProof *items = realloc(list->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
-    }
-    list->data = items;
-    list->capacity = new_capacity;
-    return 0;
-}
-
-static int ensure_byte_capacity(LanternByteList *list, size_t required) {
-    if (!list) {
-        return -1;
-    }
-    if (list->capacity >= required) {
-        return 0;
-    }
-    size_t new_capacity = list->capacity == 0 ? 64 : list->capacity;
-    while (new_capacity < required) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-
-    uint8_t *items = realloc(list->data, new_capacity * sizeof(*items));
-    if (!items) {
-        return -1;
-    }
-    list->data = items;
-    list->capacity = new_capacity;
-    return 0;
-}
-
-static int ensure_bit_capacity(struct lantern_bitlist *list, size_t required_bytes) {
-    if (!list) {
-        return -1;
-    }
-    if (list->capacity >= required_bytes) {
-        return 0;
-    }
-    size_t new_capacity = list->capacity == 0 ? 4 : list->capacity;
-    while (new_capacity < required_bytes) {
-        if (new_capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        new_capacity *= 2;
-    }
-    uint8_t *bytes = realloc(list->bytes, new_capacity * sizeof(*bytes));
-    if (!bytes) {
-        return -1;
-    }
-    list->bytes = bytes;
-    list->capacity = new_capacity;
-    return 0;
-}
+#define ENSURE_CAPACITY(list, field, required, initial_capacity)                         \
+    do {                                                                                \
+        void *grown = grow_capacity(                                                    \
+            (list)->field,                                                              \
+            &(list)->capacity,                                                          \
+            (required),                                                                 \
+            sizeof(*(list)->field),                                                     \
+            (initial_capacity));                                                        \
+        if (!grown) {                                                                   \
+            return -1;                                                                  \
+        }                                                                               \
+        (list)->field = grown;                                                          \
+    } while (0)
 
 void lantern_attestations_init(LanternAttestations *list) {
     if (!list) {
@@ -200,9 +71,7 @@ int lantern_attestations_append(LanternAttestations *list, const LanternVote *vo
     if (!list || !vote) {
         return -1;
     }
-    if (ensure_capacity(list, list->length + 1) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, list->length + 1, 4);
     list->data[list->length++] = *vote;
     return 0;
 }
@@ -218,9 +87,7 @@ int lantern_attestations_resize(LanternAttestations *list, size_t new_length) {
         list->length = 0;
         return 0;
     }
-    if (ensure_capacity(list, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, new_length, 4);
     if (!list->data) {
         return -1;
     }
@@ -263,30 +130,8 @@ int lantern_validator_indices_append(LanternValidatorIndices *indices, LanternVa
     if (indices->length >= LANTERN_VALIDATOR_REGISTRY_LIMIT) {
         return -1;
     }
-    if (ensure_validator_indices_capacity(indices, indices->length + 1) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(indices, data, indices->length + 1, 4);
     indices->data[indices->length++] = index;
-    return 0;
-}
-
-int lantern_validator_indices_copy(LanternValidatorIndices *dst, const LanternValidatorIndices *src) {
-    if (!dst || !src) {
-        return -1;
-    }
-    if (src->length == 0) {
-        lantern_validator_indices_reset(dst);
-        lantern_validator_indices_init(dst);
-        return 0;
-    }
-    if (src->length > LANTERN_VALIDATOR_REGISTRY_LIMIT || !src->data) {
-        return -1;
-    }
-    if (ensure_validator_indices_capacity(dst, src->length) != 0) {
-        return -1;
-    }
-    memcpy(dst->data, src->data, src->length * sizeof(*src->data));
-    dst->length = src->length;
     return 0;
 }
 
@@ -301,9 +146,7 @@ int lantern_validator_indices_resize(LanternValidatorIndices *indices, size_t ne
         indices->length = 0;
         return 0;
     }
-    if (ensure_validator_indices_capacity(indices, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(indices, data, new_length, 4);
     if (!indices->data) {
         return -1;
     }
@@ -315,20 +158,6 @@ int lantern_validator_indices_resize(LanternValidatorIndices *indices, size_t ne
     }
     indices->length = new_length;
     return 0;
-}
-
-bool lantern_validator_index_is_valid(LanternValidatorIndex index, size_t num_validators) {
-    return (size_t)index < num_validators;
-}
-
-bool lantern_validator_index_is_proposer_for(
-    LanternValidatorIndex index,
-    uint64_t slot,
-    size_t num_validators) {
-    if (num_validators == 0 || num_validators > UINT64_MAX) {
-        return false;
-    }
-    return (slot % (uint64_t)num_validators) == index;
 }
 
 int lantern_validator_index_compute_subnet_id(
@@ -434,9 +263,7 @@ int lantern_bitlist_resize(struct lantern_bitlist *list, size_t new_bit_length) 
         return 0;
     }
     size_t required_bytes = (new_bit_length + 7u) / 8u;
-    if (ensure_bit_capacity(list, required_bytes) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, bytes, required_bytes, 4);
     if (!list->bytes) {
         return -1;
     }
@@ -528,9 +355,7 @@ int lantern_byte_list_resize(LanternByteList *list, size_t new_length) {
         list->length = 0;
         return 0;
     }
-    if (ensure_byte_capacity(list, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, new_length, 64);
     if (!list->data) {
         return -1;
     }
@@ -555,9 +380,7 @@ int lantern_byte_list_copy(LanternByteList *dst, const LanternByteList *src) {
     if (src->length > LANTERN_AGG_PROOF_MAX_BYTES) {
         return -1;
     }
-    if (ensure_byte_capacity(dst, src->length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(dst, data, src->length, 64);
     if (!dst->data || (src->length > 0 && !src->data)) {
         return -1;
     }
@@ -632,9 +455,7 @@ int lantern_aggregated_attestations_append(
     if (!list || !attestation) {
         return -1;
     }
-    if (ensure_aggregated_att_capacity(list, list->length + 1) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, list->length + 1, 4);
     if (list->length >= list->capacity) {
         return -1;
     }
@@ -658,9 +479,7 @@ int lantern_aggregated_attestations_copy(
         lantern_aggregated_attestations_init(dst);
         return 0;
     }
-    if (ensure_aggregated_att_capacity(dst, src->length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(dst, data, src->length, 4);
     for (size_t i = dst->length; i < src->length; ++i) {
         lantern_aggregated_attestation_init(&dst->data[i]);
     }
@@ -686,9 +505,7 @@ int lantern_aggregated_attestations_resize(LanternAggregatedAttestations *list, 
         list->length = 0;
         return 0;
     }
-    if (ensure_aggregated_att_capacity(list, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, new_length, 4);
     size_t old_length = list->length;
     if (new_length > old_length) {
         for (size_t i = old_length; i < new_length; ++i) {
@@ -761,62 +578,6 @@ int lantern_expand_aggregated_attestations(
     return rc;
 }
 
-int lantern_wrap_attestations_as_aggregated(
-    const LanternAttestations *attestations,
-    LanternAggregatedAttestations *out_aggregated) {
-    if (!attestations || !out_aggregated) {
-        return -1;
-    }
-    if (lantern_aggregated_attestations_resize(out_aggregated, 0) != 0) {
-        return -1;
-    }
-    if (attestations->length == 0) {
-        return 0;
-    }
-    if (!attestations->data) {
-        return -1;
-    }
-    for (size_t i = 0; i < attestations->length; ++i) {
-        const LanternVote *vote = &attestations->data[i];
-        LanternAggregatedAttestation att;
-        lantern_aggregated_attestation_init(&att);
-        att.data.slot = vote->slot;
-        att.data.head = vote->head;
-        att.data.target = vote->target;
-        att.data.source = vote->source;
-
-        LanternValidatorIndices indices;
-        lantern_validator_indices_init(&indices);
-        if (lantern_validator_indices_append(&indices, vote->validator_id) != 0
-            || lantern_aggregation_bits_from_validator_indices(&att.aggregation_bits, &indices) != 0) {
-            lantern_validator_indices_reset(&indices);
-            lantern_aggregated_attestation_reset(&att);
-            return -1;
-        }
-        lantern_validator_indices_reset(&indices);
-        if (lantern_aggregated_attestations_append(out_aggregated, &att) != 0) {
-            lantern_aggregated_attestation_reset(&att);
-            return -1;
-        }
-        lantern_aggregated_attestation_reset(&att);
-    }
-    return 0;
-}
-
-const uint8_t *lantern_validator_get_attestation_pubkey(const LanternValidator *validator) {
-    if (!validator) {
-        return NULL;
-    }
-    return validator->attestation_pubkey;
-}
-
-const uint8_t *lantern_validator_get_proposal_pubkey(const LanternValidator *validator) {
-    if (!validator) {
-        return NULL;
-    }
-    return validator->proposal_pubkey;
-}
-
 void lantern_aggregated_signature_proof_init(LanternAggregatedSignatureProof *proof) {
     if (!proof) {
         return;
@@ -871,19 +632,6 @@ void lantern_signed_aggregated_attestation_reset(LanternSignedAggregatedAttestat
     lantern_aggregated_signature_proof_reset(&attestation->proof);
 }
 
-int lantern_signed_aggregated_attestation_copy(
-    LanternSignedAggregatedAttestation *dst,
-    const LanternSignedAggregatedAttestation *src) {
-    if (!dst || !src) {
-        return -1;
-    }
-    dst->data = src->data;
-    if (lantern_aggregated_signature_proof_copy(&dst->proof, &src->proof) != 0) {
-        return -1;
-    }
-    return 0;
-}
-
 void lantern_attestation_signatures_init(LanternAttestationSignatures *list) {
     if (!list) {
         return;
@@ -914,9 +662,7 @@ int lantern_attestation_signatures_append(
     if (!list || !proof) {
         return -1;
     }
-    if (ensure_attestation_signature_capacity(list, list->length + 1) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, list->length + 1, 4);
     if (list->length >= list->capacity) {
         return -1;
     }
@@ -926,32 +672,6 @@ int lantern_attestation_signatures_append(
         return -1;
     }
     list->length += 1;
-    return 0;
-}
-
-int lantern_attestation_signatures_copy(
-    LanternAttestationSignatures *dst,
-    const LanternAttestationSignatures *src) {
-    if (!dst || !src) {
-        return -1;
-    }
-    if (src->length == 0) {
-        lantern_attestation_signatures_reset(dst);
-        lantern_attestation_signatures_init(dst);
-        return 0;
-    }
-    if (ensure_attestation_signature_capacity(dst, src->length) != 0) {
-        return -1;
-    }
-    for (size_t i = dst->length; i < src->length; ++i) {
-        lantern_aggregated_signature_proof_init(&dst->data[i]);
-    }
-    for (size_t i = 0; i < src->length; ++i) {
-        if (lantern_aggregated_signature_proof_copy(&dst->data[i], &src->data[i]) != 0) {
-            return -1;
-        }
-    }
-    dst->length = src->length;
     return 0;
 }
 
@@ -968,9 +688,7 @@ int lantern_attestation_signatures_resize(LanternAttestationSignatures *list, si
         list->length = 0;
         return 0;
     }
-    if (ensure_attestation_signature_capacity(list, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, new_length, 4);
     size_t old_length = list->length;
     if (new_length > old_length) {
         for (size_t i = old_length; i < new_length; ++i) {
@@ -1008,9 +726,7 @@ int lantern_signature_list_append(LanternSignatureList *list, const LanternSigna
     if (!list || !signature) {
         return -1;
     }
-    if (ensure_signature_list_capacity(list, list->length + 1) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, list->length + 1, 4);
     list->data[list->length++] = *signature;
     return 0;
 }
@@ -1026,9 +742,7 @@ int lantern_signature_list_resize(LanternSignatureList *list, size_t new_length)
         list->length = 0;
         return 0;
     }
-    if (ensure_signature_list_capacity(list, new_length) != 0) {
-        return -1;
-    }
+    ENSURE_CAPACITY(list, data, new_length, 4);
     if (!list->data) {
         return -1;
     }

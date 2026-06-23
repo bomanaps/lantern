@@ -56,6 +56,7 @@ set(LANTERN_LIBRARY_SOURCES
 		    src/core/client_validator.c
 		    src/genesis/genesis.c
 		    src/genesis/genesis_parse.c
+		    src/genesis/genesis_parse_helpers.c
 		    src/genesis/genesis_parse_registry.c
 		    src/genesis/genesis_validator_config.c
 		    src/encoding/snappy.c
@@ -68,8 +69,9 @@ set(LANTERN_LIBRARY_SOURCES
     src/networking/messages.c
     src/encoding/rlp.c
     src/metrics/lean_metrics.c
-    src/http/common.c
-    src/http/metrics.c
+    src/metrics/server.c
+    src/http/client.c
+    src/http/core.c
     src/http/server.c
     src/test_driver/driver.c
     src/storage/storage.c

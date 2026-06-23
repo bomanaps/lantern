@@ -40,10 +40,6 @@ static void format_root_hex(const LanternRoot *root, char *out, size_t out_len) 
     }
 }
 
-static bool finalization_trace_enabled(void) {
-    return false;
-}
-
 static uint64_t lantern_state_justified_slots_anchor(const LanternState *state) {
     if (!state || state->latest_finalized.slot == UINT64_MAX) {
         return 0u;
@@ -86,12 +82,6 @@ static int collect_attestations_for_checkpoint(
     struct lantern_root_list *processed_data_roots,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures);
-static int lantern_state_process_attestations_internal(
-    LanternState *state,
-    LanternStore *store,
-    const LanternAttestations *attestations,
-    const LanternSignatureList *signatures,
-    bool apply_consensus_effects);
 static lantern_state_aggregate_result state_select_child_proofs_from_pool(
     const struct lantern_aggregated_payload_pool *pool,
     const LanternRoot *data_root,
@@ -1203,6 +1193,24 @@ static bool lantern_root_is_zero(const LanternRoot *root) {
     return true;
 }
 
+static bool lantern_checkpoint_matches_history(
+    const LanternCheckpoint *checkpoint,
+    const struct lantern_root_list *history) {
+    if (!checkpoint || !history || lantern_root_is_zero(&checkpoint->root) || checkpoint->slot > SIZE_MAX) {
+        return false;
+    }
+    size_t slot = (size_t)checkpoint->slot;
+    return slot < history->length
+        && memcmp(checkpoint->root.bytes, history->items[slot].bytes, LANTERN_ROOT_SIZE) == 0;
+}
+
+static bool lantern_vote_matches_history(const LanternVote *vote, const struct lantern_root_list *history) {
+    return vote
+        && lantern_checkpoint_matches_history(&vote->source, history)
+        && lantern_checkpoint_matches_history(&vote->target, history)
+        && lantern_checkpoint_matches_history(&vote->head, history);
+}
+
 static uint64_t lantern_u64_isqrt(uint64_t value) {
     uint64_t result = 0;
     uint64_t bit = 1ull << 62;
@@ -1407,31 +1415,13 @@ int lantern_state_get_justified_slot_bit(const LanternState *state, uint64_t slo
     }
     if (!lantern_state_slot_in_justified_window(state, slot)) {
         *out_value = false;
-        if (finalization_trace_enabled()) {
-            lantern_log_debug(
-                "state",
-                &(const struct lantern_log_metadata){.has_slot = true, .slot = state->slot},
-                "justification trace read slot=%" PRIu64 " value=false (outside window anchor=%" PRIu64 ")",
-                slot,
-                anchor);
-        }
         return 0;
     }
     uint64_t relative = slot - anchor;
     if (relative > SIZE_MAX) {
         return -1;
     }
-    int rc = lantern_bitlist_get_bit(&state->justified_slots, (size_t)relative, out_value);
-    if (rc == 0 && finalization_trace_enabled()) {
-        lantern_log_debug(
-            "state",
-            &(const struct lantern_log_metadata){.has_slot = true, .slot = state->slot},
-            "justification trace read slot=%" PRIu64 " value=%s anchor=%" PRIu64,
-            slot,
-            *out_value ? "true" : "false",
-            anchor);
-    }
-    return rc;
+    return lantern_bitlist_get_bit(&state->justified_slots, (size_t)relative, out_value);
 }
 
 static int lantern_state_ensure_justified_slot_index(LanternState *state, uint64_t slot, size_t *out_index) {
@@ -1574,75 +1564,44 @@ static int lantern_state_add_justification_root(
         insert_pos++;
     }
 
-    /* First, expand the root list by appending (we'll shift elements afterward) */
     if (lantern_root_list_append(&state->justification_roots, root) != 0) {
         return -1;
     }
 
-    /* Expand justification_validators bitlist by validator_count bits */
     size_t old_root_count = state->justification_roots.length - 1;
     size_t new_bit_length = state->justification_validators.bit_length + validator_count;
     if (lantern_bitlist_ensure_length(&state->justification_validators, new_bit_length) != 0) {
-        /* Rollback root addition */
         state->justification_roots.length--;
         return -1;
     }
 
-    /* If inserting at the end, we're done - no shifting needed */
     if (insert_pos == old_root_count) {
         return (int)insert_pos;
     }
 
-    /* Shift roots from insert_pos to make room for the new root.
-     * The new root is currently at the end, we need to move it to insert_pos. */
-    LanternRoot temp_root = state->justification_roots.items[old_root_count];
-    for (size_t i = old_root_count; i > insert_pos; --i) {
-        state->justification_roots.items[i] = state->justification_roots.items[i - 1];
+    LanternRoot inserted = state->justification_roots.items[old_root_count];
+    memmove(
+        &state->justification_roots.items[insert_pos + 1u],
+        &state->justification_roots.items[insert_pos],
+        (old_root_count - insert_pos) * sizeof(*state->justification_roots.items));
+    state->justification_roots.items[insert_pos] = inserted;
+
+    for (size_t row = old_root_count; row > insert_pos; --row) {
+        size_t dst = row * validator_count;
+        size_t src = (row - 1u) * validator_count;
+        for (size_t validator = 0; validator < validator_count; ++validator) {
+            bool bit = false;
+            if (lantern_bitlist_get_bit(&state->justification_validators, src + validator, &bit) != 0
+                || lantern_bitlist_set_bit(&state->justification_validators, dst + validator, bit) != 0) {
+                return -1;
+            }
+        }
     }
-    state->justification_roots.items[insert_pos] = temp_root;
-
-    /* Shift validator bits to match the new root order.
-     * We need to move bits from [insert_pos * validator_count] onward.
-     * The bits for the new root (currently at the end) should move to insert_pos. */
-    size_t bits_to_shift = (old_root_count - insert_pos) * validator_count;
-    if (bits_to_shift > 0) {
-        /* Create a temporary buffer to hold the bits we need to shift */
-        size_t shift_start_bit = insert_pos * validator_count;
-
-        /* Copy existing bits from [shift_start_bit, shift_start_bit + bits_to_shift) onward to temporary storage */
-        size_t temp_bytes_needed = (bits_to_shift + 7) / 8;
-        uint8_t *temp_bits = (uint8_t *)calloc(temp_bytes_needed, 1);
-        if (!temp_bits) {
-            /* Can't shift bits - this is a critical error but we'll proceed with unsorted */
-            return (int)insert_pos;
+    size_t insert_start = insert_pos * validator_count;
+    for (size_t validator = 0; validator < validator_count; ++validator) {
+        if (lantern_bitlist_set_bit(&state->justification_validators, insert_start + validator, false) != 0) {
+            return -1;
         }
-
-        /* Extract bits from [shift_start_bit, shift_start_bit + bits_to_shift) */
-        for (size_t i = 0; i < bits_to_shift; ++i) {
-            bool bit_value = false;
-            if (lantern_bitlist_get_bit(&state->justification_validators, shift_start_bit + i, &bit_value) == 0 && bit_value) {
-                temp_bits[i / 8] |= (uint8_t)(1u << (i % 8));
-            }
-        }
-
-        /* Clear the region we're about to rewrite: [shift_start_bit, new_bit_length) */
-        for (size_t i = shift_start_bit; i < new_bit_length; ++i) {
-            lantern_bitlist_set_bit(&state->justification_validators, i, false);
-        }
-
-        /* Write zeros at insert_pos (validator_count bits) - new root votes are all false */
-        /* (already done by clearing above) */
-
-        /* Write shifted bits starting at (insert_pos + 1) * validator_count */
-        size_t dest_start = (insert_pos + 1) * validator_count;
-        for (size_t i = 0; i < bits_to_shift; ++i) {
-            bool bit_value = (temp_bits[i / 8] & (1u << (i % 8))) != 0;
-            if (bit_value) {
-                lantern_bitlist_set_bit(&state->justification_validators, dest_start + i, true);
-            }
-        }
-
-        free(temp_bits);
     }
 
     return (int)insert_pos;
@@ -1880,10 +1839,6 @@ size_t lantern_state_validator_count(const LanternState *state) {
     return state->validator_count;
 }
 
-const uint8_t *lantern_state_validator_pubkey(const LanternState *state, size_t index) {
-    return lantern_state_validator_attestation_pubkey(state, index);
-}
-
 const uint8_t *lantern_state_validator_attestation_pubkey(const LanternState *state, size_t index) {
     if (!state || !state->validators || index >= state->validator_count) {
         return NULL;
@@ -2035,17 +1990,7 @@ int lantern_state_mark_justified_slot(LanternState *state, uint64_t slot) {
     if (slot > SIZE_MAX) {
         return -1;
     }
-    int rc = lantern_state_set_justified_slot_bit(state, slot, true);
-    if (rc == 0 && finalization_trace_enabled()) {
-        lantern_log_debug(
-            "state",
-            &(const struct lantern_log_metadata){.has_slot = true, .slot = state->slot},
-            "justification trace mark slot=%" PRIu64 " anchor=%" PRIu64 " window=%zu",
-            slot,
-            lantern_state_justified_slots_anchor(state),
-            state->justified_slots.bit_length);
-    }
-    return rc;
+    return lantern_state_set_justified_slot_bit(state, slot, true);
 }
 
 int lantern_state_process_block_header(LanternState *state, const LanternBlock *block) {
@@ -2165,12 +2110,11 @@ int lantern_state_process_block_header(LanternState *state, const LanternBlock *
     return 0;
 }
 
-static int lantern_state_process_attestations_internal(
+int lantern_state_process_attestations(
     LanternState *state,
     LanternStore *store,
     const LanternAttestations *attestations,
-    const LanternSignatureList *signatures,
-    bool apply_consensus_effects) {
+    const LanternSignatureList *signatures) {
     if (!state || !store || !attestations) {
         return -1;
     }
@@ -2179,7 +2123,6 @@ static int lantern_state_process_attestations_internal(
         return -1;
     }
     size_t validator_count = (size_t)validator_count_u64;
-    bool trace_finalization = finalization_trace_enabled();
     const struct lantern_log_metadata meta = {
         .has_slot = true,
         .slot = state->slot,
@@ -2230,30 +2173,8 @@ static int lantern_state_process_attestations_internal(
             /* LeanSpec: silently skip if target <= source (state.py:406) */
             continue;
         }
-        if (vote->source.slot > SIZE_MAX || vote->target.slot > SIZE_MAX || vote->head.slot > SIZE_MAX) {
-            lantern_log_warn(
-                "state",
-                &meta,
-                "attestation rejected: slot range (%" PRIu64 ", %" PRIu64 ", %" PRIu64
-                ") exceeds size_t capacity",
-                vote->source.slot,
-                vote->target.slot,
-                vote->head.slot);
-            record_attestation_validation_metric(att_validation_start, false);
-            continue;
-        }
         if (!lantern_state_slot_in_justified_window(state, vote->source.slot)) {
             /* LeanSpec: silently skip attestations with source outside justified window */
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip source_outside_window source_slot=%" PRIu64
-                    " window=[%" PRIu64 ",%" PRIu64 ")",
-                    vote->source.slot,
-                    lantern_state_justified_slots_anchor(state),
-                    lantern_state_justified_slots_anchor(state) + state->justified_slots.bit_length);
-            }
             continue;
         }
         bool source_is_justified = false;
@@ -2261,109 +2182,22 @@ static int lantern_state_process_attestations_internal(
          * loop may unlock later votes in the same block. */
         if (lantern_state_get_justified_slot_bit(state, vote->source.slot, &source_is_justified) != 0) {
             /* LeanSpec: silently skip if we can't read source justified status */
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip source_bit_unreadable source_slot=%" PRIu64,
-                    vote->source.slot);
-            }
             continue;
         }
         if (!source_is_justified) {
             /* LeanSpec: silently skip attestations with unjustified source (state.py:386) */
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip source_unjustified source_slot=%" PRIu64,
-                    vote->source.slot);
-            }
-            continue;
-        }
-
-        if (lantern_root_is_zero(&vote->source.root)
-            || lantern_root_is_zero(&vote->target.root)
-            || lantern_root_is_zero(&vote->head.root)) {
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip zero_hash_vote source_slot=%" PRIu64
-                    " target_slot=%" PRIu64 " head_slot=%" PRIu64,
-                    vote->source.slot,
-                    vote->target.slot,
-                    vote->head.slot);
-            }
             continue;
         }
 
         /* LeanSpec: skip if source, target, or head root mismatches history. */
-        bool source_matches = false;
-        size_t source_slot_idx = (size_t)vote->source.slot;
-        if (source_slot_idx < state->historical_block_hashes.length) {
-            source_matches = memcmp(
-                vote->source.root.bytes,
-                state->historical_block_hashes.items[source_slot_idx].bytes,
-                LANTERN_ROOT_SIZE) == 0;
-        }
-
-        bool target_matches = false;
-        size_t target_slot_idx = (size_t)vote->target.slot;
-        if (target_slot_idx < state->historical_block_hashes.length) {
-            target_matches = memcmp(
-                vote->target.root.bytes,
-                state->historical_block_hashes.items[target_slot_idx].bytes,
-                LANTERN_ROOT_SIZE) == 0;
-        }
-
-        bool head_matches = false;
-        if (vote->head.slot <= SIZE_MAX) {
-            size_t head_slot_idx = (size_t)vote->head.slot;
-            if (head_slot_idx < state->historical_block_hashes.length) {
-                head_matches = memcmp(
-                    vote->head.root.bytes,
-                    state->historical_block_hashes.items[head_slot_idx].bytes,
-                    LANTERN_ROOT_SIZE) == 0;
-            }
-        }
-
-        if (!source_matches || !target_matches || !head_matches) {
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip roots_mismatch source_slot=%" PRIu64
-                    " target_slot=%" PRIu64 " head_slot=%" PRIu64,
-                    vote->source.slot,
-                    vote->target.slot,
-                    vote->head.slot);
-            }
+        if (!lantern_vote_matches_history(vote, &state->historical_block_hashes)) {
             continue;
         }
 
-        if (trace_finalization) {
-            lantern_log_debug(
-                "state",
-                &meta,
-                "finalization trace validator=%" PRIu64 " vote_slot=%" PRIu64 " source_slot=%" PRIu64
-                " target_slot=%" PRIu64,
-                vote->validator_id,
-                vote->slot,
-                vote->source.slot,
-                vote->target.slot);
-        }
         bool target_is_justified = false;
         if (lantern_state_slot_in_justified_window(state, vote->target.slot)) {
             if (lantern_state_get_justified_slot_bit(state, vote->target.slot, &target_is_justified) != 0) {
                 /* LeanSpec: silently skip if we can't read target justified status */
-                if (trace_finalization) {
-                    lantern_log_debug(
-                        "state",
-                        &meta,
-                        "finalization trace skip target_bit_unreadable target_slot=%" PRIu64,
-                        vote->target.slot);
-                }
                 continue;
             }
         }
@@ -2378,34 +2212,14 @@ static int lantern_state_process_attestations_internal(
             return -1;
         }
 
-        if (!apply_consensus_effects) {
-            record_attestation_validation_metric(att_validation_start, true);
-            continue;
-        }
-
         /* Skip if target is already justified (leanSpec line 394) */
         if (target_is_justified) {
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip target_already_justified target_slot=%" PRIu64,
-                    vote->target.slot);
-            }
             record_attestation_validation_metric(att_validation_start, true);
             continue;
         }
 
         /* Target slot must remain justifiable after the current finalized slot. */
         if (!lantern_slot_is_justifiable(vote->target.slot, finalized_slot)) {
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace skip non-justifiable target_slot=%" PRIu64 " finalized=%" PRIu64,
-                    vote->target.slot,
-                    finalized_slot);
-            }
             record_attestation_validation_metric(att_validation_start, true);
             continue;
         }
@@ -2423,14 +2237,6 @@ static int lantern_state_process_attestations_internal(
                     vote->target.slot);
                 record_attestation_validation_metric(att_validation_start, false);
                 continue;
-            }
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace added justification root for target_slot=%" PRIu64 " root_idx=%d",
-                    vote->target.slot,
-                    root_idx);
             }
         }
 
@@ -2453,40 +2259,15 @@ static int lantern_state_process_attestations_internal(
         size_t vote_count = lantern_state_count_justification_votes(state, root_idx, validator_count);
         size_t quorum = lantern_quorum_threshold(validator_count_u64);
 
-        if (trace_finalization) {
-            lantern_log_debug(
-                "state",
-                &meta,
-                "finalization trace validator=%" PRIu64 " target_slot=%" PRIu64 " votes=%zu quorum=%zu",
-                vote->validator_id,
-                vote->target.slot,
-                vote_count,
-                quorum);
-        }
-
         /* Check if 2/3 supermajority reached (leanSpec line 428: 3 * count >= 2 * validators) */
-        bool target_was_justified = false;
         if (vote_count >= quorum) {
             /* Supermajority reached - mark as justified */
             if (lantern_state_mark_justified_slot(state, vote->target.slot) != 0) {
                 record_attestation_validation_metric(att_validation_start, false);
                 return -1;
             }
-            target_is_justified = true;
-            target_was_justified = true;
-
             if (vote->target.slot > latest_justified.slot) {
                 latest_justified = vote->target;
-            }
-
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace marked target slot=%" PRIu64 " justified (votes=%zu quorum=%zu)",
-                    vote->target.slot,
-                    vote_count,
-                    quorum);
             }
 
             /* Clean up tracking for this root (leanSpec line 431) */
@@ -2498,25 +2279,15 @@ static int lantern_state_process_attestations_internal(
                     vote->target.slot);
             }
 
-            /* Finalization: if the target is the next valid justifiable slot after source
-             * relative to the current finalized boundary, finalize the source checkpoint.
+            /* Finalization: if the source is newer than the finalized boundary and
+             * the target is the next valid justifiable slot after source relative
+             * to that boundary, finalize the source checkpoint.
              */
-            bool has_justifiable_between = has_justifiable_slot_between(
-                vote->source.slot, vote->target.slot, finalized_slot);
-            bool vote_has_consecutive_source = !has_justifiable_between;
-
-            if (trace_finalization) {
-                lantern_log_debug(
-                    "state",
-                    &meta,
-                    "finalization trace validator=%" PRIu64 " target_was_justified=%s vote_consecutive=%s "
-                    "latest_finalized=%" PRIu64 " latest_justified=%" PRIu64,
-                    vote->validator_id,
-                    target_was_justified ? "true" : "false",
-                    vote_has_consecutive_source ? "true" : "false",
-                    latest_finalized.slot,
-                    latest_justified.slot);
-            }
+            bool source_after_finalized = vote->source.slot > finalized_slot;
+            bool has_justifiable_between =
+                source_after_finalized
+                && has_justifiable_slot_between(vote->source.slot, vote->target.slot, finalized_slot);
+            bool vote_has_consecutive_source = source_after_finalized && !has_justifiable_between;
 
             if (vote_has_consecutive_source) {
                 /* Finalize the source checkpoint */
@@ -2558,67 +2329,41 @@ static int lantern_state_process_attestations_internal(
                         return -1;
                     }
                 }
-                if (trace_finalization) {
-                    lantern_log_debug(
-                        "state",
-                        &meta,
-                        "finalization trace updated checkpoints finalized=%" PRIu64 " justified=%" PRIu64,
-                        latest_finalized.slot,
-                        latest_justified.slot);
-                }
             }
         }
 
         record_attestation_validation_metric(att_validation_start, true);
     }
 
-    if (apply_consensus_effects) {
-        if (lantern_state_mark_justified_slot(state, latest_justified.slot) != 0) {
-            if (finalization_attempted) {
-                lean_metrics_record_finalization_attempt(false);
-            }
-            return -1;
+    if (lantern_state_mark_justified_slot(state, latest_justified.slot) != 0) {
+        if (finalization_attempted) {
+            lean_metrics_record_finalization_attempt(false);
         }
-        if (lantern_state_mark_justified_slot(state, latest_finalized.slot) != 0) {
-            if (finalization_attempted) {
-                lean_metrics_record_finalization_attempt(false);
-            }
-            return -1;
+        return -1;
+    }
+    if (lantern_state_mark_justified_slot(state, latest_finalized.slot) != 0) {
+        if (finalization_attempted) {
+            lean_metrics_record_finalization_attempt(false);
         }
+        return -1;
+    }
 
-        state->latest_justified = latest_justified;
-        state->latest_finalized = latest_finalized;
-        if (trace_finalization) {
-            lantern_log_debug(
-                "state",
-                &meta,
-                "finalization trace commit finalized=%" PRIu64 " justified=%" PRIu64,
-                state->latest_finalized.slot,
-                state->latest_justified.slot);
-        }
-        if (store->fork_choice) {
-            if (lantern_fork_choice_update_checkpoints(
-                    store->fork_choice,
-                    &state->latest_justified,
-                    &state->latest_finalized)
-                != 0) {
-                if (finalization_attempted) {
-                    lean_metrics_record_finalization_attempt(false);
-                }
-                return -1;
+    state->latest_justified = latest_justified;
+    state->latest_finalized = latest_finalized;
+    if (store->fork_choice) {
+        if (lantern_fork_choice_update_checkpoints(
+                store->fork_choice,
+                &state->latest_justified,
+                &state->latest_finalized)
+            != 0) {
+            if (finalization_attempted) {
+                lean_metrics_record_finalization_attempt(false);
             }
+            return -1;
         }
     }
     lean_metrics_record_state_transition_attestations(att_attempted, lantern_time_now_seconds() - att_batch_start);
     return 0;
-}
-
-int lantern_state_process_attestations(
-    LanternState *state,
-    LanternStore *store,
-    const LanternAttestations *attestations,
-    const LanternSignatureList *signatures) {
-    return lantern_state_process_attestations_internal(state, store, attestations, signatures, true);
 }
 
 int lantern_state_process_block(
@@ -2778,7 +2523,6 @@ int lantern_state_transition(LanternState *state, LanternStore *store, const Lan
         if (lantern_fork_choice_add_block_with_state(
                 store->fork_choice,
                 block,
-                NULL,
                 &state->latest_justified,
                 &state->latest_finalized,
                 NULL,
@@ -3078,7 +2822,6 @@ int lantern_state_compute_vote_checkpoints(
     }
 
     const LanternForkChoice *fork_choice = store->fork_choice;
-    bool trace_finalization = finalization_trace_enabled();
     LanternRoot head_root;
     if (lantern_fork_choice_current_head(fork_choice, &head_root) != 0) {
         return -1;
@@ -3087,11 +2830,6 @@ int lantern_state_compute_vote_checkpoints(
     if (!base_state) {
         base_state = state;
     }
-    struct lantern_log_metadata trace_meta = {.has_slot = true, .slot = base_state->slot};
-    char head_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-    char target_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-    char parent_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-    char safe_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
     uint64_t head_slot = 0;
     if (lantern_fork_choice_block_info(fork_choice, &head_root, &head_slot, NULL, NULL) != 0) {
         return -1;
@@ -3112,15 +2850,6 @@ int lantern_state_compute_vote_checkpoints(
     }
     LanternRoot target_root = head_root;
     uint64_t target_slot = head_slot;
-    if (trace_finalization) {
-        format_root_hex(&head_root, head_hex, sizeof(head_hex));
-        lantern_log_debug(
-            "state",
-            &trace_meta,
-            "finalization trace checkpoints head slot=%" PRIu64 " root=%s",
-            head_slot,
-            head_hex[0] ? head_hex : "0x0");
-    }
 
     uint64_t safe_slot = head_slot;
     bool has_safe = false;
@@ -3130,19 +2859,12 @@ int lantern_state_compute_vote_checkpoints(
             return -1;
         }
         has_safe = true;
-        if (trace_finalization) {
-            format_root_hex(safe_ptr, safe_hex, sizeof(safe_hex));
-            lantern_log_debug(
-                "state",
-                &trace_meta,
-                "finalization trace checkpoints safe_target slot=%" PRIu64 " root=%s",
-                safe_slot,
-                safe_hex[0] ? safe_hex : "0x0");
-        }
     }
 
     if (has_safe) {
-        for (size_t i = 0; i < 3 && target_slot > safe_slot; ++i) {
+        uint64_t lower_bound_slot =
+            safe_slot > finalized_checkpoint.slot ? safe_slot : finalized_checkpoint.slot;
+        for (size_t i = 0; i < 3 && target_slot > lower_bound_slot; ++i) {
             LanternRoot parent_root;
             bool has_parent = false;
             if (lantern_fork_choice_block_info(
@@ -3161,26 +2883,11 @@ int lantern_state_compute_vote_checkpoints(
             if (lantern_fork_choice_block_info(fork_choice, &parent_root, &parent_slot, NULL, NULL) != 0) {
                 return -1;
             }
-            if (trace_finalization) {
-                format_root_hex(&target_root, target_hex, sizeof(target_hex));
-                format_root_hex(&parent_root, parent_hex, sizeof(parent_hex));
-                lantern_log_debug(
-                    "state",
-                    &trace_meta,
-                    "finalization trace checkpoints safe_step=%zu current_slot=%" PRIu64
-                    " parent_slot=%" PRIu64 " root=%s parent=%s",
-                    i + 1,
-                    target_slot,
-                    parent_slot,
-                    target_hex[0] ? target_hex : "0x0",
-                    parent_hex[0] ? parent_hex : "0x0");
-            }
             target_root = parent_root;
             target_slot = parent_slot;
         }
     }
 
-    bool justifiable_slot_found = true;
     while (!lantern_slot_is_justifiable(target_slot, finalized_checkpoint.slot)) {
         LanternRoot parent_root;
         bool has_parent = false;
@@ -3194,7 +2901,6 @@ int lantern_state_compute_vote_checkpoints(
             return -1;
         }
         if (!has_parent) {
-            justifiable_slot_found = false;
             break;
         }
         uint64_t parent_slot = 0;
@@ -3202,46 +2908,10 @@ int lantern_state_compute_vote_checkpoints(
             return -1;
         }
         if (parent_slot < finalized_checkpoint.slot) {
-            justifiable_slot_found = false;
-            if (trace_finalization) {
-                format_root_hex(&target_root, target_hex, sizeof(target_hex));
-                format_root_hex(&parent_root, parent_hex, sizeof(parent_hex));
-                lantern_log_debug(
-                    "state",
-                    &trace_meta,
-                    "finalization trace checkpoints justifiable_stop target_slot=%" PRIu64
-                    " parent_slot=%" PRIu64 " root=%s parent=%s",
-                    target_slot,
-                    parent_slot,
-                    target_hex[0] ? target_hex : "0x0",
-                    parent_hex[0] ? parent_hex : "0x0");
-            }
             break;
-        }
-        if (trace_finalization) {
-            format_root_hex(&target_root, target_hex, sizeof(target_hex));
-            format_root_hex(&parent_root, parent_hex, sizeof(parent_hex));
-            lantern_log_debug(
-                "state",
-                &trace_meta,
-                "finalization trace checkpoints justifiable_step target_slot=%" PRIu64
-                " parent_slot=%" PRIu64 " root=%s parent=%s",
-                target_slot,
-                parent_slot,
-                target_hex[0] ? target_hex : "0x0",
-                parent_hex[0] ? parent_hex : "0x0");
         }
         target_root = parent_root;
         target_slot = parent_slot;
-    }
-    if (trace_finalization && !justifiable_slot_found) {
-        lantern_log_debug(
-            "state",
-            &trace_meta,
-            "finalization trace checkpoints justifiable_slot_unreachable finalized=%" PRIu64
-            " current=%" PRIu64,
-            finalized_checkpoint.slot,
-            target_slot);
     }
 
     out_head->root = head_root;
@@ -3249,14 +2919,5 @@ int lantern_state_compute_vote_checkpoints(
     out_target->root = target_root;
     out_target->slot = target_slot;
     *out_source = source_checkpoint;
-    if (trace_finalization) {
-        lantern_log_debug(
-            "state",
-            &trace_meta,
-            "finalization trace checkpoints head=%" PRIu64 " target=%" PRIu64 " source=%" PRIu64,
-            out_head->slot,
-            out_target->slot,
-            out_source->slot);
-    }
     return 0;
 }

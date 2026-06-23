@@ -13,6 +13,7 @@
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/state.h"
 #include "lantern/core/client.h"
+#include "lantern/http/client.h"
 #include "lantern/storage/storage.h"
 #include "lantern/support/strings.h"
 
@@ -319,7 +320,6 @@ static int test_checkpoint_consumers_use_fork_choice_store(void)
     if (lantern_fork_choice_add_block(
             &client.fork_choice,
             &grandchild_block.block,
-            NULL,
             &client.state.latest_justified,
             &client.state.latest_finalized,
             &grandchild_root)
@@ -582,89 +582,77 @@ cleanup:
 
 static int test_checkpoint_sync_parse_url_scheme_handling(void)
 {
-    char *host = NULL;
-    char *base_path = NULL;
-    uint16_t port = 0;
+    struct lantern_http_url url = {0};
 
-    if (lantern_client_checkpoint_sync_parse_url(
+    if (lantern_http_url_parse(
             "http://checkpoint.example:5052/lean/v0/states/finalized",
-            &host,
-            &port,
-            &base_path)
+            &url)
         != 0)
     {
         fprintf(stderr, "failed to parse http checkpoint sync url\n");
         goto fail;
     }
-    if (!host || strcmp(host, "checkpoint.example") != 0)
+    if (!url.host || strcmp(url.host, "checkpoint.example") != 0)
     {
         fprintf(stderr, "unexpected checkpoint sync host\n");
         goto fail;
     }
-    if (port != 5052u)
+    if (url.port != 5052u)
     {
         fprintf(stderr, "unexpected checkpoint sync port\n");
         goto fail;
     }
-    if (!base_path || strcmp(base_path, "/lean/v0/states/finalized") != 0)
+    if (!url.path || strcmp(url.path, "/lean/v0/states/finalized") != 0)
     {
         fprintf(stderr, "unexpected checkpoint sync base path\n");
         goto fail;
     }
 
-    free(host);
-    host = NULL;
-    free(base_path);
-    base_path = NULL;
-    port = 0;
+    lantern_http_url_reset(&url);
 
-    if (lantern_client_checkpoint_sync_parse_url(
+    if (lantern_http_url_parse(
             "http://127.0.0.1:/lean/v0/states/finalized",
-            &host,
-            &port,
-            &base_path)
+            &url)
         == 0)
     {
         fprintf(stderr, "checkpoint sync URL with empty port should be rejected\n");
         goto fail;
     }
-    if (host || base_path || port != 0)
+    if (url.host || url.path || url.port != 0)
     {
         fprintf(stderr, "empty-port checkpoint sync parse should not return partial output\n");
         goto fail;
     }
 
-    if (lantern_client_checkpoint_sync_parse_url(
+    if (lantern_http_url_parse(
             "https://checkpoint.example/lean/v0/states/finalized",
-            &host,
-            &port,
-            &base_path)
+            &url)
         != 0)
     {
         fprintf(stderr, "failed to parse https checkpoint sync url for downgrade\n");
         goto fail;
     }
-    if (!host || strcmp(host, "checkpoint.example") != 0)
+    if (!url.host || strcmp(url.host, "checkpoint.example") != 0)
     {
         fprintf(stderr, "unexpected downgraded checkpoint sync host\n");
         goto fail;
     }
-    if (port != 80u)
+    if (url.port != 80u)
     {
         fprintf(stderr, "unexpected downgraded checkpoint sync port\n");
         goto fail;
     }
-    if (!base_path || strcmp(base_path, "/lean/v0/states/finalized") != 0)
+    if (!url.path || strcmp(url.path, "/lean/v0/states/finalized") != 0)
     {
         fprintf(stderr, "unexpected downgraded checkpoint sync base path\n");
         goto fail;
     }
 
+    lantern_http_url_reset(&url);
     return 0;
 
 fail:
-    free(host);
-    free(base_path);
+    lantern_http_url_reset(&url);
     return 1;
 }
 
@@ -948,7 +936,6 @@ static int test_checkpoint_sync_anchor_checkpoint_restores(void)
     if (lantern_fork_choice_add_block_with_state(
             &client.fork_choice,
             &child_block,
-            NULL,
             &remote_justified,
             &remote_finalized,
             &child_root,

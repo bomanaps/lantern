@@ -630,7 +630,6 @@ int lantern_reqresp_read_response_chunk(
  * @param client         Client instance
  * @param peer_id_text   Peer ID string
  * @param roots          Block roots to request
- * @param depths         Backfill depth per root (may be NULL for zeros)
  * @param root_count     Number of roots
  * @param request_id     Internal request tracking ID (0 disables tracking)
  * @return 0 on success
@@ -644,39 +643,8 @@ int lantern_client_schedule_blocks_request_batch(
     struct lantern_client *client,
     const char *peer_id_text,
     const LanternRoot *roots,
-    const uint32_t *depths,
     size_t root_count,
     uint64_t request_id);
-
-int lantern_client_schedule_blocks_by_range_request(
-    struct lantern_client *client,
-    const char *peer_id_text,
-    uint64_t start_slot,
-    uint64_t count,
-    uint64_t request_id);
-
-/**
- * Write all bytes to a stream.
- *
- * Retries on AGAIN/TIMEOUT errors until all bytes are written or the
- * reqresp stall timeout window elapses.
- *
- * @param stream  libp2p stream
- * @param data    Data to write
- * @param length  Number of bytes to write
- * @param out_err Optional output error code (may be NULL)
- * @return 0 on success
- * @return LANTERN_REQRESP_ERR_INVALID_PARAM if parameters are invalid
- * @return LANTERN_REQRESP_ERR_STREAM_WRITE on stream write failure
- *
- * @note Thread safety: This function is thread-safe
- */
-int stream_write_all(
-    struct lantern_reqresp_stream *stream,
-    const uint8_t *data,
-    size_t length,
-    ssize_t *out_err);
-
 
 /* ============================================================================
  * Key Management Functions

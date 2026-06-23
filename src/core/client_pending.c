@@ -28,467 +28,79 @@ enum
 };
 
 static const size_t BLOCK_LIST_INITIAL_CAPACITY = 4u;
-static const size_t PARENT_INDEX_INITIAL_CAPACITY = 4u;
 
 
 /* ============================================================================
  * Helpers
  * ============================================================================ */
 
-/**
- * @brief Ensure the persisted block list can hold at least `required` entries.
- */
-static int ensure_persisted_block_list_capacity(
-    struct lantern_persisted_block_list *list,
-    size_t required)
+static int grow_item_capacity(
+    void *items,
+    size_t *capacity,
+    size_t required,
+    size_t element_size,
+    size_t initial_capacity,
+    void **out_items)
 {
-    if (!list)
+    if (!capacity || !out_items || element_size == 0u || initial_capacity == 0u)
     {
         return LANTERN_CLIENT_PENDING_ERR_INVALID_PARAM;
     }
-
-    if (list->capacity >= required)
+    *out_items = items;
+    if (*capacity >= required)
     {
         return LANTERN_CLIENT_PENDING_OK;
     }
 
-    size_t new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
-    if (list->capacity > 0)
+    size_t new_capacity = initial_capacity;
+    if (*capacity > 0u)
     {
-        size_t half = list->capacity / 2u;
-        if (list->capacity > SIZE_MAX - half)
+        size_t half = *capacity / 2u;
+        if (*capacity > SIZE_MAX - half)
         {
             return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
         }
-        new_capacity = list->capacity + half;
-        if (new_capacity < BLOCK_LIST_INITIAL_CAPACITY)
+        new_capacity = *capacity + half;
+        if (new_capacity < initial_capacity)
         {
-            new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
+            new_capacity = initial_capacity;
         }
     }
-
     if (new_capacity < required)
     {
         new_capacity = required;
     }
-
-    if (new_capacity > SIZE_MAX / sizeof(*list->items))
+    if (new_capacity > SIZE_MAX / element_size)
     {
         return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
     }
 
-    struct lantern_persisted_block *expanded = realloc(
-        list->items,
-        new_capacity * sizeof(*expanded));
+    void *expanded = realloc(items, new_capacity * element_size);
     if (!expanded)
     {
         return LANTERN_CLIENT_PENDING_ERR_ALLOC;
     }
-    list->items = expanded;
-    list->capacity = new_capacity;
+    *capacity = new_capacity;
+    *out_items = expanded;
     return LANTERN_CLIENT_PENDING_OK;
 }
 
-
-/**
- * @brief Ensure the pending block list can hold at least `required` entries.
- */
-static int ensure_pending_block_list_capacity(
-    struct lantern_pending_block_list *list,
-    size_t required)
-{
-    if (!list)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_INVALID_PARAM;
-    }
-
-    if (list->capacity >= required)
-    {
-        return LANTERN_CLIENT_PENDING_OK;
-    }
-
-    size_t new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
-    if (list->capacity > 0)
-    {
-        size_t half = list->capacity / 2u;
-        if (list->capacity > SIZE_MAX - half)
-        {
-            return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-        }
-        new_capacity = list->capacity + half;
-        if (new_capacity < BLOCK_LIST_INITIAL_CAPACITY)
-        {
-            new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
-        }
-    }
-
-    if (new_capacity < required)
-    {
-        new_capacity = required;
-    }
-
-    if (new_capacity > SIZE_MAX / sizeof(*list->items))
-    {
-        return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-    }
-
-    struct lantern_pending_block *expanded = realloc(
-        list->items,
-        new_capacity * sizeof(*expanded));
-    if (!expanded)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_ALLOC;
-    }
-    list->items = expanded;
-    list->capacity = new_capacity;
-    return LANTERN_CLIENT_PENDING_OK;
-}
-
-
-/**
- * @brief Ensure the pending vote list can hold at least `required` entries.
- */
-static int ensure_pending_vote_list_capacity(
-    struct lantern_pending_vote_list *list,
-    size_t required)
-{
-    if (!list)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_INVALID_PARAM;
-    }
-
-    if (list->capacity >= required)
-    {
-        return LANTERN_CLIENT_PENDING_OK;
-    }
-
-    size_t new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
-    if (list->capacity > 0)
-    {
-        size_t half = list->capacity / 2u;
-        if (list->capacity > SIZE_MAX - half)
-        {
-            return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-        }
-        new_capacity = list->capacity + half;
-        if (new_capacity < BLOCK_LIST_INITIAL_CAPACITY)
-        {
-            new_capacity = BLOCK_LIST_INITIAL_CAPACITY;
-        }
-    }
-
-    if (new_capacity < required)
-    {
-        new_capacity = required;
-    }
-
-    if (new_capacity > SIZE_MAX / sizeof(*list->items))
-    {
-        return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-    }
-
-    struct lantern_pending_vote *expanded = realloc(
-        list->items,
-        new_capacity * sizeof(*expanded));
-    if (!expanded)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_ALLOC;
-    }
-    list->items = expanded;
-    list->capacity = new_capacity;
-    return LANTERN_CLIENT_PENDING_OK;
-}
-
-static int ensure_pending_parent_index_capacity(
-    struct lantern_pending_parent_index *index,
-    size_t required)
-{
-    if (!index)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_INVALID_PARAM;
-    }
-
-    if (index->capacity >= required)
-    {
-        return LANTERN_CLIENT_PENDING_OK;
-    }
-
-    size_t new_capacity = PARENT_INDEX_INITIAL_CAPACITY;
-    if (index->capacity > 0)
-    {
-        size_t half = index->capacity / 2u;
-        if (index->capacity > SIZE_MAX - half)
-        {
-            return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-        }
-        new_capacity = index->capacity + half;
-        if (new_capacity < PARENT_INDEX_INITIAL_CAPACITY)
-        {
-            new_capacity = PARENT_INDEX_INITIAL_CAPACITY;
-        }
-    }
-
-    if (new_capacity < required)
-    {
-        new_capacity = required;
-    }
-
-    if (new_capacity > SIZE_MAX / sizeof(*index->entries))
-    {
-        return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-    }
-
-    struct lantern_pending_parent_index_entry *expanded = realloc(
-        index->entries,
-        new_capacity * sizeof(*expanded));
-    if (!expanded)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_ALLOC;
-    }
-
-    index->entries = expanded;
-    index->capacity = new_capacity;
-    return LANTERN_CLIENT_PENDING_OK;
-}
-
-static int ensure_pending_parent_entry_capacity(
-    struct lantern_pending_parent_index_entry *entry,
-    size_t required)
-{
-    if (!entry)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_INVALID_PARAM;
-    }
-
-    if (entry->capacity >= required)
-    {
-        return LANTERN_CLIENT_PENDING_OK;
-    }
-
-    size_t new_capacity = PARENT_INDEX_INITIAL_CAPACITY;
-    if (entry->capacity > 0)
-    {
-        size_t half = entry->capacity / 2u;
-        if (entry->capacity > SIZE_MAX - half)
-        {
-            return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-        }
-        new_capacity = entry->capacity + half;
-        if (new_capacity < PARENT_INDEX_INITIAL_CAPACITY)
-        {
-            new_capacity = PARENT_INDEX_INITIAL_CAPACITY;
-        }
-    }
-
-    if (new_capacity < required)
-    {
-        new_capacity = required;
-    }
-
-    if (new_capacity > SIZE_MAX / sizeof(*entry->child_roots))
-    {
-        return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
-    }
-
-    LanternRoot *expanded = realloc(entry->child_roots, new_capacity * sizeof(*expanded));
-    if (!expanded)
-    {
-        return LANTERN_CLIENT_PENDING_ERR_ALLOC;
-    }
-
-    entry->child_roots = expanded;
-    entry->capacity = new_capacity;
-    return LANTERN_CLIENT_PENDING_OK;
-}
-
-static void pending_parent_index_init(struct lantern_pending_parent_index *index)
-{
-    if (!index)
-    {
-        return;
-    }
-    index->entries = NULL;
-    index->length = 0;
-    index->capacity = 0;
-}
-
-static void pending_parent_index_reset(struct lantern_pending_parent_index *index)
-{
-    if (!index)
-    {
-        return;
-    }
-
-    if (index->entries)
-    {
-        for (size_t i = 0; i < index->length; ++i)
-        {
-            free(index->entries[i].child_roots);
-            index->entries[i].child_roots = NULL;
-            index->entries[i].length = 0;
-            index->entries[i].capacity = 0;
-        }
-        free(index->entries);
-    }
-
-    index->entries = NULL;
-    index->length = 0;
-    index->capacity = 0;
-}
-
-static struct lantern_pending_parent_index_entry *pending_parent_index_find(
-    struct lantern_pending_parent_index *index,
-    const LanternRoot *parent_root)
-{
-    if (!index || !parent_root || !index->entries)
-    {
-        return NULL;
-    }
-
-    for (size_t i = 0; i < index->length; ++i)
-    {
-        if (memcmp(index->entries[i].parent_root.bytes, parent_root->bytes, LANTERN_ROOT_SIZE) == 0)
-        {
-            return &index->entries[i];
-        }
-    }
-
-    return NULL;
-}
-
-static struct lantern_pending_parent_index_entry *pending_parent_index_ensure(
-    struct lantern_pending_parent_index *index,
-    const LanternRoot *parent_root)
-{
-    if (!index || !parent_root)
-    {
-        return NULL;
-    }
-
-    struct lantern_pending_parent_index_entry *entry =
-        pending_parent_index_find(index, parent_root);
-    if (entry)
-    {
-        return entry;
-    }
-
-    if (index->length == SIZE_MAX)
-    {
-        return NULL;
-    }
-
-    int ensure_rc = ensure_pending_parent_index_capacity(index, index->length + 1u);
-    if (ensure_rc != LANTERN_CLIENT_PENDING_OK)
-    {
-        return NULL;
-    }
-
-    entry = &index->entries[index->length];
-    memset(entry, 0, sizeof(*entry));
-    entry->parent_root = *parent_root;
-    index->length += 1u;
-    return entry;
-}
-
-static void pending_parent_index_add_child(
-    struct lantern_pending_parent_index *index,
-    const LanternRoot *parent_root,
-    const LanternRoot *child_root)
-{
-    if (!index || !parent_root || !child_root)
-    {
-        return;
-    }
-    if (lantern_root_is_zero(parent_root))
-    {
-        return;
-    }
-
-    struct lantern_pending_parent_index_entry *entry =
-        pending_parent_index_ensure(index, parent_root);
-    if (!entry)
-    {
-        return;
-    }
-
-    for (size_t i = 0; i < entry->length; ++i)
-    {
-        if (memcmp(entry->child_roots[i].bytes, child_root->bytes, LANTERN_ROOT_SIZE) == 0)
-        {
-            return;
-        }
-    }
-
-    if (entry->length == SIZE_MAX)
-    {
-        return;
-    }
-
-    int ensure_rc = ensure_pending_parent_entry_capacity(entry, entry->length + 1u);
-    if (ensure_rc != LANTERN_CLIENT_PENDING_OK)
-    {
-        return;
-    }
-
-    entry->child_roots[entry->length] = *child_root;
-    entry->length += 1u;
-}
-
-static void pending_parent_index_remove_child(
-    struct lantern_pending_parent_index *index,
-    const LanternRoot *parent_root,
-    const LanternRoot *child_root)
-{
-    if (!index || !parent_root || !child_root || !index->entries)
-    {
-        return;
-    }
-
-    for (size_t i = 0; i < index->length; ++i)
-    {
-        struct lantern_pending_parent_index_entry *entry = &index->entries[i];
-        if (memcmp(entry->parent_root.bytes, parent_root->bytes, LANTERN_ROOT_SIZE) != 0)
-        {
-            continue;
-        }
-
-        for (size_t j = 0; j < entry->length; ++j)
-        {
-            if (memcmp(entry->child_roots[j].bytes, child_root->bytes, LANTERN_ROOT_SIZE) != 0)
-            {
-                continue;
-            }
-
-            if (j + 1u < entry->length)
-            {
-                memmove(
-                    &entry->child_roots[j],
-                    &entry->child_roots[j + 1u],
-                    (entry->length - (j + 1u)) * sizeof(*entry->child_roots));
-            }
-            entry->length -= 1u;
-
-            if (entry->length == 0)
-            {
-                free(entry->child_roots);
-                if (i + 1u < index->length)
-                {
-                    memmove(
-                        &index->entries[i],
-                        &index->entries[i + 1u],
-                        (index->length - (i + 1u)) * sizeof(*index->entries));
-                }
-                index->length -= 1u;
-                if (index->length < index->capacity)
-                {
-                    memset(&index->entries[index->length], 0, sizeof(*index->entries));
-                }
-            }
-            return;
-        }
-        return;
-    }
-}
+#define GROW_ITEMS(owner, field, required, initial_capacity, rc)                         \
+    do                                                                                  \
+    {                                                                                   \
+        void *expanded_items = NULL;                                                    \
+        (rc) = grow_item_capacity(                                                      \
+            (owner)->field,                                                            \
+            &(owner)->capacity,                                                        \
+            (required),                                                                 \
+            sizeof(*(owner)->field),                                                    \
+            (initial_capacity),                                                         \
+            &expanded_items);                                                           \
+        if ((rc) == LANTERN_CLIENT_PENDING_OK)                                          \
+        {                                                                               \
+            (owner)->field = expanded_items;                                            \
+        }                                                                               \
+    } while (0)
 
 /* ============================================================================
  * Pending Vote List
@@ -559,7 +171,8 @@ struct lantern_pending_vote *pending_vote_list_append(
         return NULL;
     }
 
-    int ensure_rc = ensure_pending_vote_list_capacity(list, list->length + 1u);
+    int ensure_rc = LANTERN_CLIENT_PENDING_OK;
+    GROW_ITEMS(list, items, list->length + 1u, BLOCK_LIST_INITIAL_CAPACITY, ensure_rc);
     if (ensure_rc != LANTERN_CLIENT_PENDING_OK)
     {
         return NULL;
@@ -703,7 +316,8 @@ int persisted_block_list_append(
         return LANTERN_CLIENT_PENDING_ERR_OVERFLOW;
     }
 
-    int ensure_rc = ensure_persisted_block_list_capacity(list, list->length + 1u);
+    int ensure_rc = LANTERN_CLIENT_PENDING_OK;
+    GROW_ITEMS(list, items, list->length + 1u, BLOCK_LIST_INITIAL_CAPACITY, ensure_rc);
     if (ensure_rc != LANTERN_CLIENT_PENDING_OK)
     {
         return ensure_rc;
@@ -742,7 +356,6 @@ void pending_block_list_init(struct lantern_pending_block_list *list)
     list->items = NULL;
     list->length = 0;
     list->capacity = 0;
-    pending_parent_index_init(&list->parent_index);
 }
 
 
@@ -759,7 +372,6 @@ void pending_block_list_reset(struct lantern_pending_block_list *list)
     {
         return;
     }
-    pending_parent_index_reset(&list->parent_index);
     if (list->items)
     {
         for (size_t i = 0; i < list->length; ++i)
@@ -820,10 +432,6 @@ void pending_block_list_remove(struct lantern_pending_block_list *list, size_t i
     }
 
     struct lantern_pending_block *entry = &list->items[index];
-    pending_parent_index_remove_child(
-        &list->parent_index,
-        &entry->parent_root,
-        &entry->root);
     lantern_signed_block_with_attestation_reset(&entry->block);
 
     if (index + 1u < list->length)
@@ -876,7 +484,8 @@ struct lantern_pending_block *pending_block_list_append(
         return NULL;
     }
 
-    int ensure_rc = ensure_pending_block_list_capacity(list, list->length + 1u);
+    int ensure_rc = LANTERN_CLIENT_PENDING_OK;
+    GROW_ITEMS(list, items, list->length + 1u, BLOCK_LIST_INITIAL_CAPACITY, ensure_rc);
     if (ensure_rc != LANTERN_CLIENT_PENDING_OK)
     {
         return NULL;
@@ -902,7 +511,6 @@ struct lantern_pending_block *pending_block_list_append(
         (void)lantern_string_copy(entry->peer_text, sizeof(entry->peer_text), peer_text);
     }
 
-    pending_parent_index_add_child(&list->parent_index, parent_root, block_root);
     list->length += 1u;
 
     return entry;

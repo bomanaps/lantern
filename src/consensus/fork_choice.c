@@ -16,9 +16,6 @@
 #define LANTERN_FORK_CHOICE_DEFAULT_SECONDS_PER_SLOT 4u
 #define LANTERN_FORK_CHOICE_DEFAULT_INTERVALS_PER_SLOT 5u
 #define LANTERN_FORK_CHOICE_MILLISECONDS_PER_SECOND 1000u
-#define LANTERN_FORK_CHOICE_MAP_MIN_CAPACITY 16u
-#define LANTERN_FORK_CHOICE_LOAD_NUMERATOR 7u
-#define LANTERN_FORK_CHOICE_LOAD_DENOMINATOR 10u
 
 struct fork_choice_latest_vote {
     bool has_checkpoint;
@@ -95,18 +92,18 @@ static int root_compare(const LanternRoot *a, const LanternRoot *b) {
     return memcmp(a->bytes, b->bytes, sizeof(a->bytes));
 }
 
-static uint64_t root_hash(const LanternRoot *root) {
-    /* 64-bit FNV-1a */
-    const uint8_t *data = root->bytes;
-    uint64_t hash = 1469598103934665603ULL;
-    for (size_t i = 0; i < LANTERN_ROOT_SIZE; ++i) {
-        hash ^= data[i];
-        hash *= 1099511628211ULL;
+static bool find_block_index(const LanternForkChoice *store, const LanternRoot *root, size_t *out_index) {
+    if (!store || !root || !store->blocks) {
+        return false;
     }
-    return hash;
-}
-
-static bool finalization_trace_enabled(void) {
+    for (size_t i = 0; i < store->block_len; ++i) {
+        if (root_compare(&store->blocks[i].root, root) == 0) {
+            if (out_index) {
+                *out_index = i;
+            }
+            return true;
+        }
+    }
     return false;
 }
 
@@ -121,13 +118,6 @@ static void format_root_hex(const LanternRoot *root, char *out, size_t out_len) 
     if (lantern_bytes_to_hex(root->bytes, LANTERN_ROOT_SIZE, out, out_len, 1) != 0) {
         out[0] = '\0';
     }
-}
-
-static void map_reset(LanternForkChoice *store) {
-    free(store->index_entries);
-    store->index_entries = NULL;
-    store->index_cap = 0;
-    store->index_len = 0;
 }
 
 static void states_reset(LanternForkChoice *store) {
@@ -145,151 +135,6 @@ static void states_reset(LanternForkChoice *store) {
     free(store->states);
     store->states = NULL;
     store->state_cap = 0;
-}
-
-static int map_reserve(LanternForkChoice *store, size_t desired) {
-    if (!store) {
-        return -1;
-    }
-    if (store->index_cap >= desired) {
-        return 0;
-    }
-    size_t capacity = store->index_cap == 0 ? LANTERN_FORK_CHOICE_MAP_MIN_CAPACITY : store->index_cap;
-    while (capacity < desired) {
-        if (capacity > (SIZE_MAX / 2)) {
-            return -1;
-        }
-        capacity *= 2;
-    }
-    struct lantern_fork_choice_root_index_entry *entries = calloc(capacity, sizeof(*entries));
-    if (!entries) {
-        return -1;
-    }
-
-    size_t new_len = 0;
-    if (store->index_entries) {
-        for (size_t i = 0; i < store->index_cap; ++i) {
-            struct lantern_fork_choice_root_index_entry *old = &store->index_entries[i];
-            if (!old->occupied || old->tombstone) {
-                continue;
-            }
-            uint64_t hash = root_hash(&old->root);
-            size_t mask = capacity - 1;
-            size_t pos = (size_t)(hash & mask);
-            while (entries[pos].occupied) {
-                pos = (pos + 1) & mask;
-            }
-            entries[pos] = *old;
-            entries[pos].tombstone = false;
-            entries[pos].occupied = true;
-            new_len += 1;
-        }
-        free(store->index_entries);
-    }
-
-    store->index_entries = entries;
-    store->index_cap = capacity;
-    store->index_len = new_len;
-    return 0;
-}
-
-static bool map_lookup(const LanternForkChoice *store, const LanternRoot *root, size_t *out_value) {
-    if (!store || !root || store->index_cap == 0 || !store->index_entries) {
-        return false;
-    }
-    uint64_t hash = root_hash(root);
-    size_t mask = store->index_cap - 1;
-    size_t pos = (size_t)(hash & mask);
-    size_t start = pos;
-    while (true) {
-        const struct lantern_fork_choice_root_index_entry *entry = &store->index_entries[pos];
-        if (!entry->occupied) {
-            return false;
-        }
-        if (!entry->tombstone && root_compare(&entry->root, root) == 0) {
-            if (out_value) {
-                *out_value = entry->value;
-            }
-            return true;
-        }
-        pos = (pos + 1) & mask;
-        if (pos == start) {
-            return false;
-        }
-    }
-}
-
-static int map_insert(LanternForkChoice *store, const LanternRoot *root, size_t value) {
-    if (!store || !root) {
-        return -1;
-    }
-    if (store->index_cap == 0) {
-        if (map_reserve(store, LANTERN_FORK_CHOICE_MAP_MIN_CAPACITY) != 0) {
-            return -1;
-        }
-    }
-    if (store->index_len * LANTERN_FORK_CHOICE_LOAD_DENOMINATOR
-        >= store->index_cap * LANTERN_FORK_CHOICE_LOAD_NUMERATOR) {
-        size_t desired = store->index_cap * 2;
-        if (desired < store->index_cap) {
-            return -1;
-        }
-        if (map_reserve(store, desired) != 0) {
-            return -1;
-        }
-    }
-    uint64_t hash = root_hash(root);
-    size_t mask = store->index_cap - 1;
-    size_t pos = (size_t)(hash & mask);
-    size_t first_tombstone = SIZE_MAX;
-    while (true) {
-        struct lantern_fork_choice_root_index_entry *entry = &store->index_entries[pos];
-        if (!entry->occupied) {
-            size_t target = (first_tombstone != SIZE_MAX) ? first_tombstone : pos;
-            entry = &store->index_entries[target];
-            entry->root = *root;
-            entry->value = value;
-            entry->occupied = true;
-            entry->tombstone = false;
-            store->index_len += 1;
-            return 0;
-        }
-        if (!entry->tombstone && root_compare(&entry->root, root) == 0) {
-            entry->value = value;
-            return 0;
-        }
-        if (entry->tombstone && first_tombstone == SIZE_MAX) {
-            first_tombstone = pos;
-        }
-        pos = (pos + 1) & mask;
-    }
-}
-
-static bool map_remove(LanternForkChoice *store, const LanternRoot *root) {
-    if (!store || !root || store->index_cap == 0 || !store->index_entries) {
-        return false;
-    }
-    uint64_t hash = root_hash(root);
-    size_t mask = store->index_cap - 1;
-    size_t pos = (size_t)(hash & mask);
-    size_t start = pos;
-    while (true) {
-        struct lantern_fork_choice_root_index_entry *entry = &store->index_entries[pos];
-        if (!entry->occupied) {
-            return false;
-        }
-        if (!entry->tombstone && root_compare(&entry->root, root) == 0) {
-            entry->tombstone = true;
-            if (store->index_len > 0) {
-                store->index_len -= 1;
-            }
-            return true;
-        }
-        pos = (pos + 1) & mask;
-        if (pos == start) {
-            return false;
-        }
-    }
 }
 
 static int ensure_block_capacity(LanternForkChoice *store, size_t required) {
@@ -333,14 +178,18 @@ static int ensure_block_capacity(LanternForkChoice *store, size_t required) {
     return 0;
 }
 
-static size_t parent_index_for_block(const LanternForkChoice *store, const LanternRoot *parent_root) {
-    size_t parent_index = SIZE_MAX;
-    if (!root_is_zero(parent_root)) {
-        if (!map_lookup(store, parent_root, &parent_index)) {
-            parent_index = SIZE_MAX;
-        }
+static bool parent_index_for_block(const LanternForkChoice *store, size_t block_index, size_t *out_parent) {
+    if (!store || !store->blocks || block_index >= store->block_len || !out_parent) {
+        return false;
     }
-    return parent_index;
+    const LanternRoot *parent_root = &store->blocks[block_index].parent_root;
+    if (root_is_zero(parent_root)) {
+        return false;
+    }
+    if (find_block_index(store, parent_root, out_parent)) {
+        return true;
+    }
+    return false;
 }
 
 static bool block_descends_from(
@@ -355,40 +204,13 @@ static bool block_descends_from(
         if (current == ancestor_index) {
             return true;
         }
-        size_t parent = store->blocks[current].parent_index;
-        if (parent == SIZE_MAX || parent >= store->block_len) {
+        size_t parent = 0;
+        if (!parent_index_for_block(store, current, &parent)) {
             return false;
         }
         current = parent;
     }
     return false;
-}
-
-static void update_children_parent_index(
-    LanternForkChoice *store,
-    const LanternRoot *parent_root,
-    size_t parent_index) {
-    if (!store || !store->blocks || !parent_root) {
-        return;
-    }
-    if (root_is_zero(parent_root)) {
-        return;
-    }
-    for (size_t i = 0; i < store->block_len; ++i) {
-        if (i == parent_index) {
-            continue;
-        }
-        struct lantern_fork_choice_block_entry *entry = &store->blocks[i];
-        if (entry->parent_index != SIZE_MAX) {
-            continue;
-        }
-        if (root_is_zero(&entry->parent_root)) {
-            continue;
-        }
-        if (root_compare(&entry->parent_root, parent_root) == 0) {
-            entry->parent_index = parent_index;
-        }
-    }
 }
 
 void lantern_fork_choice_init(LanternForkChoice *store) {
@@ -419,8 +241,6 @@ void lantern_fork_choice_reset(LanternForkChoice *store) {
     store->blocks = NULL;
     store->block_cap = 0;
     store->block_len = 0;
-
-    map_reset(store);
 
     store->initialized = false;
     store->has_anchor = false;
@@ -473,13 +293,12 @@ static int register_block(
         return -1;
     }
     size_t existing_index = 0;
-    if (map_lookup(store, root, &existing_index)) {
+    if (find_block_index(store, root, &existing_index)) {
         struct lantern_fork_choice_block_entry *entry = &store->blocks[existing_index];
         entry->slot = slot;
         entry->proposer_index = proposer_index;
         if (parent_root) {
             entry->parent_root = *parent_root;
-            entry->parent_index = parent_index_for_block(store, parent_root);
         }
         return 0;
     }
@@ -493,18 +312,11 @@ static int register_block(
     } else {
         zero_root(&entry->parent_root);
     }
-    entry->parent_index = parent_index_for_block(store, &entry->parent_root);
     entry->slot = slot;
     entry->proposer_index = proposer_index;
     entry->has_validator_count = false;
     entry->validator_count = 0;
-    size_t new_index = store->block_len;
     store->block_len += 1;
-    if (map_insert(store, root, new_index) != 0) {
-        store->block_len -= 1;
-        return -1;
-    }
-    update_children_parent_index(store, root, new_index);
     return 0;
 }
 
@@ -516,7 +328,7 @@ int lantern_fork_choice_set_block_validator_count(
         return -1;
     }
     size_t index = 0;
-    if (!map_lookup(store, root, &index)) {
+    if (!find_block_index(store, root, &index)) {
         return -1;
     }
     if (!store->blocks || index >= store->block_len) {
@@ -536,7 +348,7 @@ int lantern_fork_choice_set_block_state(
         return -1;
     }
     size_t index = 0;
-    if (!map_lookup(store, root, &index)) {
+    if (!find_block_index(store, root, &index)) {
         return -1;
     }
     if (!store->states || index >= store->state_cap) {
@@ -566,7 +378,7 @@ const LanternState *lantern_fork_choice_block_state(
         return NULL;
     }
     size_t index = 0;
-    if (!map_lookup(store, root, &index)) {
+    if (!find_block_index(store, root, &index)) {
         return NULL;
     }
     if (!store->states || index >= store->state_cap) {
@@ -626,7 +438,7 @@ int lantern_fork_choice_set_anchor_with_state(
         }
     }
     size_t existing_index = 0;
-    bool existed = map_lookup(store, &root, &existing_index);
+    bool existed = find_block_index(store, &root, &existing_index);
     struct lantern_fork_choice_block_entry previous_entry;
     memset(&previous_entry, 0, sizeof(previous_entry));
     if (existed) {
@@ -715,14 +527,6 @@ int lantern_fork_choice_set_anchor_with_state(
         if (existed) {
             store->blocks[existing_index] = previous_entry;
         } else {
-            size_t new_index = store->block_len > 0 ? (store->block_len - 1u) : 0u;
-            for (size_t i = 0; i + 1u < store->block_len; ++i) {
-                struct lantern_fork_choice_block_entry *entry = &store->blocks[i];
-                if (entry->parent_index == new_index && root_compare(&entry->parent_root, &root) == 0) {
-                    entry->parent_index = SIZE_MAX;
-                }
-            }
-            map_remove(store, &root);
             store->block_len = previous_block_len;
         }
         return -1;
@@ -738,7 +542,7 @@ static bool checkpoint_known_in_store(
         return false;
     }
     size_t checkpoint_index = 0;
-    if (!map_lookup(store, &checkpoint->root, &checkpoint_index)) {
+    if (!find_block_index(store, &checkpoint->root, &checkpoint_index)) {
         return false;
     }
     if (!store->blocks || checkpoint_index >= store->block_len) {
@@ -850,14 +654,12 @@ static int update_latest_checkpoints(
 int lantern_fork_choice_add_block(
     LanternForkChoice *store,
     const LanternBlock *block,
-    const LanternSignedVote *proposer_attestation,
     const LanternCheckpoint *post_justified,
     const LanternCheckpoint *post_finalized,
     const LanternRoot *block_root_hint) {
     return lantern_fork_choice_add_block_with_state(
         store,
         block,
-        proposer_attestation,
         post_justified,
         post_finalized,
         block_root_hint,
@@ -867,7 +669,6 @@ int lantern_fork_choice_add_block(
 int lantern_fork_choice_add_block_with_state(
     LanternForkChoice *store,
     const LanternBlock *block,
-    const LanternSignedVote *proposer_attestation,
     const LanternCheckpoint *post_justified,
     const LanternCheckpoint *post_finalized,
     const LanternRoot *block_root_hint,
@@ -875,15 +676,9 @@ int lantern_fork_choice_add_block_with_state(
     if (!store || !store->initialized || !store->has_anchor || !block) {
         return -1;
     }
-    /* Proposer attestations are cached by the caller after head recomputation. */
-    (void)proposer_attestation;
-    bool trace_finalization = finalization_trace_enabled();
-    struct lantern_log_metadata trace_meta = {.has_slot = true, .slot = block->slot};
     struct lantern_log_metadata diag_meta = {.has_slot = true, .slot = block->slot};
     char block_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
     char parent_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-    uint64_t parent_slot = 0;
-    bool parent_known = false;
     double metrics_start = lantern_time_now_seconds();
     LanternRoot block_root;
     if (block_root_hint) {
@@ -917,7 +712,7 @@ int lantern_fork_choice_add_block_with_state(
     bool had_head = store->has_head;
 
     size_t existing_index = 0;
-    bool existed = map_lookup(store, &block_root, &existing_index);
+    bool existed = find_block_index(store, &block_root, &existing_index);
     struct lantern_fork_choice_block_entry previous_entry;
     memset(&previous_entry, 0, sizeof(previous_entry));
     if (existed) {
@@ -929,14 +724,6 @@ int lantern_fork_choice_add_block_with_state(
 
     size_t previous_block_len = store->block_len;
 
-    if (trace_finalization) {
-        format_root_hex(&block_root, block_hex, sizeof(block_hex));
-        format_root_hex(&block->parent_root, parent_hex, sizeof(parent_hex));
-        if (!root_is_zero(&block->parent_root)) {
-            parent_known =
-                (lantern_fork_choice_block_info(store, &block->parent_root, &parent_slot, NULL, NULL) == 0);
-        }
-    }
     if (register_block(
             store,
             &block_root,
@@ -1030,22 +817,6 @@ int lantern_fork_choice_add_block_with_state(
         goto rollback;
     }
     lean_metrics_record_fork_choice_block_time(lantern_time_now_seconds() - metrics_start);
-    if (trace_finalization) {
-        lantern_log_debug(
-            "fork_choice",
-            &trace_meta,
-            "finalization trace add_block slot=%" PRIu64 " root=%s parent_root=%s parent_known=%s"
-            " parent_slot=%" PRIu64 " attestations=%zu post_justified=%" PRIu64
-            " post_finalized=%" PRIu64,
-            block->slot,
-            block_hex[0] ? block_hex : "0x0",
-            parent_hex[0] ? parent_hex : "0x0",
-            parent_known ? "true" : "false",
-            parent_known ? parent_slot : 0u,
-            block->body.attestations.length,
-            post_justified ? post_justified->slot : 0u,
-            post_finalized ? post_finalized->slot : 0u);
-    }
     fork_choice_publish_current_checkpoints(store);
     return 0;
 
@@ -1058,14 +829,6 @@ rollback:
     if (existed) {
         store->blocks[existing_index] = previous_entry;
     } else {
-        size_t new_index = store->block_len > 0 ? (store->block_len - 1u) : 0u;
-        for (size_t i = 0; i + 1u < store->block_len; ++i) {
-            struct lantern_fork_choice_block_entry *entry = &store->blocks[i];
-            if (entry->parent_index == new_index && root_compare(&entry->parent_root, &block_root) == 0) {
-                entry->parent_index = SIZE_MAX;
-            }
-        }
-        map_remove(store, &block_root);
         store->block_len = previous_block_len;
     }
 
@@ -1198,8 +961,8 @@ int lantern_fork_choice_prune_states(LanternForkChoice *store) {
 
     size_t head_index = 0;
     size_t finalized_index = 0;
-    if (!map_lookup(store, &store->head, &head_index)
-        || !map_lookup(store, &store->latest_finalized.root, &finalized_index)) {
+    if (!find_block_index(store, &store->head, &head_index)
+        || !find_block_index(store, &store->latest_finalized.root, &finalized_index)) {
         return -1;
     }
     if (head_index >= store->block_len || finalized_index >= store->block_len) {
@@ -1219,8 +982,8 @@ int lantern_fork_choice_prune_states(LanternForkChoice *store) {
             found_finalized = true;
             break;
         }
-        size_t parent_index = store->blocks[current].parent_index;
-        if (parent_index == SIZE_MAX || parent_index >= store->block_len) {
+        size_t parent_index = 0;
+        if (!parent_index_for_block(store, current, &parent_index)) {
             break;
         }
         current = parent_index;
@@ -1299,8 +1062,6 @@ int lantern_fork_choice_prune_states(LanternForkChoice *store) {
             }
         }
 
-        LanternForkChoice new_index_store;
-        memset(&new_index_store, 0, sizeof(new_index_store));
         for (size_t old_index = 0; old_index < store->block_len; ++old_index) {
             size_t new_index = old_to_new[old_index];
             if (new_index == SIZE_MAX) {
@@ -1308,21 +1069,6 @@ int lantern_fork_choice_prune_states(LanternForkChoice *store) {
             }
             new_blocks[new_index] = store->blocks[old_index];
             new_states[new_index] = store->states[old_index];
-            size_t old_parent = store->blocks[old_index].parent_index;
-            if (old_parent < store->block_len) {
-                new_blocks[new_index].parent_index = old_to_new[old_parent];
-            } else {
-                new_blocks[new_index].parent_index = SIZE_MAX;
-            }
-            if (map_insert(&new_index_store, &new_blocks[new_index].root, new_index) != 0) {
-                map_reset(&new_index_store);
-                free(new_blocks);
-                free(new_states);
-                free(canonical);
-                free(keep_block);
-                free(old_to_new);
-                return -1;
-            }
         }
 
         for (size_t i = 0; i < store->block_len; ++i) {
@@ -1337,28 +1083,24 @@ int lantern_fork_choice_prune_states(LanternForkChoice *store) {
 
         free(store->blocks);
         free(store->states);
-        map_reset(store);
         store->blocks = new_blocks;
         store->states = new_states;
         store->block_len = blocks_kept;
         store->block_cap = blocks_kept;
         store->state_cap = blocks_kept;
-        store->index_entries = new_index_store.index_entries;
-        store->index_cap = new_index_store.index_cap;
-        store->index_len = new_index_store.index_len;
         store->anchor_root = store->latest_finalized.root;
         store->anchor_slot = finalized_slot;
         store->has_anchor = true;
 
         if (store->has_safe_target) {
             size_t safe_index = 0;
-            if (!map_lookup(store, &store->safe_target, &safe_index)) {
+            if (!find_block_index(store, &store->safe_target, &safe_index)) {
                 store->safe_target = store->latest_finalized.root;
             }
         }
         size_t justified_index = 0;
         if (!root_is_zero(&store->latest_justified.root)
-            && !map_lookup(store, &store->latest_justified.root, &justified_index)) {
+            && !find_block_index(store, &store->latest_justified.root, &justified_index)) {
             store->latest_justified = store->latest_finalized;
         }
     }
@@ -1401,7 +1143,7 @@ static int find_start_index(
         *out_index = best;
         return 0;
     }
-    if (map_lookup(store, start_root, out_index)) {
+    if (find_block_index(store, start_root, out_index)) {
         return 0;
     }
     return -1;
@@ -1438,7 +1180,7 @@ static int lmd_ghost_compute(
             continue;
         }
         size_t node_index = 0;
-        if (!map_lookup(store, &vote->checkpoint.root, &node_index)) {
+        if (!find_block_index(store, &vote->checkpoint.root, &node_index)) {
             continue;
         }
         while (true) {
@@ -1452,10 +1194,11 @@ static int lmd_ghost_compute(
             if (weights[node_index] < UINT64_MAX) {
                 weights[node_index] += 1;
             }
-            if (node->parent_index == SIZE_MAX) {
+            size_t parent = 0;
+            if (!parent_index_for_block(store, node_index, &parent)) {
                 break;
             }
-            node_index = node->parent_index;
+            node_index = parent;
         }
     }
 
@@ -1468,8 +1211,8 @@ static int lmd_ghost_compute(
         best_child[i] = SIZE_MAX;
     }
     for (size_t i = 0; i < store->block_len; ++i) {
-        size_t parent = blocks[i].parent_index;
-        if (parent == SIZE_MAX || parent >= store->block_len) {
+        size_t parent = 0;
+        if (!parent_index_for_block(store, i, &parent)) {
             continue;
         }
         if (weights[i] < min_score) {
@@ -1550,6 +1293,9 @@ static void safe_target_merge_payload_pool(
         if (!attestation_data) {
             continue;
         }
+        if (attestation_data->head.slot <= store->latest_finalized.slot) {
+            continue;
+        }
         const struct lantern_bitlist *participants = &entry->proof.participants;
         if (participants->bit_length == 0 || !participants->bytes) {
             continue;
@@ -1573,6 +1319,35 @@ static void safe_target_merge_payload_pool(
     }
 }
 
+static int collect_payload_pool_votes(
+    const LanternForkChoice *store,
+    const struct lantern_aggregated_payload_pool *pool,
+    struct fork_choice_latest_vote **out_votes,
+    size_t *out_vote_count) {
+    if (!store || !out_votes || !out_vote_count) {
+        return -1;
+    }
+    *out_votes = NULL;
+    *out_vote_count = 0;
+    size_t vote_count = store->validator_count;
+    struct fork_choice_latest_vote *votes = NULL;
+    uint64_t *latest_slots = NULL;
+    if (vote_count > 0) {
+        votes = calloc(vote_count, sizeof(*votes));
+        latest_slots = calloc(vote_count, sizeof(*latest_slots));
+        if (!votes || !latest_slots) {
+            free(votes);
+            free(latest_slots);
+            return -1;
+        }
+        safe_target_merge_payload_pool(store, pool, votes, latest_slots, vote_count);
+    }
+    free(latest_slots);
+    *out_votes = votes;
+    *out_vote_count = vote_count;
+    return 0;
+}
+
 static bool fork_choice_has_attached_payload_views(const LanternForkChoice *store) {
     return store
         && store->new_aggregated_payloads
@@ -1587,40 +1362,11 @@ static int collect_known_weight_votes(
     if (!store || !out_votes || !out_vote_count) {
         return -1;
     }
-    *out_votes = NULL;
-    *out_vote_count = 0;
-
-    size_t vote_count = store->validator_count;
-    struct fork_choice_latest_vote *votes = NULL;
-    uint64_t *latest_slots = NULL;
-    if (vote_count > 0) {
-        votes = calloc(vote_count, sizeof(*votes));
-        if (!votes) {
-            return -1;
-        }
-    }
-
-    if (vote_count > 0) {
-        latest_slots = calloc(vote_count, sizeof(*latest_slots));
-        if (!latest_slots) {
-            free(votes);
-            return -1;
-        }
-    }
-
-    if (fork_choice_has_attached_payload_views(store)) {
-        safe_target_merge_payload_pool(
-            store,
-            store->known_aggregated_payloads,
-            votes,
-            latest_slots,
-            vote_count);
-    }
-    free(latest_slots);
-
-    *out_votes = votes;
-    *out_vote_count = vote_count;
-    return 0;
+    return collect_payload_pool_votes(
+        store,
+        fork_choice_has_attached_payload_views(store) ? store->known_aggregated_payloads : NULL,
+        out_votes,
+        out_vote_count);
 }
 
 static int compute_known_block_weights(
@@ -1648,7 +1394,7 @@ static int compute_known_block_weights(
             continue;
         }
         size_t node_index = 0;
-        if (!map_lookup(store, &vote->checkpoint.root, &node_index)) {
+        if (!find_block_index(store, &vote->checkpoint.root, &node_index)) {
             continue;
         }
         while (node_index < store->block_len) {
@@ -1659,10 +1405,11 @@ static int compute_known_block_weights(
             if (weights[node_index] < UINT64_MAX) {
                 weights[node_index] += 1u;
             }
-            if (node->parent_index == SIZE_MAX) {
+            size_t parent = 0;
+            if (!parent_index_for_block(store, node_index, &parent)) {
                 break;
             }
-            node_index = node->parent_index;
+            node_index = parent;
         }
     }
 
@@ -1683,8 +1430,8 @@ static size_t fork_choice_reorg_depth(
 
     while (old_index != new_index) {
         if (old_slot > new_slot) {
-            size_t parent = store->blocks[old_index].parent_index;
-            if (parent == SIZE_MAX || parent >= store->block_len) {
+            size_t parent = 0;
+            if (!parent_index_for_block(store, old_index, &parent)) {
                 return 0;
             }
             old_index = parent;
@@ -1693,8 +1440,8 @@ static size_t fork_choice_reorg_depth(
             continue;
         }
         if (new_slot > old_slot) {
-            size_t parent = store->blocks[new_index].parent_index;
-            if (parent == SIZE_MAX || parent >= store->block_len) {
+            size_t parent = 0;
+            if (!parent_index_for_block(store, new_index, &parent)) {
                 return 0;
             }
             new_index = parent;
@@ -1702,10 +1449,10 @@ static size_t fork_choice_reorg_depth(
             continue;
         }
 
-        size_t old_parent = store->blocks[old_index].parent_index;
-        size_t new_parent = store->blocks[new_index].parent_index;
-        if (old_parent == SIZE_MAX || new_parent == SIZE_MAX
-            || old_parent >= store->block_len || new_parent >= store->block_len) {
+        size_t old_parent = 0;
+        size_t new_parent = 0;
+        if (!parent_index_for_block(store, old_index, &old_parent)
+            || !parent_index_for_block(store, new_index, &new_parent)) {
             return 0;
         }
         old_index = old_parent;
@@ -1748,8 +1495,8 @@ int lantern_fork_choice_recompute_head(LanternForkChoice *store) {
     if (had_head && root_compare(&previous_head, &head) != 0) {
         size_t old_index = 0;
         size_t new_index = 0;
-        if (map_lookup(store, &previous_head, &old_index)
-            && map_lookup(store, &head, &new_index)) {
+        if (find_block_index(store, &previous_head, &old_index)
+            && find_block_index(store, &head, &new_index)) {
             size_t depth = fork_choice_reorg_depth(store, old_index, new_index);
             if (depth > 0) {
                 lean_metrics_record_fork_choice_reorg(depth);
@@ -1774,7 +1521,7 @@ int lantern_fork_choice_update_safe_target(LanternForkChoice *store) {
     uint64_t validator_count = store->config.num_validators;
     if (store->has_head && store->blocks) {
         size_t head_index = 0;
-        if (map_lookup(store, &store->head, &head_index) && head_index < store->block_len) {
+        if (find_block_index(store, &store->head, &head_index) && head_index < store->block_len) {
             const struct lantern_fork_choice_block_entry *head_entry = &store->blocks[head_index];
             if (head_entry->has_validator_count && head_entry->validator_count > 0) {
                 validator_count = head_entry->validator_count;
@@ -1782,35 +1529,29 @@ int lantern_fork_choice_update_safe_target(LanternForkChoice *store) {
         }
     }
     uint64_t threshold = lantern_consensus_quorum_threshold(validator_count);
-    struct fork_choice_latest_vote *safe_votes =
-        calloc(store->validator_count, sizeof(*safe_votes));
-    uint64_t *latest_slots = calloc(store->validator_count, sizeof(*latest_slots));
-    if (!safe_votes || !latest_slots) {
-        free(safe_votes);
-        free(latest_slots);
+    struct fork_choice_latest_vote *safe_votes = NULL;
+    size_t safe_vote_count = 0;
+    if (collect_payload_pool_votes(
+            store,
+            store->new_aggregated_payloads,
+            &safe_votes,
+            &safe_vote_count)
+        != 0) {
         return -1;
     }
-    safe_target_merge_payload_pool(
-        store,
-        store->new_aggregated_payloads,
-        safe_votes,
-        latest_slots,
-        store->validator_count);
     LanternRoot safe;
     if (lmd_ghost_compute(
             store,
             &store->latest_justified.root,
             safe_votes,
-            store->validator_count,
+            safe_vote_count,
             threshold,
             &safe)
         != 0) {
         free(safe_votes);
-        free(latest_slots);
         return -1;
     }
     free(safe_votes);
-    free(latest_slots);
     store->safe_target = safe;
     store->has_safe_target = true;
     return 0;
@@ -1884,28 +1625,17 @@ int lantern_fork_choice_block_info(
     uint64_t *out_slot,
     LanternRoot *out_parent_root,
     bool *out_has_parent) {
-    bool trace_finalization = finalization_trace_enabled();
-    char root_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-    if (trace_finalization) {
-        format_root_hex(root, root_hex, sizeof(root_hex));
-    }
-    const struct lantern_fork_choice_block_entry *entry = NULL;
-    const char *fail_reason = NULL;
-    int rc = -1;
     if (!store || !store->initialized || !root) {
-        fail_reason = "invalid_args";
-        goto done;
+        return -1;
     }
     size_t index = 0;
-    if (!map_lookup(store, root, &index)) {
-        fail_reason = "lookup_miss";
-        goto done;
+    if (!find_block_index(store, root, &index)) {
+        return -1;
     }
     if (!store->blocks || index >= store->block_len) {
-        fail_reason = "entry_oob";
-        goto done;
+        return -1;
     }
-    entry = &store->blocks[index];
+    const struct lantern_fork_choice_block_entry *entry = &store->blocks[index];
     if (out_slot) {
         *out_slot = entry->slot;
     }
@@ -1913,42 +1643,10 @@ int lantern_fork_choice_block_info(
         *out_parent_root = entry->parent_root;
     }
     if (out_has_parent) {
-        bool has_parent = entry->parent_index != SIZE_MAX && !root_is_zero(&entry->parent_root);
-        *out_has_parent = has_parent;
+        size_t parent = 0;
+        *out_has_parent = parent_index_for_block(store, index, &parent);
     }
-    rc = 0;
-
-done:
-    if (trace_finalization) {
-        if (rc == 0 && entry) {
-            struct lantern_log_metadata meta = {.has_slot = true, .slot = entry->slot};
-            bool has_parent = entry->parent_index != SIZE_MAX && !root_is_zero(&entry->parent_root);
-            uint64_t parent_slot = 0;
-            if (has_parent && store->blocks && entry->parent_index < store->block_len) {
-                parent_slot = store->blocks[entry->parent_index].slot;
-            }
-            char parent_hex[(LANTERN_ROOT_SIZE * 2u) + 3u];
-            format_root_hex(&entry->parent_root, parent_hex, sizeof(parent_hex));
-            lantern_log_debug(
-                "fork_choice",
-                &meta,
-                "finalization trace block_info slot=%" PRIu64 " root=%s has_parent=%s parent_slot=%" PRIu64
-                " parent_root=%s",
-                entry->slot,
-                root_hex[0] ? root_hex : "0x0",
-                has_parent ? "true" : "false",
-                has_parent ? parent_slot : 0u,
-                parent_hex[0] ? parent_hex : "0x0");
-        } else {
-            lantern_log_debug(
-                "fork_choice",
-                NULL,
-                "finalization trace block_info miss root=%s reason=%s",
-                root_hex[0] ? root_hex : "0x0",
-                fail_reason ? fail_reason : "error");
-        }
-    }
-    return rc;
+    return 0;
 }
 
 const LanternCheckpoint *lantern_fork_choice_latest_justified(const LanternForkChoice *store) {

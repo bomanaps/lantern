@@ -20,22 +20,11 @@
 #include <inttypes.h>
 #include <limits.h>
 #include <pthread.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
 #include <time.h>
-
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <netdb.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <unistd.h>
-#endif
 
 #include "internal/yaml_parser.h"
 #include "client_internal.h"
@@ -49,6 +38,7 @@
 #include "lantern/consensus/state.h"
 #include "lantern/crypto/xmss.h"
 #include "lantern/encoding/snappy.h"
+#include "lantern/http/client.h"
 #include "lantern/http/server.h"
 #include "lantern/metrics/lean_metrics.h"
 #include "lantern/networking/gossip.h"
@@ -292,59 +282,6 @@ static bool interval_range_last_with_phase(
         *out_interval = end - offset;
     }
     return true;
-}
-
-int lantern_client_set_attestation_signature(
-    struct lantern_client *client,
-    const LanternSignatureKey *key,
-    const LanternAttestationData *data,
-    const LanternSignature *signature,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_set_attestation_signature(&client->store, key, data, signature, target_slot);
-}
-
-int lantern_client_add_new_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_add_new_aggregated_payload(&client->store, data_root, data, proof, target_slot);
-}
-
-int lantern_client_add_known_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_add_known_aggregated_payload(&client->store, data_root, data, proof, target_slot);
-}
-
-size_t lantern_client_promote_new_aggregated_payloads(
-    struct lantern_client *client) {
-    if (!client) {
-        return 0u;
-    }
-    return lantern_store_promote_new_aggregated_payloads(&client->store);
-}
-
-size_t lantern_client_prune_finalized_attestation_material(
-    struct lantern_client *client,
-    uint64_t finalized_slot) {
-    if (!client) {
-        return 0u;
-    }
-    return lantern_store_prune_finalized_attestation_material(&client->store, finalized_slot);
 }
 
 int lantern_client_tick_fork_choice_interval_locked(
@@ -1570,933 +1507,6 @@ static lantern_client_error client_finalize_genesis_state(struct lantern_client 
  * Checkpoint Sync Helpers
  * ============================================================================ */
 
-static int checkpoint_sync_parse_port(
-    const char *text,
-    size_t text_len,
-    uint16_t *out_port)
-{
-    if (!text || text_len == 0 || !out_port)
-    {
-        return -1;
-    }
-
-    uint32_t port = 0;
-    for (size_t i = 0; i < text_len; ++i)
-    {
-        unsigned char ch = (unsigned char)text[i];
-        if (!isdigit(ch))
-        {
-            return -1;
-        }
-        port = (port * 10u) + (uint32_t)(ch - '0');
-        if (port > UINT16_MAX)
-        {
-            return -1;
-        }
-    }
-
-    if (port == 0)
-    {
-        return -1;
-    }
-    *out_port = (uint16_t)port;
-    return 0;
-}
-
-int lantern_client_checkpoint_sync_parse_url(
-    const char *url,
-    char **out_host,
-    uint16_t *out_port,
-    char **out_base_path)
-{
-    if (!url || !out_host || !out_port || !out_base_path)
-    {
-        return -1;
-    }
-
-    *out_host = NULL;
-    *out_base_path = NULL;
-    *out_port = 0;
-
-    const char *http_prefix = "http://";
-    const char *https_prefix = "https://";
-    size_t prefix_len = strlen(http_prefix);
-    if (strncasecmp(url, http_prefix, prefix_len) == 0)
-    {
-        /* plain http — use as-is */
-    }
-    else if (strncasecmp(url, https_prefix, strlen(https_prefix)) == 0)
-    {
-        /* TLS transport is not implemented yet; downgrade to plain HTTP parsing */
-        prefix_len = strlen(https_prefix);
-    }
-    else
-    {
-        return -1;
-    }
-
-    const char *cursor = url + prefix_len;
-    if (*cursor == '\0')
-    {
-        return -1;
-    }
-
-    const char *authority_start = cursor;
-    while (*cursor && *cursor != '/' && *cursor != '?' && *cursor != '#')
-    {
-        ++cursor;
-    }
-    const char *authority_end = cursor;
-    if (authority_end <= authority_start)
-    {
-        return -1;
-    }
-
-    char *base_path = NULL;
-    if (*cursor == '/')
-    {
-        const char *path_start = cursor;
-        while (*cursor && *cursor != '?' && *cursor != '#')
-        {
-            ++cursor;
-        }
-        base_path = lantern_string_duplicate_len(
-            path_start,
-            (size_t)(cursor - path_start));
-    }
-    else
-    {
-        base_path = lantern_string_duplicate("");
-    }
-    if (!base_path)
-    {
-        return -1;
-    }
-
-    char *host = NULL;
-    uint16_t port = 80;
-
-    if (*authority_start == '[')
-    {
-        const char *host_start = authority_start + 1;
-        const char *host_end = host_start;
-        while (host_end < authority_end && *host_end != ']')
-        {
-            ++host_end;
-        }
-        if (host_end >= authority_end || host_end == host_start)
-        {
-            free(base_path);
-            return -1;
-        }
-
-        host = lantern_string_duplicate_len(
-            host_start,
-            (size_t)(host_end - host_start));
-        if (!host)
-        {
-            free(base_path);
-            return -1;
-        }
-
-        const char *port_start = host_end + 1;
-        if (port_start < authority_end)
-        {
-            if (*port_start != ':'
-                || checkpoint_sync_parse_port(
-                       port_start + 1,
-                       (size_t)(authority_end - (port_start + 1)),
-                       &port)
-                    != 0)
-            {
-                free(host);
-                free(base_path);
-                return -1;
-            }
-        }
-    }
-    else
-    {
-        const char *port_sep = NULL;
-        for (const char *p = authority_start; p < authority_end; ++p)
-        {
-            if (*p == ':')
-            {
-                port_sep = p;
-            }
-        }
-
-        const char *host_end = port_sep ? port_sep : authority_end;
-        if (host_end <= authority_start)
-        {
-            free(base_path);
-            return -1;
-        }
-
-        host = lantern_string_duplicate_len(
-            authority_start,
-            (size_t)(host_end - authority_start));
-        if (!host)
-        {
-            free(base_path);
-            return -1;
-        }
-
-        if (port_sep)
-        {
-            if (checkpoint_sync_parse_port(
-                    port_sep + 1,
-                    (size_t)(authority_end - (port_sep + 1)),
-                    &port)
-                != 0)
-            {
-                free(host);
-                free(base_path);
-                return -1;
-            }
-        }
-    }
-
-    if (!host[0])
-    {
-        free(host);
-        free(base_path);
-        return -1;
-    }
-
-    *out_host = host;
-    *out_port = port;
-    *out_base_path = base_path;
-    return 0;
-}
-
-static bool checkpoint_sync_header_has_token(
-    const char *value,
-    const char *token)
-{
-    if (!value || !token || !token[0])
-    {
-        return false;
-    }
-
-    size_t token_len = strlen(token);
-    const char *cursor = value;
-    while (*cursor)
-    {
-        while (*cursor == ',' || isspace((unsigned char)*cursor))
-        {
-            ++cursor;
-        }
-        const char *entry_start = cursor;
-        while (*cursor && *cursor != ',')
-        {
-            ++cursor;
-        }
-        const char *entry_end = cursor;
-        while (entry_end > entry_start
-               && isspace((unsigned char)*(entry_end - 1)))
-        {
-            --entry_end;
-        }
-        if ((size_t)(entry_end - entry_start) == token_len
-            && strncasecmp(entry_start, token, token_len) == 0)
-        {
-            return true;
-        }
-        if (*cursor == ',')
-        {
-            ++cursor;
-        }
-    }
-
-    return false;
-}
-
-#if defined(_WIN32)
-static int checkpoint_sync_connect_tcp(const char *host, uint16_t port)
-{
-    (void)host;
-    (void)port;
-    return -1;
-}
-#else
-static int checkpoint_sync_connect_tcp(const char *host, uint16_t port)
-{
-    if (!host || !host[0])
-    {
-        return -1;
-    }
-
-    char port_text[6];
-    int port_written = snprintf(port_text, sizeof(port_text), "%u", (unsigned int)port);
-    if (port_written <= 0 || (size_t)port_written >= sizeof(port_text))
-    {
-        return -1;
-    }
-
-    struct addrinfo hints;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    struct addrinfo *results = NULL;
-    if (getaddrinfo(host, port_text, &hints, &results) != 0)
-    {
-        return -1;
-    }
-
-    int fd = -1;
-    for (const struct addrinfo *candidate = results; candidate; candidate = candidate->ai_next)
-    {
-        fd = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
-        if (fd < 0)
-        {
-            continue;
-        }
-        if (connect(fd, candidate->ai_addr, candidate->ai_addrlen) == 0)
-        {
-            break;
-        }
-        close(fd);
-        fd = -1;
-    }
-
-    freeaddrinfo(results);
-    return fd;
-}
-#endif
-
-static int checkpoint_sync_send_all(
-    int fd,
-    const uint8_t *data,
-    size_t data_len)
-{
-    if (fd < 0 || !data)
-    {
-        return -1;
-    }
-
-    size_t sent = 0;
-    while (sent < data_len)
-    {
-#if defined(_WIN32)
-        int rc = send(fd, (const char *)(data + sent), (int)(data_len - sent), 0);
-#else
-        ssize_t rc = send(fd, data + sent, data_len - sent, 0);
-#endif
-        if (rc < 0)
-        {
-#if !defined(_WIN32)
-            if (errno == EINTR)
-            {
-                continue;
-            }
-#endif
-            return -1;
-        }
-        if (rc == 0)
-        {
-            return -1;
-        }
-        sent += (size_t)rc;
-    }
-
-    return 0;
-}
-
-static int checkpoint_sync_read_response(
-    int fd,
-    uint8_t **out_bytes,
-    size_t *out_len)
-{
-    if (fd < 0 || !out_bytes || !out_len)
-    {
-        return -1;
-    }
-
-    *out_bytes = NULL;
-    *out_len = 0;
-
-    uint8_t *buffer = NULL;
-    size_t buffer_len = 0;
-    size_t buffer_cap = 0;
-
-    for (;;)
-    {
-        uint8_t chunk[4096];
-#if defined(_WIN32)
-        int read_bytes = recv(fd, (char *)chunk, (int)sizeof(chunk), 0);
-#else
-        ssize_t read_bytes = recv(fd, chunk, sizeof(chunk), 0);
-#endif
-        if (read_bytes < 0)
-        {
-#if !defined(_WIN32)
-            if (errno == EINTR)
-            {
-                continue;
-            }
-#endif
-            free(buffer);
-            return -1;
-        }
-        if (read_bytes == 0)
-        {
-            break;
-        }
-
-        if ((size_t)read_bytes > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES - buffer_len)
-        {
-            free(buffer);
-            return -1;
-        }
-        size_t needed = buffer_len + (size_t)read_bytes;
-        if (needed > buffer_cap)
-        {
-            size_t new_cap = buffer_cap == 0 ? 8192u : buffer_cap;
-            while (new_cap < needed)
-            {
-                if (new_cap > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES / 2u)
-                {
-                    new_cap = CHECKPOINT_SYNC_MAX_RESPONSE_BYTES;
-                    break;
-                }
-                new_cap *= 2u;
-            }
-            if (new_cap < needed)
-            {
-                free(buffer);
-                return -1;
-            }
-            uint8_t *resized = realloc(buffer, new_cap);
-            if (!resized)
-            {
-                free(buffer);
-                return -1;
-            }
-            buffer = resized;
-            buffer_cap = new_cap;
-        }
-
-        memcpy(buffer + buffer_len, chunk, (size_t)read_bytes);
-        buffer_len += (size_t)read_bytes;
-    }
-
-    if (!buffer || buffer_len == 0)
-    {
-        free(buffer);
-        return -1;
-    }
-
-    *out_bytes = buffer;
-    *out_len = buffer_len;
-    return 0;
-}
-
-static int checkpoint_sync_find_header_end(
-    const uint8_t *data,
-    size_t data_len,
-    size_t *out_header_end)
-{
-    if (!data || data_len < 4 || !out_header_end)
-    {
-        return -1;
-    }
-
-    for (size_t i = 0; i + 3 < data_len; ++i)
-    {
-        if (data[i] == '\r'
-            && data[i + 1] == '\n'
-            && data[i + 2] == '\r'
-            && data[i + 3] == '\n')
-        {
-            *out_header_end = i + 4;
-            return 0;
-        }
-    }
-    return -1;
-}
-
-static int checkpoint_sync_decode_chunked_body(
-    const uint8_t *chunked_data,
-    size_t chunked_len,
-    uint8_t **out_body,
-    size_t *out_body_len)
-{
-    if (!chunked_data || !out_body || !out_body_len)
-    {
-        return -1;
-    }
-
-    *out_body = NULL;
-    *out_body_len = 0;
-
-    uint8_t *decoded = NULL;
-    size_t decoded_len = 0;
-    size_t decoded_cap = 0;
-    size_t cursor = 0;
-
-    while (cursor < chunked_len)
-    {
-        size_t line_start = cursor;
-        while (cursor + 1 < chunked_len
-               && !(chunked_data[cursor] == '\r'
-                    && chunked_data[cursor + 1] == '\n'))
-        {
-            ++cursor;
-        }
-        if (cursor + 1 >= chunked_len)
-        {
-            free(decoded);
-            return -1;
-        }
-
-        size_t line_len = cursor - line_start;
-        if (line_len == 0 || line_len >= 64u)
-        {
-            free(decoded);
-            return -1;
-        }
-
-        char line[64];
-        memcpy(line, chunked_data + line_start, line_len);
-        line[line_len] = '\0';
-
-        char *extensions = strchr(line, ';');
-        if (extensions)
-        {
-            *extensions = '\0';
-        }
-
-        char *trimmed = line;
-        while (*trimmed && isspace((unsigned char)*trimmed))
-        {
-            ++trimmed;
-        }
-        if (!*trimmed)
-        {
-            free(decoded);
-            return -1;
-        }
-
-        errno = 0;
-        char *endptr = NULL;
-        unsigned long long chunk_size_u64 = strtoull(trimmed, &endptr, 16);
-        if (errno != 0 || endptr == trimmed)
-        {
-            free(decoded);
-            return -1;
-        }
-        while (*endptr && isspace((unsigned char)*endptr))
-        {
-            ++endptr;
-        }
-        if (*endptr != '\0')
-        {
-            free(decoded);
-            return -1;
-        }
-
-        cursor += 2;
-
-        if (chunk_size_u64 == 0)
-        {
-            if (cursor + 1 < chunked_len
-                && chunked_data[cursor] == '\r'
-                && chunked_data[cursor + 1] == '\n')
-            {
-                cursor += 2;
-                break;
-            }
-
-            bool trailers_done = false;
-            for (size_t i = cursor; i + 3 < chunked_len; ++i)
-            {
-                if (chunked_data[i] == '\r'
-                    && chunked_data[i + 1] == '\n'
-                    && chunked_data[i + 2] == '\r'
-                    && chunked_data[i + 3] == '\n')
-                {
-                    cursor = i + 4;
-                    trailers_done = true;
-                    break;
-                }
-            }
-            if (!trailers_done)
-            {
-                free(decoded);
-                return -1;
-            }
-            break;
-        }
-
-        if (chunk_size_u64 > (unsigned long long)(chunked_len - cursor))
-        {
-            free(decoded);
-            return -1;
-        }
-        if (chunk_size_u64 > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES - decoded_len)
-        {
-            free(decoded);
-            return -1;
-        }
-
-        size_t chunk_size = (size_t)chunk_size_u64;
-        size_t needed = decoded_len + chunk_size;
-        if (needed > decoded_cap)
-        {
-            size_t new_cap = decoded_cap == 0 ? 4096u : decoded_cap;
-            while (new_cap < needed)
-            {
-                if (new_cap > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES / 2u)
-                {
-                    new_cap = CHECKPOINT_SYNC_MAX_RESPONSE_BYTES;
-                    break;
-                }
-                new_cap *= 2u;
-            }
-            if (new_cap < needed)
-            {
-                free(decoded);
-                return -1;
-            }
-
-            uint8_t *resized = realloc(decoded, new_cap);
-            if (!resized)
-            {
-                free(decoded);
-                return -1;
-            }
-            decoded = resized;
-            decoded_cap = new_cap;
-        }
-
-        memcpy(decoded + decoded_len, chunked_data + cursor, chunk_size);
-        decoded_len += chunk_size;
-        cursor += chunk_size;
-
-        if (cursor + 1 >= chunked_len
-            || chunked_data[cursor] != '\r'
-            || chunked_data[cursor + 1] != '\n')
-        {
-            free(decoded);
-            return -1;
-        }
-        cursor += 2;
-    }
-
-    *out_body = decoded;
-    *out_body_len = decoded_len;
-    return 0;
-}
-
-static int checkpoint_sync_extract_http_body(
-    const uint8_t *response,
-    size_t response_len,
-    int *out_status_code,
-    uint8_t **out_body,
-    size_t *out_body_len)
-{
-    if (!response || !out_status_code || !out_body || !out_body_len)
-    {
-        return -1;
-    }
-
-    *out_status_code = 0;
-    *out_body = NULL;
-    *out_body_len = 0;
-
-    size_t header_end = 0;
-    if (checkpoint_sync_find_header_end(response, response_len, &header_end) != 0)
-    {
-        return -1;
-    }
-
-    char *headers = malloc(header_end + 1u);
-    if (!headers)
-    {
-        return -1;
-    }
-    memcpy(headers, response, header_end);
-    headers[header_end] = '\0';
-
-    int status_code = 0;
-    if (sscanf(headers, "HTTP/%*u.%*u %d", &status_code) != 1)
-    {
-        free(headers);
-        return -1;
-    }
-    *out_status_code = status_code;
-
-    bool is_chunked = false;
-    bool has_content_length = false;
-    size_t content_length = 0;
-
-    char *line = strstr(headers, "\r\n");
-    if (line)
-    {
-        line += 2;
-    }
-    while (line && line[0] != '\0')
-    {
-        char *line_end = strstr(line, "\r\n");
-        if (!line_end)
-        {
-            break;
-        }
-        if (line_end == line)
-        {
-            break;
-        }
-
-        *line_end = '\0';
-        size_t line_len = (size_t)(line_end - line);
-        if (line_len >= 15
-            && strncasecmp(line, "Content-Length:", 15) == 0)
-        {
-            const char *value = line + 15;
-            while (*value && isspace((unsigned char)*value))
-            {
-                ++value;
-            }
-            errno = 0;
-            char *endptr = NULL;
-            unsigned long long parsed = strtoull(value, &endptr, 10);
-            while (endptr && *endptr && isspace((unsigned char)*endptr))
-            {
-                ++endptr;
-            }
-            if (errno == 0 && endptr && *endptr == '\0')
-            {
-                if (parsed > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES)
-                {
-                    free(headers);
-                    return -1;
-                }
-                content_length = (size_t)parsed;
-                has_content_length = true;
-            }
-        }
-        else if (line_len >= 18
-                 && strncasecmp(line, "Transfer-Encoding:", 18) == 0)
-        {
-            const char *value = line + 18;
-            while (*value && isspace((unsigned char)*value))
-            {
-                ++value;
-            }
-            if (checkpoint_sync_header_has_token(value, "chunked"))
-            {
-                is_chunked = true;
-            }
-        }
-
-        *line_end = '\r';
-        line = line_end + 2;
-    }
-
-    const uint8_t *body_start = response + header_end;
-    size_t body_available = response_len - header_end;
-
-    if (status_code != 200)
-    {
-        free(headers);
-        return 1;
-    }
-
-    int rc = -1;
-    if (is_chunked)
-    {
-        rc = checkpoint_sync_decode_chunked_body(
-            body_start,
-            body_available,
-            out_body,
-            out_body_len);
-    }
-    else
-    {
-        size_t body_len = body_available;
-        if (has_content_length)
-        {
-            if (body_available < content_length)
-            {
-                free(headers);
-                return -1;
-            }
-            body_len = content_length;
-        }
-
-        if (body_len > CHECKPOINT_SYNC_MAX_RESPONSE_BYTES)
-        {
-            free(headers);
-            return -1;
-        }
-
-        uint8_t *copy = malloc(body_len);
-        if (!copy)
-        {
-            free(headers);
-            return -1;
-        }
-        if (body_len > 0)
-        {
-            memcpy(copy, body_start, body_len);
-        }
-        *out_body = copy;
-        *out_body_len = body_len;
-        rc = 0;
-    }
-
-    free(headers);
-    return rc;
-}
-
-static int checkpoint_sync_fetch_bytes(
-    const char *checkpoint_sync_url,
-    uint8_t **out_bytes,
-    size_t *out_len,
-    int *out_status_code)
-{
-    if (!checkpoint_sync_url || !out_bytes || !out_len || !out_status_code)
-    {
-        return -1;
-    }
-
-    *out_bytes = NULL;
-    *out_len = 0;
-    *out_status_code = 0;
-
-    char *host = NULL;
-    char *base_path = NULL;
-    uint16_t port = 0;
-    if (lantern_client_checkpoint_sync_parse_url(
-            checkpoint_sync_url,
-            &host,
-            &port,
-            &base_path)
-        != 0)
-    {
-        return -1;
-    }
-
-    if (!base_path || !base_path[0])
-    {
-        free(base_path);
-        free(host);
-        return -1;
-    }
-    char *request_target = base_path;
-    base_path = NULL;
-
-    bool is_ipv6 = strchr(host, ':') != NULL;
-    int host_header_len = snprintf(
-        NULL,
-        0,
-        is_ipv6 ? "[%s]:%u" : "%s:%u",
-        host,
-        (unsigned int)port);
-    if (host_header_len <= 0)
-    {
-        free(request_target);
-        free(host);
-        return -1;
-    }
-    char *host_header = malloc((size_t)host_header_len + 1u);
-    if (!host_header)
-    {
-        free(request_target);
-        free(host);
-        return -1;
-    }
-    snprintf(
-        host_header,
-        (size_t)host_header_len + 1u,
-        is_ipv6 ? "[%s]:%u" : "%s:%u",
-        host,
-        (unsigned int)port);
-
-    int request_len = snprintf(
-        NULL,
-        0,
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Accept: application/octet-stream\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        request_target,
-        host_header);
-    if (request_len <= 0)
-    {
-        free(host_header);
-        free(request_target);
-        free(host);
-        return -1;
-    }
-
-    char *request = malloc((size_t)request_len + 1u);
-    if (!request)
-    {
-        free(host_header);
-        free(request_target);
-        free(host);
-        return -1;
-    }
-    snprintf(
-        request,
-        (size_t)request_len + 1u,
-        "GET %s HTTP/1.1\r\n"
-        "Host: %s\r\n"
-        "Accept: application/octet-stream\r\n"
-        "Connection: close\r\n"
-        "\r\n",
-        request_target,
-        host_header);
-
-    int fd = checkpoint_sync_connect_tcp(host, port);
-    if (fd < 0)
-    {
-        free(request);
-        free(host_header);
-        free(request_target);
-        free(host);
-        return -1;
-    }
-
-    int rc = -1;
-    uint8_t *response = NULL;
-    size_t response_len = 0;
-    if (checkpoint_sync_send_all(
-            fd,
-            (const uint8_t *)request,
-            (size_t)request_len)
-        != 0)
-    {
-        goto cleanup;
-    }
-    if (checkpoint_sync_read_response(fd, &response, &response_len) != 0)
-    {
-        goto cleanup;
-    }
-
-    rc = checkpoint_sync_extract_http_body(
-        response,
-        response_len,
-        out_status_code,
-        out_bytes,
-        out_len);
-
-cleanup:
-#if !defined(_WIN32)
-    close(fd);
-#endif
-    free(response);
-    free(request);
-    free(host_header);
-    free(request_target);
-    free(host);
-    return rc;
-}
-
 static lantern_client_error client_load_state_from_checkpoint(
     struct lantern_client *client,
     const char *checkpoint_sync_url)
@@ -2513,23 +1523,21 @@ static lantern_client_error client_load_state_from_checkpoint(
         "fetching finalized checkpoint state from %s",
         checkpoint_sync_url);
 
-    uint8_t *state_bytes = NULL;
-    size_t state_len = 0;
-    int status_code = 0;
-    int fetch_rc = checkpoint_sync_fetch_bytes(
+    struct lantern_http_fetch_result fetch_result;
+    int fetch_rc = lantern_http_get_bytes(
         checkpoint_sync_url,
-        &state_bytes,
-        &state_len,
-        &status_code);
+        "application/octet-stream",
+        CHECKPOINT_SYNC_MAX_RESPONSE_BYTES,
+        &fetch_result);
     if (fetch_rc != 0)
     {
-        if (fetch_rc == 1)
+        if (fetch_rc == LANTERN_HTTP_CLIENT_STATUS_ERROR)
         {
             lantern_log_error(
                 "checkpoint_sync",
                 &meta,
                 "checkpoint sync endpoint returned HTTP %d",
-                status_code);
+                fetch_result.status_code);
         }
         else
         {
@@ -2539,13 +1547,13 @@ static lantern_client_error client_load_state_from_checkpoint(
                 "failed to fetch checkpoint state from %s",
                 checkpoint_sync_url);
         }
-        free(state_bytes);
+        lantern_http_fetch_result_reset(&fetch_result);
         return LANTERN_CLIENT_ERR_NETWORK;
     }
 
-    if (!state_bytes || state_len == 0)
+    if (!fetch_result.body || fetch_result.body_len == 0)
     {
-        free(state_bytes);
+        lantern_http_fetch_result_reset(&fetch_result);
         lantern_log_error(
             "checkpoint_sync",
             &meta,
@@ -2561,13 +1569,13 @@ static lantern_client_error client_load_state_from_checkpoint(
     bool decoded_owned = true;
     lantern_client_error result = LANTERN_CLIENT_OK;
 
-    if (lantern_ssz_decode_state(&decoded, state_bytes, state_len) != SSZ_SUCCESS)
+    if (lantern_ssz_decode_state(&decoded, fetch_result.body, fetch_result.body_len) != SSZ_SUCCESS)
     {
         lantern_log_error(
             "checkpoint_sync",
             &meta,
             "failed to decode checkpoint state SSZ (bytes=%zu)",
-            state_len);
+            fetch_result.body_len);
         result = LANTERN_CLIENT_ERR_GENESIS;
         goto cleanup;
     }
@@ -2682,7 +1690,7 @@ static lantern_client_error client_load_state_from_checkpoint(
         anchor_root_hex[0] ? anchor_root_hex : "0x0");
 
 cleanup:
-    free(state_bytes);
+    lantern_http_fetch_result_reset(&fetch_result);
     if (anchor_block_initialized)
     {
         lantern_block_body_reset(&anchor_block.body);
@@ -3569,6 +2577,44 @@ static void shutdown_network_services(struct lantern_client *client)
     lantern_string_list_reset(&client->connected_peer_ids);
     lantern_string_list_reset(&client->connected_peer_refs);
     lantern_string_list_reset(&client->inbound_peer_ids);
+    free(client->connection_peer_refs);
+    client->connection_peer_refs = NULL;
+    client->connection_peer_ref_count = 0;
+    client->connection_peer_ref_capacity = 0;
+}
+
+static void clear_status_tracking(struct lantern_client *client)
+{
+    free(client->peer_status_entries);
+    client->peer_status_entries = NULL;
+    client->peer_status_count = 0;
+    client->peer_status_capacity = 0;
+    free(client->active_blocks_requests);
+    client->active_blocks_requests = NULL;
+    client->active_blocks_request_count = 0;
+    client->active_blocks_request_capacity = 0;
+    client->next_blocks_request_id = 0;
+}
+
+static void clear_peer_vote_tracking(struct lantern_client *client)
+{
+    free(client->peer_vote_stats);
+    client->peer_vote_stats = NULL;
+    client->peer_vote_stats_len = 0;
+    client->peer_vote_stats_cap = 0;
+}
+
+static void clear_validator_enabled(struct lantern_client *client)
+{
+    free(client->validator_enabled);
+    client->validator_enabled = NULL;
+}
+
+static void clear_pending_block_state(struct lantern_client *client)
+{
+    pending_block_list_reset(&client->pending_blocks);
+    free(client->backfill.entries);
+    memset(&client->backfill, 0, sizeof(client->backfill));
 }
 
 
@@ -3585,71 +2631,38 @@ static void shutdown_peer_tracking(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->status_lock) == 0)
         {
-            free(client->peer_status_entries);
-            client->peer_status_entries = NULL;
-            client->peer_status_count = 0;
-            client->peer_status_capacity = 0;
-            free(client->active_blocks_requests);
-            client->active_blocks_requests = NULL;
-            client->active_blocks_request_count = 0;
-            client->active_blocks_request_capacity = 0;
-            client->next_blocks_request_id = 0;
+            clear_status_tracking(client);
             pthread_mutex_unlock(&client->status_lock);
         }
         else
         {
-            free(client->peer_status_entries);
-            client->peer_status_entries = NULL;
-            client->peer_status_count = 0;
-            client->peer_status_capacity = 0;
-            free(client->active_blocks_requests);
-            client->active_blocks_requests = NULL;
-            client->active_blocks_request_count = 0;
-            client->active_blocks_request_capacity = 0;
-            client->next_blocks_request_id = 0;
+            clear_status_tracking(client);
         }
         pthread_mutex_destroy(&client->status_lock);
         client->status_lock_initialized = false;
     }
     else
     {
-        free(client->peer_status_entries);
-        client->peer_status_entries = NULL;
-        client->peer_status_count = 0;
-        client->peer_status_capacity = 0;
-        free(client->active_blocks_requests);
-        client->active_blocks_requests = NULL;
-        client->active_blocks_request_count = 0;
-        client->active_blocks_request_capacity = 0;
-        client->next_blocks_request_id = 0;
+        clear_status_tracking(client);
     }
 
     if (client->peer_vote_lock_initialized)
     {
         if (pthread_mutex_lock(&client->peer_vote_lock) == 0)
         {
-            free(client->peer_vote_stats);
-            client->peer_vote_stats = NULL;
-            client->peer_vote_stats_len = 0;
-            client->peer_vote_stats_cap = 0;
+            clear_peer_vote_tracking(client);
             pthread_mutex_unlock(&client->peer_vote_lock);
         }
         else
         {
-            free(client->peer_vote_stats);
-            client->peer_vote_stats = NULL;
-            client->peer_vote_stats_len = 0;
-            client->peer_vote_stats_cap = 0;
+            clear_peer_vote_tracking(client);
         }
         pthread_mutex_destroy(&client->peer_vote_lock);
         client->peer_vote_lock_initialized = false;
     }
     else
     {
-        free(client->peer_vote_stats);
-        client->peer_vote_stats = NULL;
-        client->peer_vote_stats_len = 0;
-        client->peer_vote_stats_cap = 0;
+        clear_peer_vote_tracking(client);
     }
 }
 
@@ -3667,22 +2680,19 @@ static void shutdown_validator_lock(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->validator_lock) == 0)
         {
-            free(client->validator_enabled);
-            client->validator_enabled = NULL;
+            clear_validator_enabled(client);
             pthread_mutex_unlock(&client->validator_lock);
         }
         else
         {
-            free(client->validator_enabled);
-            client->validator_enabled = NULL;
+            clear_validator_enabled(client);
         }
         pthread_mutex_destroy(&client->validator_lock);
         client->validator_lock_initialized = false;
     }
     else
     {
-        free(client->validator_enabled);
-        client->validator_enabled = NULL;
+        clear_validator_enabled(client);
     }
 }
 
@@ -3700,25 +2710,19 @@ static void shutdown_pending_blocks(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->pending_lock) == 0)
         {
-            pending_block_list_reset(&client->pending_blocks);
-            free(client->backfill.entries);
-            memset(&client->backfill, 0, sizeof(client->backfill));
+            clear_pending_block_state(client);
             pthread_mutex_unlock(&client->pending_lock);
         }
         else
         {
-            pending_block_list_reset(&client->pending_blocks);
-            free(client->backfill.entries);
-            memset(&client->backfill, 0, sizeof(client->backfill));
+            clear_pending_block_state(client);
         }
         pthread_mutex_destroy(&client->pending_lock);
         client->pending_lock_initialized = false;
     }
     else
     {
-        pending_block_list_reset(&client->pending_blocks);
-        free(client->backfill.entries);
-        memset(&client->backfill, 0, sizeof(client->backfill));
+        clear_pending_block_state(client);
     }
 }
 

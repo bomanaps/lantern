@@ -215,93 +215,6 @@ bool lantern_client_persisted_state_is_stale_for_checkpoint_sync(
 size_t lantern_client_attestation_committee_count(const struct lantern_client *client);
 
 /**
- * Parse a checkpoint sync base URL.
- *
- * `http://` URLs are parsed directly. `https://` URLs are currently accepted
- * but downgraded to the existing plaintext HTTP transport. Callers own the
- * returned host/base-path buffers and must free them with `free()`.
- *
- * @return 0 on success, -1 on parse/validation failure.
- */
-int lantern_client_checkpoint_sync_parse_url(
-    const char *url,
-    char **out_host,
-    uint16_t *out_port,
-    char **out_base_path);
-
-/**
- * Cache an individual attestation signature keyed by validator and attestation root.
- *
- * @param client     Client instance (state_lock must be held)
- * @param key        Signature cache key
- * @param signature  XMSS signature to cache, or NULL to record attestation data only
- * @return 0 on success, -1 on error
- *
- * @note Thread safety: Caller must hold state_lock.
- */
-int lantern_client_set_attestation_signature(
-    struct lantern_client *client,
-    const LanternSignatureKey *key,
-    const LanternAttestationData *data,
-    const LanternSignature *signature,
-    uint64_t target_slot);
-
-static inline int lantern_client_set_gossip_signature(
-    struct lantern_client *client,
-    const LanternSignatureKey *key,
-    const LanternAttestationData *data,
-    const LanternSignature *signature,
-    uint64_t target_slot) {
-    return lantern_client_set_attestation_signature(client, key, data, signature, target_slot);
-}
-
-/**
- * Cache a newly received aggregated signature proof keyed by attestation data root.
- *
- * @note Thread safety: Caller must hold state_lock.
- */
-int lantern_client_add_new_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot);
-
-/**
- * Cache a processed aggregated signature proof in the known payload pool.
- *
- * @note Thread safety: Caller must hold state_lock.
- */
-int lantern_client_add_known_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot);
-
-/**
- * Promote pending aggregated payloads into the known pool.
- *
- * @note Thread safety: Caller must hold state_lock.
- */
-size_t lantern_client_promote_new_aggregated_payloads(
-    struct lantern_client *client);
-
-/**
- * Prune cached signatures, attestation data, and aggregated payloads whose
- * attestation target slot is finalized.
- *
- * @param client          Client instance (state_lock must be held)
- * @param finalized_slot  Latest finalized slot boundary
- * @return Number of entries removed
- *
- * @note Thread safety: Caller must hold state_lock.
- */
-size_t lantern_client_prune_finalized_attestation_material(
-    struct lantern_client *client,
-    uint64_t finalized_slot);
-
-/**
  * Advance fork choice by exactly one interval and sync crossed payload-pool transitions.
  *
  * Caller must hold state_lock or otherwise guarantee exclusive access to the
@@ -344,19 +257,6 @@ int lantern_client_advance_fork_choice_time_locked(
     struct lantern_client *client,
     uint64_t now_milliseconds,
     bool has_proposal);
-
-/**
- * Select cached aggregated proofs for block attestations.
- *
- * @note Thread safety: Acquires state_lock internally.
- */
-lantern_client_error lantern_client_aggregate_attestations_for_block(
-    struct lantern_client *client,
-    const LanternAttestations *att_list,
-    const LanternSignatureList *att_signatures,
-    LanternAggregatedAttestations *out_attestations,
-    LanternAttestationSignatures *out_signatures);
-
 
 /* ============================================================================
  * Lock Functions

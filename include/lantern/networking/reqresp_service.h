@@ -139,6 +139,7 @@ struct lantern_reqresp_protocol_context {
 struct lantern_reqresp_conn_entry {
     struct lantern_peer_id peer;
     libp2p_host_conn_t *conn;
+    int inbound;
 };
 
 struct lantern_reqresp_service {
@@ -173,13 +174,6 @@ int lantern_reqresp_service_request_blocks(
     const char *peer_id_text,
     const LanternRoot *roots,
     size_t root_count,
-    uint64_t request_id);
-int lantern_reqresp_service_request_blocks_by_range(
-    struct lantern_reqresp_service *service,
-    const struct lantern_peer_id *peer_id,
-    const char *peer_id_text,
-    uint64_t start_slot,
-    uint64_t count,
     uint64_t request_id);
 int lantern_reqresp_service_start(
     struct lantern_reqresp_service *service,
