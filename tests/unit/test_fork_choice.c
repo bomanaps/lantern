@@ -110,6 +110,43 @@ static LanternSignedVote make_vote(
     return vote;
 }
 
+static int wrap_test_attestations_as_aggregated(
+    const LanternAttestations *attestations,
+    LanternAggregatedAttestations *out_aggregated) {
+    if (!attestations || !out_aggregated) {
+        return -1;
+    }
+    if (lantern_aggregated_attestations_resize(out_aggregated, 0) != 0) {
+        return -1;
+    }
+    if (attestations->length == 0) {
+        return 0;
+    }
+    if (!attestations->data) {
+        return -1;
+    }
+    for (size_t i = 0; i < attestations->length; ++i) {
+        const LanternVote *vote = &attestations->data[i];
+        if (vote->validator_id >= LANTERN_VALIDATOR_REGISTRY_LIMIT) {
+            return -1;
+        }
+        LanternAggregatedAttestation att;
+        lantern_aggregated_attestation_init(&att);
+        att.data.slot = vote->slot;
+        att.data.head = vote->head;
+        att.data.target = vote->target;
+        att.data.source = vote->source;
+        if (lantern_bitlist_resize(&att.aggregation_bits, (size_t)vote->validator_id + 1u) != 0
+            || lantern_bitlist_set(&att.aggregation_bits, (size_t)vote->validator_id, true) != 0
+            || lantern_aggregated_attestations_append(out_aggregated, &att) != 0) {
+            lantern_aggregated_attestation_reset(&att);
+            return -1;
+        }
+        lantern_aggregated_attestation_reset(&att);
+    }
+    return 0;
+}
+
 static int build_dummy_proof(
     LanternAggregatedSignatureProof *out_proof,
     uint64_t validator_id,
@@ -1420,7 +1457,7 @@ static int test_fork_choice_add_block_skips_conflicting_block_attestation(void) 
         goto cleanup;
     }
     votes.data[0] = make_vote(0, &block_one_cp, &block_two_b_cp).data;
-    if (lantern_wrap_attestations_as_aggregated(&votes, &block_three.body.attestations) != 0) {
+    if (wrap_test_attestations_as_aggregated(&votes, &block_three.body.attestations) != 0) {
         fprintf(stderr, "failed to build conflicting aggregated attestation\n");
         goto cleanup;
     }
@@ -1606,7 +1643,7 @@ static int test_fork_choice_block_attestation_votes_do_not_bypass_attached_paylo
     lantern_attestations_init(&votes);
     assert(lantern_attestations_resize(&votes, 1u) == 0);
     votes.data[0] = make_vote(0, &block_one_cp, &voted_cp).data;
-    assert(lantern_wrap_attestations_as_aggregated(&votes, &voted_branch->body.attestations) == 0);
+    assert(wrap_test_attestations_as_aggregated(&votes, &voted_branch->body.attestations) == 0);
 
     assert(
         lantern_fork_choice_add_block(

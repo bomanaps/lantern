@@ -353,8 +353,8 @@ static bool cache_attestation_signature_locked(
         .validator_index = vote->data.validator_id,
         .data_root = data_root,
     };
-    if (lantern_client_set_attestation_signature(
-            client,
+    if (lantern_store_set_attestation_signature(
+            &client->store,
             &key,
             &vote->data.data,
             signature_to_cache,

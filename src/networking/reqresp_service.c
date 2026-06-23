@@ -507,16 +507,6 @@ static int snappy_frame_payload_len(
     return 0;
 }
 
-static int encode_uvarint(uint64_t value, uint8_t out[10], size_t *written) {
-    if (!out || !written) {
-        return -1;
-    }
-    if (libp2p_uvarint_encode(value, out, 10u, written) != LIBP2P_UVARINT_OK) {
-        return -1;
-    }
-    return 0;
-}
-
 static int build_frame_from_raw(
     const uint8_t *raw,
     size_t raw_len,
@@ -547,7 +537,8 @@ static int build_frame_from_raw(
     }
     uint8_t header[10];
     size_t header_len = 0;
-    if (encode_uvarint((uint64_t)raw_len, header, &header_len) != 0) {
+    if (libp2p_uvarint_encode((uint64_t)raw_len, header, sizeof(header), &header_len)
+        != LIBP2P_UVARINT_OK) {
         free(compressed);
         return -1;
     }

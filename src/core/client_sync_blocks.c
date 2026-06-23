@@ -2715,8 +2715,8 @@ static void prune_finalized_attestation_material_if_slot_advanced_locked(
         return;
     }
 
-    (void)lantern_client_prune_finalized_attestation_material(
-        client,
+    (void)lantern_store_prune_finalized_attestation_material(
+        &client->store,
         current_finalized->slot);
 }
 

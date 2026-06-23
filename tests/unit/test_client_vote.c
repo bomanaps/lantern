@@ -20,36 +20,23 @@
 #include "lantern/storage/storage.h"
 #include "lantern/support/time.h"
 
-/* Internal core APIs used for targeted cache and block-build regression tests. */
-int lantern_client_set_attestation_signature(
-    struct lantern_client *client,
-    const LanternSignatureKey *key,
-    const LanternAttestationData *data,
-    const LanternSignature *signature,
-    uint64_t target_slot);
-int lantern_client_add_new_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot);
-int lantern_client_add_known_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot);
+/* Test-only aliases for direct store access in targeted cache regressions. */
+#define lantern_client_set_attestation_signature(client, key, data, signature, target_slot) \
+    lantern_store_set_attestation_signature(&(client)->store, key, data, signature, target_slot)
+#define lantern_client_add_new_aggregated_payload(client, data_root, data, proof, target_slot) \
+    lantern_store_add_new_aggregated_payload(&(client)->store, data_root, data, proof, target_slot)
+#define lantern_client_add_known_aggregated_payload(client, data_root, data, proof, target_slot) \
+    lantern_store_add_known_aggregated_payload(&(client)->store, data_root, data, proof, target_slot)
 int lantern_client_commit_and_publish_local_block(
     struct lantern_client *client,
     const LanternSignedBlock *block,
     const LanternRoot *block_root,
     LanternState *post_state,
     LanternStore *post_store);
-size_t lantern_client_promote_new_aggregated_payloads(
-    struct lantern_client *client);
-size_t lantern_client_prune_finalized_attestation_material(
-    struct lantern_client *client,
-    uint64_t finalized_slot);
+#define lantern_client_promote_new_aggregated_payloads(client) \
+    lantern_store_promote_new_aggregated_payloads(&(client)->store)
+#define lantern_client_prune_finalized_attestation_material(client, finalized_slot) \
+    lantern_store_prune_finalized_attestation_material(&(client)->store, finalized_slot)
 int lantern_client_chain_service_tick_to(
     struct lantern_client *client,
     uint64_t target_interval,

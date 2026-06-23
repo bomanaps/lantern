@@ -2167,8 +2167,8 @@ int validator_publish_vote(struct lantern_client *client, const LanternSignedVot
             .validator_index = vote->data.validator_id,
             .data_root = data_root,
         };
-        if (lantern_client_set_attestation_signature(
-                client,
+        if (lantern_store_set_attestation_signature(
+                &client->store,
                 &key,
                 &vote->data.data,
                 &vote->signature,

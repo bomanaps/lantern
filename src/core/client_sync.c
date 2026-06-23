@@ -1026,8 +1026,8 @@ static bool verify_and_cache_aggregated_attestation_locked(
     if (!verified) {
         return false;
     }
-    if (lantern_client_add_new_aggregated_payload(
-            client,
+    if (lantern_store_add_new_aggregated_payload(
+            &client->store,
             &data_root,
             &attestation->data,
             &attestation->proof,

@@ -284,59 +284,6 @@ static bool interval_range_last_with_phase(
     return true;
 }
 
-int lantern_client_set_attestation_signature(
-    struct lantern_client *client,
-    const LanternSignatureKey *key,
-    const LanternAttestationData *data,
-    const LanternSignature *signature,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_set_attestation_signature(&client->store, key, data, signature, target_slot);
-}
-
-int lantern_client_add_new_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_add_new_aggregated_payload(&client->store, data_root, data, proof, target_slot);
-}
-
-int lantern_client_add_known_aggregated_payload(
-    struct lantern_client *client,
-    const LanternRoot *data_root,
-    const LanternAttestationData *data,
-    const LanternAggregatedSignatureProof *proof,
-    uint64_t target_slot) {
-    if (!client) {
-        return -1;
-    }
-    return lantern_store_add_known_aggregated_payload(&client->store, data_root, data, proof, target_slot);
-}
-
-size_t lantern_client_promote_new_aggregated_payloads(
-    struct lantern_client *client) {
-    if (!client) {
-        return 0u;
-    }
-    return lantern_store_promote_new_aggregated_payloads(&client->store);
-}
-
-size_t lantern_client_prune_finalized_attestation_material(
-    struct lantern_client *client,
-    uint64_t finalized_slot) {
-    if (!client) {
-        return 0u;
-    }
-    return lantern_store_prune_finalized_attestation_material(&client->store, finalized_slot);
-}
-
 int lantern_client_tick_fork_choice_interval_locked(
     struct lantern_client *client,
     bool has_proposal) {
@@ -2636,6 +2583,40 @@ static void shutdown_network_services(struct lantern_client *client)
     client->connection_peer_ref_capacity = 0;
 }
 
+static void clear_status_tracking(struct lantern_client *client)
+{
+    free(client->peer_status_entries);
+    client->peer_status_entries = NULL;
+    client->peer_status_count = 0;
+    client->peer_status_capacity = 0;
+    free(client->active_blocks_requests);
+    client->active_blocks_requests = NULL;
+    client->active_blocks_request_count = 0;
+    client->active_blocks_request_capacity = 0;
+    client->next_blocks_request_id = 0;
+}
+
+static void clear_peer_vote_tracking(struct lantern_client *client)
+{
+    free(client->peer_vote_stats);
+    client->peer_vote_stats = NULL;
+    client->peer_vote_stats_len = 0;
+    client->peer_vote_stats_cap = 0;
+}
+
+static void clear_validator_enabled(struct lantern_client *client)
+{
+    free(client->validator_enabled);
+    client->validator_enabled = NULL;
+}
+
+static void clear_pending_block_state(struct lantern_client *client)
+{
+    pending_block_list_reset(&client->pending_blocks);
+    free(client->backfill.entries);
+    memset(&client->backfill, 0, sizeof(client->backfill));
+}
+
 
 /**
  * @brief Free peer tracking structures and destroy associated locks.
@@ -2650,71 +2631,38 @@ static void shutdown_peer_tracking(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->status_lock) == 0)
         {
-            free(client->peer_status_entries);
-            client->peer_status_entries = NULL;
-            client->peer_status_count = 0;
-            client->peer_status_capacity = 0;
-            free(client->active_blocks_requests);
-            client->active_blocks_requests = NULL;
-            client->active_blocks_request_count = 0;
-            client->active_blocks_request_capacity = 0;
-            client->next_blocks_request_id = 0;
+            clear_status_tracking(client);
             pthread_mutex_unlock(&client->status_lock);
         }
         else
         {
-            free(client->peer_status_entries);
-            client->peer_status_entries = NULL;
-            client->peer_status_count = 0;
-            client->peer_status_capacity = 0;
-            free(client->active_blocks_requests);
-            client->active_blocks_requests = NULL;
-            client->active_blocks_request_count = 0;
-            client->active_blocks_request_capacity = 0;
-            client->next_blocks_request_id = 0;
+            clear_status_tracking(client);
         }
         pthread_mutex_destroy(&client->status_lock);
         client->status_lock_initialized = false;
     }
     else
     {
-        free(client->peer_status_entries);
-        client->peer_status_entries = NULL;
-        client->peer_status_count = 0;
-        client->peer_status_capacity = 0;
-        free(client->active_blocks_requests);
-        client->active_blocks_requests = NULL;
-        client->active_blocks_request_count = 0;
-        client->active_blocks_request_capacity = 0;
-        client->next_blocks_request_id = 0;
+        clear_status_tracking(client);
     }
 
     if (client->peer_vote_lock_initialized)
     {
         if (pthread_mutex_lock(&client->peer_vote_lock) == 0)
         {
-            free(client->peer_vote_stats);
-            client->peer_vote_stats = NULL;
-            client->peer_vote_stats_len = 0;
-            client->peer_vote_stats_cap = 0;
+            clear_peer_vote_tracking(client);
             pthread_mutex_unlock(&client->peer_vote_lock);
         }
         else
         {
-            free(client->peer_vote_stats);
-            client->peer_vote_stats = NULL;
-            client->peer_vote_stats_len = 0;
-            client->peer_vote_stats_cap = 0;
+            clear_peer_vote_tracking(client);
         }
         pthread_mutex_destroy(&client->peer_vote_lock);
         client->peer_vote_lock_initialized = false;
     }
     else
     {
-        free(client->peer_vote_stats);
-        client->peer_vote_stats = NULL;
-        client->peer_vote_stats_len = 0;
-        client->peer_vote_stats_cap = 0;
+        clear_peer_vote_tracking(client);
     }
 }
 
@@ -2732,22 +2680,19 @@ static void shutdown_validator_lock(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->validator_lock) == 0)
         {
-            free(client->validator_enabled);
-            client->validator_enabled = NULL;
+            clear_validator_enabled(client);
             pthread_mutex_unlock(&client->validator_lock);
         }
         else
         {
-            free(client->validator_enabled);
-            client->validator_enabled = NULL;
+            clear_validator_enabled(client);
         }
         pthread_mutex_destroy(&client->validator_lock);
         client->validator_lock_initialized = false;
     }
     else
     {
-        free(client->validator_enabled);
-        client->validator_enabled = NULL;
+        clear_validator_enabled(client);
     }
 }
 
@@ -2765,25 +2710,19 @@ static void shutdown_pending_blocks(struct lantern_client *client)
     {
         if (pthread_mutex_lock(&client->pending_lock) == 0)
         {
-            pending_block_list_reset(&client->pending_blocks);
-            free(client->backfill.entries);
-            memset(&client->backfill, 0, sizeof(client->backfill));
+            clear_pending_block_state(client);
             pthread_mutex_unlock(&client->pending_lock);
         }
         else
         {
-            pending_block_list_reset(&client->pending_blocks);
-            free(client->backfill.entries);
-            memset(&client->backfill, 0, sizeof(client->backfill));
+            clear_pending_block_state(client);
         }
         pthread_mutex_destroy(&client->pending_lock);
         client->pending_lock_initialized = false;
     }
     else
     {
-        pending_block_list_reset(&client->pending_blocks);
-        free(client->backfill.entries);
-        memset(&client->backfill, 0, sizeof(client->backfill));
+        clear_pending_block_state(client);
     }
 }
 
