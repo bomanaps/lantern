@@ -99,6 +99,11 @@ function(_lantern_define_c_lean_libp2p target_name source_dir)
     set(BUILD_TOOL OFF CACHE BOOL "Do not build AWS-LC tools from Lantern" FORCE)
     set(DISABLE_GO ON CACHE BOOL "Do not require Go when building AWS-LC" FORCE)
     set(DISABLE_PERL ON CACHE BOOL "Use generated AWS-LC assembly sources" FORCE)
+    if(LANTERN_C_LEAN_LIBP2P_AWSLC_CPU_JITTER_ENTROPY)
+        set(DISABLE_CPU_JITTER_ENTROPY OFF CACHE BOOL "Use AWS-LC CPU-jitter entropy source" FORCE)
+    else()
+        set(DISABLE_CPU_JITTER_ENTROPY ON CACHE BOOL "Disable AWS-LC CPU-jitter entropy source" FORCE)
+    endif()
 
     if(NOT TARGET c_lean_libp2p)
         add_subdirectory(${source_dir} ${CMAKE_BINARY_DIR}/c-lean-libp2p EXCLUDE_FROM_ALL)
@@ -113,6 +118,9 @@ find_program(CARGO_EXECUTABLE cargo)
 if(NOT CARGO_EXECUTABLE)
     message(FATAL_ERROR "cargo is required to build post-quantum signature bindings. Install Rust (https://rustup.rs/) and ensure cargo is on PATH.")
 endif()
+
+option(LANTERN_C_LEANVM_XMSS_JEMALLOC "Use jemalloc as the c-leanvm-xmss Rust global allocator" ON)
+option(LANTERN_C_LEAN_LIBP2P_AWSLC_CPU_JITTER_ENTROPY "Use the AWS-LC CPU-jitter entropy source in c-lean-libp2p" ON)
 
 function(_lantern_define_snappy target_name source_dir)
     if(NOT TARGET ${target_name})
@@ -134,7 +142,7 @@ function(_lantern_define_snappy target_name source_dir)
 endfunction()
 
 function(_lantern_define_c_leanvm_xmss_variant target_name source_dir cargo_target_dir header_dir)
-    set(options TEST_CONFIG)
+    set(options NO_JEMALLOC TEST_CONFIG)
     cmake_parse_arguments(C_XMSS "${options}" "" "" ${ARGN})
 
     if(TARGET ${target_name})
@@ -148,6 +156,9 @@ function(_lantern_define_c_leanvm_xmss_variant target_name source_dir cargo_targ
     set(c_leanvm_xmss_compat_header "${header_dir}/pq-bindings-c-rust.h")
     set(c_leanvm_xmss_args build --release --locked)
     file(MAKE_DIRECTORY "${header_dir}")
+    if(C_XMSS_NO_JEMALLOC)
+        list(APPEND c_leanvm_xmss_args --no-default-features)
+    endif()
     if(C_XMSS_TEST_CONFIG)
         list(APPEND c_leanvm_xmss_args --features test-config)
     endif()
@@ -204,6 +215,10 @@ function(lantern_configure_dependencies target)
     endif()
 
     set(external_root ${PROJECT_SOURCE_DIR}/external)
+    set(c_leanvm_xmss_allocator_options)
+    if(NOT LANTERN_C_LEANVM_XMSS_JEMALLOC)
+        list(APPEND c_leanvm_xmss_allocator_options NO_JEMALLOC)
+    endif()
 
     _lantern_define_c_lean_libp2p(lantern_c_lean_libp2p ${external_root}/c-lean-libp2p)
     _lantern_configure_awslc_openssl_package(${external_root}/c-lean-libp2p)
@@ -214,12 +229,14 @@ function(lantern_configure_dependencies target)
         ${external_root}/c-leanvm-xmss
         ${CMAKE_BINARY_DIR}/c-leanvm-xmss/prod
         ${CMAKE_BINARY_DIR}/c-leanvm-xmss/prod/include
+        ${c_leanvm_xmss_allocator_options}
     )
     _lantern_define_c_leanvm_xmss_variant(
         lantern_c_leanvm_xmss_test
         ${external_root}/c-leanvm-xmss
         ${CMAKE_BINARY_DIR}/c-leanvm-xmss/test
         ${CMAKE_BINARY_DIR}/c-leanvm-xmss/test/include
+        ${c_leanvm_xmss_allocator_options}
         TEST_CONFIG
     )
 

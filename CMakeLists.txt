@@ -33,6 +33,7 @@ set(LANTERN_LIBRARY_SOURCES
     src/consensus/fork_choice.c
     src/consensus/hash.c
     src/consensus/runtime.c
+    src/consensus/shadow_cost.c
     src/consensus/slot_clock.c
     src/consensus/signature.c
     src/consensus/state.c

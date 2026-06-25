@@ -9,6 +9,7 @@
 
 #include "lantern/metrics/lean_metrics.h"
 #include "lantern/consensus/hash.h"
+#include "lantern/consensus/shadow_cost.h"
 #include "lantern/support/log.h"
 #include "pq-bindings-c-rust.h"
 
@@ -44,6 +45,27 @@ static void signature_add_stage_seconds(double *stage_seconds, double seconds) {
         return;
     }
     *stage_seconds += seconds;
+}
+
+static void shadow_sleep_aggregate(size_t n) {
+    uint64_t delay_ns = lantern_shadow_xmss_aggregate_delay_ns(n);
+    if (delay_ns != 0u) {
+        lantern_shadow_xmss_sleep_ns(delay_ns);
+    }
+}
+
+static void shadow_sleep_verify(size_t n) {
+    uint64_t delay_ns = lantern_shadow_xmss_verify_delay_ns(n);
+    if (delay_ns != 0u) {
+        lantern_shadow_xmss_sleep_ns(delay_ns);
+    }
+}
+
+static void shadow_sleep_merge(size_t n) {
+    uint64_t delay_ns = lantern_shadow_xmss_merge_delay_ns(n);
+    if (delay_ns != 0u) {
+        lantern_shadow_xmss_sleep_ns(delay_ns);
+    }
 }
 
 static bool bytes_are_zero(const uint8_t *bytes, size_t length) {
@@ -187,6 +209,7 @@ static bool prepare_recursive_child(
         out_input->pubkey_count = participant_count;
         out_input->agg_bytes = proof->proof_data.data;
         out_input->agg_len = proof->proof_data.length;
+        shadow_sleep_verify(participant_count);
         return true;
     }
 
@@ -741,6 +764,7 @@ bool lantern_signature_aggregate(
             ok = false;
         } else {
             elapsed = get_time_seconds() - start;
+            shadow_sleep_aggregate(count);
         }
     }
 
@@ -973,6 +997,7 @@ bool lantern_aggregated_signature_proof_aggregate(
                 ok = false;
             } else {
                 elapsed = get_time_seconds() - start;
+                shadow_sleep_aggregate(raw_xmss_count);
             }
         }
 
@@ -1118,6 +1143,9 @@ bool lantern_signature_verify_aggregated(
             "aggregation verify rc=%d elapsed=%.6f",
             verify_rc,
             elapsed);
+        if (verify_rc == 1) {
+            shadow_sleep_verify(count);
+        }
     }
 
     for (size_t i = 0; i < count; ++i) {
@@ -1261,6 +1289,9 @@ bool lantern_signature_merge_block_type2_proof(
         signature_add_stage_seconds(
             &g_stage_timings->proof_copy_seconds,
             signature_elapsed_seconds(copy_started_seconds, copy_finished_seconds));
+    }
+    if (ok) {
+        shadow_sleep_merge(component_count);
     }
 
 cleanup:

@@ -33,6 +33,7 @@
 #include "lantern/consensus/fork_choice.h"
 #include "lantern/consensus/hash.h"
 #include "lantern/consensus/runtime.h"
+#include "lantern/consensus/shadow_cost.h"
 #include "lantern/consensus/signature.h"
 #include "lantern/consensus/ssz.h"
 #include "lantern/consensus/state.h"
@@ -506,6 +507,12 @@ void lantern_client_options_init(struct lantern_client_options *options)
     options->aggregate_subnet_ids = NULL;
     options->aggregate_subnet_id_count = 0;
     options->aggregate_subnet_id_capacity = 0;
+    options->shadow_xmss_aggregate_signatures_rate = 0.0;
+    options->has_shadow_xmss_aggregate_signatures_rate = false;
+    options->shadow_xmss_verify_aggregated_signatures_rate = 0.0;
+    options->has_shadow_xmss_verify_aggregated_signatures_rate = false;
+    options->shadow_xmss_merge_rate = 0.0;
+    options->has_shadow_xmss_merge_rate = false;
 }
 
 
@@ -2948,6 +2955,14 @@ lantern_client_error lantern_init(
 
     uint8_t node_key[NODE_PRIVATE_KEY_SIZE];
     lantern_client_error err = LANTERN_CLIENT_OK;
+
+    lantern_shadow_xmss_cost_init(
+        options->shadow_xmss_aggregate_signatures_rate,
+        options->has_shadow_xmss_aggregate_signatures_rate,
+        options->shadow_xmss_verify_aggregated_signatures_rate,
+        options->has_shadow_xmss_verify_aggregated_signatures_rate,
+        options->shadow_xmss_merge_rate,
+        options->has_shadow_xmss_merge_rate);
 
     client_reset_base(client);
 
