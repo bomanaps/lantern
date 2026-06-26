@@ -56,6 +56,9 @@ enum {
     OPT_IS_AGGREGATOR,
     OPT_ATTESTATION_COMMITTEE_COUNT,
     OPT_AGGREGATE_SUBNET_IDS,
+    OPT_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE,
+    OPT_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE,
+    OPT_SHADOW_XMSS_MERGE_RATE,
     /* Deprecated: legacy file-path flags retained so pre-migration
      * lean-quickstart wrappers keep working. Each resolves to the parent
      * directory of the given file and feeds validator_config_dir. */
@@ -106,6 +109,10 @@ static lantern_client_error handle_xmss_option(
 static lantern_client_error handle_aggregate_subnet_ids_option(
     struct lantern_client_options *options,
     const char *optarg);
+static lantern_client_error handle_shadow_xmss_rate_option(
+    struct lantern_client_options *options,
+    int opt,
+    const char *optarg);
 static lantern_client_error parse_arguments(
     struct lantern_client_options *options,
     int argc,
@@ -116,6 +123,7 @@ static lantern_client_error validate_required_options(
     const struct lantern_client_options *options);
 static lantern_client_error run_main_loop(struct lantern_client *client);
 static void print_usage(const char *prog);
+static lantern_client_error parse_double_value(const char *text, double *out_value);
 static lantern_client_error parse_u16(const char *text, uint16_t *out_value);
 static lantern_client_error parse_size_t_nonnegative(const char *text, size_t *out_value);
 static lantern_client_error parse_size_t_positive(const char *text, size_t *out_value);
@@ -333,6 +341,10 @@ static lantern_client_error apply_option(
     }
     case OPT_AGGREGATE_SUBNET_IDS:
         return handle_aggregate_subnet_ids_option(options, optarg);
+    case OPT_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE:
+    case OPT_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE:
+    case OPT_SHADOW_XMSS_MERGE_RATE:
+        return handle_shadow_xmss_rate_option(options, opt, optarg);
     default:
         return LANTERN_CLIENT_ERR_INVALID_PARAM;
     }
@@ -549,6 +561,54 @@ static lantern_client_error handle_aggregate_subnet_ids_option(
     return LANTERN_CLIENT_OK;
 }
 
+static lantern_client_error handle_shadow_xmss_rate_option(
+    struct lantern_client_options *options,
+    int opt,
+    const char *optarg)
+{
+    if (!options || !optarg)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    double *rate = NULL;
+    bool *has_rate = NULL;
+    const char *label = NULL;
+    switch (opt)
+    {
+    case OPT_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE:
+        rate = &options->shadow_xmss_aggregate_signatures_rate;
+        has_rate = &options->has_shadow_xmss_aggregate_signatures_rate;
+        label = "shadow-xmss-aggregate-signatures-rate";
+        break;
+    case OPT_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE:
+        rate = &options->shadow_xmss_verify_aggregated_signatures_rate;
+        has_rate = &options->has_shadow_xmss_verify_aggregated_signatures_rate;
+        label = "shadow-xmss-verify-aggregated-signatures-rate";
+        break;
+    case OPT_SHADOW_XMSS_MERGE_RATE:
+        rate = &options->shadow_xmss_merge_rate;
+        has_rate = &options->has_shadow_xmss_merge_rate;
+        label = "shadow-xmss-merge-rate";
+        break;
+    default:
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    if (parse_double_value(optarg, rate) != LANTERN_CLIENT_OK)
+    {
+        lantern_log_error(
+            "cli",
+            &(const struct lantern_log_metadata){.validator = options->node_id},
+            "invalid %s '%s'",
+            label,
+            optarg);
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+    *has_rate = true;
+    return LANTERN_CLIENT_OK;
+}
+
 
 /**
  * Parse CLI arguments and populate client options.
@@ -613,6 +673,9 @@ static lantern_client_error parse_arguments(
         {"is-aggregator", no_argument, NULL, OPT_IS_AGGREGATOR},
         {"attestation-committee-count", required_argument, NULL, OPT_ATTESTATION_COMMITTEE_COUNT},
         {"aggregate-subnet-ids", required_argument, NULL, OPT_AGGREGATE_SUBNET_IDS},
+        {"shadow-xmss-aggregate-signatures-rate", required_argument, NULL, OPT_SHADOW_XMSS_AGGREGATE_SIGNATURES_RATE},
+        {"shadow-xmss-verify-aggregated-signatures-rate", required_argument, NULL, OPT_SHADOW_XMSS_VERIFY_AGGREGATED_SIGNATURES_RATE},
+        {"shadow-xmss-merge-rate", required_argument, NULL, OPT_SHADOW_XMSS_MERGE_RATE},
         {"help", no_argument, NULL, 'h'},
         {"version", no_argument, NULL, 'v'},
         {0, 0, 0, 0},
@@ -985,6 +1048,18 @@ static void print_usage_xmss(void)
         "main",
         NULL,
         "  --xmss-secret-template STR  printf-style template for secret key paths");
+    lantern_log_info(
+        "main",
+        NULL,
+        "  --shadow-xmss-aggregate-signatures-rate N  Shadow XMSS aggregate signatures per second");
+    lantern_log_info(
+        "main",
+        NULL,
+        "  --shadow-xmss-verify-aggregated-signatures-rate N  Shadow XMSS aggregate verification signatures per second");
+    lantern_log_info(
+        "main",
+        NULL,
+        "  --shadow-xmss-merge-rate N  Shadow XMSS Type-1 components merged per second");
 }
 
 
@@ -1027,6 +1102,29 @@ static void print_usage(const char *prog)
     print_usage_network();
     print_usage_xmss();
     print_usage_misc();
+}
+
+static lantern_client_error parse_double_value(const char *text, double *out_value)
+{
+    if (!text || !out_value)
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    if (isspace((unsigned char)text[0]))
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    char *end = NULL;
+    double parsed = strtod(text, &end);
+    if (end == text || (end && *end != '\0'))
+    {
+        return LANTERN_CLIENT_ERR_INVALID_PARAM;
+    }
+
+    *out_value = parsed;
+    return LANTERN_CLIENT_OK;
 }
 
 

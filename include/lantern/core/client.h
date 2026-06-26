@@ -86,6 +86,12 @@ struct lantern_client_options {
     size_t *aggregate_subnet_ids;
     size_t aggregate_subnet_id_count;
     size_t aggregate_subnet_id_capacity;
+    double shadow_xmss_aggregate_signatures_rate;
+    bool has_shadow_xmss_aggregate_signatures_rate;
+    double shadow_xmss_verify_aggregated_signatures_rate;
+    bool has_shadow_xmss_verify_aggregated_signatures_rate;
+    double shadow_xmss_merge_rate;
+    bool has_shadow_xmss_merge_rate;
 };
 
 struct lantern_peer_status_entry;
