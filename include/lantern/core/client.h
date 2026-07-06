@@ -181,6 +181,18 @@ struct lantern_connection_peer_ref {
     bool closing;
 };
 
+struct lantern_validator_signature_record {
+    uint64_t slot;
+    LanternRoot message;
+    LanternSignature signature;
+};
+
+struct lantern_validator_signature_history {
+    struct lantern_validator_signature_record *records;
+    size_t length;
+    size_t capacity;
+};
+
 struct lantern_local_validator {
     uint64_t global_index;
     const struct lantern_validator_record *registry;
@@ -194,6 +206,8 @@ struct lantern_local_validator {
     bool has_proposal_secret_handle;
     uint64_t last_proposed_slot;
     uint64_t last_attested_slot;
+    struct lantern_validator_signature_history attestation_signature_history;
+    struct lantern_validator_signature_history proposal_signature_history;
 };
 
 struct lantern_network_view {
@@ -255,7 +269,7 @@ struct lantern_client {
     bool validator_thread_started;
     int validator_stop_flag;
     struct lantern_async_block_proposal_job *block_proposal_job;
-    uint64_t prebuilt_proposal_signature_slot;
+    uint64_t block_proposal_inflight_slot;
     pthread_mutex_t block_proposal_lock;
     pthread_cond_t block_proposal_cond;
     pthread_t block_proposal_thread;
@@ -363,21 +377,22 @@ int lantern_client_aggregation_subnet_id(
 
 /**
  * Refresh a cached vote's checkpoints and signature if the source checkpoint
- * has changed.
+ * has changed and the slot's attestation key has not already signed a
+ * different vote root.
  *
  * @param validator     Local validator with signing key
  * @param slot          Slot used for signing context
  * @param head          Updated head checkpoint
  * @param target        Updated target checkpoint
  * @param source        Updated source checkpoint
- * @param vote          Vote to refresh (modified in place)
+ * @param vote          Vote to refresh, unchanged if signing is refused
  * @param out_refreshed Optional output flag set to true when the vote was
  *                      re-signed
  *
  * @return LANTERN_CLIENT_OK on success
  * @return LANTERN_CLIENT_ERR_INVALID_PARAM on NULL inputs
- * @return LANTERN_CLIENT_ERR_VALIDATOR when signing fails or the key is
- *         missing
+ * @return LANTERN_CLIENT_ERR_VALIDATOR when signing fails, the key is missing,
+ *         or refreshing would reuse a slot key for a different vote root
  */
 int lantern_validator_refresh_cached_vote(
     struct lantern_local_validator *validator,

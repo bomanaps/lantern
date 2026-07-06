@@ -75,6 +75,10 @@ bool validator_service_should_run(const struct lantern_client *client);
 /**
  * Sign an arbitrary message root with one of a validator's XMSS keys.
  *
+ * Enforces one message root per slot for the selected validator key. Repeating
+ * the same root for a slot is idempotent; a different root is rejected before
+ * XMSS signing.
+ *
  * Advances the selected key's prepared interval until it can sign `slot`,
  * mutates the key in place, and writes the resulting signature to
  * `out_signature`.
@@ -87,7 +91,8 @@ bool validator_service_should_run(const struct lantern_client *client);
  * @param out_signature     Output signature
  * @return LANTERN_CLIENT_OK on success
  * @return LANTERN_CLIENT_ERR_INVALID_PARAM on NULL inputs
- * @return LANTERN_CLIENT_ERR_VALIDATOR on missing keys or signing failure
+ * @return LANTERN_CLIENT_ERR_VALIDATOR on missing keys, signing failure, or
+ *         an attempted different message for an already-signed slot
  *
  * @note Thread safety: Caller must ensure exclusive access to validator
  */
