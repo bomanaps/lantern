@@ -1402,13 +1402,17 @@ cleanup:
     return rc;
 }
 
-static int test_validator_refresh_cached_vote_updates_source(void) {
+static int test_validator_refresh_cached_vote_rejects_changed_root_reuse(void) {
     struct lantern_client client;
     struct PQSignatureSchemePublicKey *pub = NULL;
     struct PQSignatureSchemeSecretKey *secret = NULL;
     LanternRoot anchor_root;
     LanternRoot child_root;
+    struct lantern_local_validator validator;
     int rc = 1;
+
+    memset(&client, 0, sizeof(client));
+    memset(&validator, 0, sizeof(validator));
 
     if (client_test_setup_vote_validation_client(
             &client,
@@ -1418,11 +1422,9 @@ static int test_validator_refresh_cached_vote_updates_source(void) {
             &anchor_root,
             &child_root)
         != 0) {
-        return 1;
+        goto cleanup;
     }
 
-    struct lantern_local_validator validator;
-    memset(&validator, 0, sizeof(validator));
     validator.global_index = 0;
     validator.attestation_secret_key = secret;
     validator.has_attestation_secret_handle = true;
@@ -1438,7 +1440,7 @@ static int test_validator_refresh_cached_vote_updates_source(void) {
     stale.data.source.slot = 0;
     stale.data.source.root = anchor_root;
 
-    if (client_test_sign_vote_with_secret(&stale, secret) != 0) {
+    if (validator_sign_vote(&validator, stale.data.slot, &stale) != LANTERN_CLIENT_OK) {
         fprintf(stderr, "failed to sign stale vote for refresh test\n");
         goto cleanup;
     }
@@ -1463,17 +1465,17 @@ static int test_validator_refresh_cached_vote_updates_source(void) {
         &new_source,
         &refreshed,
         &refreshed_flag);
-    if (refresh_rc != LANTERN_CLIENT_OK || !refreshed_flag) {
-        fprintf(stderr, "expected cached vote refresh to occur\n");
+    if (refresh_rc != LANTERN_CLIENT_ERR_VALIDATOR || refreshed_flag) {
+        fprintf(stderr, "expected cached vote refresh to reject changed root reuse\n");
         goto cleanup;
     }
-    if (refreshed.data.source.slot != new_source.slot
-        || memcmp(refreshed.data.source.root.bytes, new_source.root.bytes, LANTERN_ROOT_SIZE) != 0) {
-        fprintf(stderr, "cached vote source was not updated\n");
+    if (refreshed.data.source.slot != stale.data.source.slot
+        || memcmp(refreshed.data.source.root.bytes, stale.data.source.root.bytes, LANTERN_ROOT_SIZE) != 0) {
+        fprintf(stderr, "failed refresh mutated cached vote source\n");
         goto cleanup;
     }
-    if (memcmp(refreshed.signature.bytes, stale.signature.bytes, LANTERN_SIGNATURE_SIZE) == 0) {
-        fprintf(stderr, "cached vote signature did not change after refresh\n");
+    if (memcmp(refreshed.signature.bytes, stale.signature.bytes, LANTERN_SIGNATURE_SIZE) != 0) {
+        fprintf(stderr, "failed refresh mutated cached vote signature\n");
         goto cleanup;
     }
 
@@ -1482,9 +1484,9 @@ static int test_validator_refresh_cached_vote_updates_source(void) {
     if (lantern_validator_refresh_cached_vote(
             &validator,
             stale.data.slot,
-            &new_head,
-            &new_target,
-            &new_source,
+            &stale.data.head,
+            &stale.data.target,
+            &stale.data.source,
             &second,
             &refreshed_flag)
         != LANTERN_CLIENT_OK) {
@@ -1503,6 +1505,8 @@ static int test_validator_refresh_cached_vote_updates_source(void) {
     rc = 0;
 
 cleanup:
+    lantern_client_local_validator_cleanup(&validator);
+    secret = NULL;
     client_test_teardown_vote_validation_client(&client, pub, secret);
     return rc;
 }
@@ -1589,6 +1593,84 @@ cleanup:
     if (attestation_secret) {
         pq_secret_key_free(attestation_secret);
     }
+    if (pub) {
+        pq_public_key_free(pub);
+    }
+    return rc;
+}
+
+static int test_validator_sign_with_key_rejects_different_message_same_slot(void) {
+    struct PQSignatureSchemePublicKey *pub = NULL;
+    struct PQSignatureSchemeSecretKey *secret = NULL;
+    struct lantern_local_validator validator;
+    LanternRoot first_message;
+    LanternRoot second_message;
+    LanternSignature first_signature;
+    LanternSignature repeat_signature;
+    LanternSignature rejected_signature;
+    int rc = 1;
+
+    memset(&validator, 0, sizeof(validator));
+    memset(&first_message, 0, sizeof(first_message));
+    memset(&second_message, 0, sizeof(second_message));
+    memset(&first_signature, 0, sizeof(first_signature));
+    memset(&repeat_signature, 0, sizeof(repeat_signature));
+    memset(&rejected_signature, 0, sizeof(rejected_signature));
+
+    if (client_test_load_precomputed_keypair(0u, &pub, &secret) != 0) {
+        fprintf(stderr, "failed to load keypair for signing reuse guard test\n");
+        goto cleanup;
+    }
+
+    validator.global_index = 0u;
+    validator.proposal_secret_key = secret;
+    validator.has_proposal_secret_handle = true;
+
+    struct PQRange prepared = pq_get_prepared_interval(validator.proposal_secret_key);
+    if (prepared.end <= prepared.start) {
+        fprintf(stderr, "prepared interval unavailable for signing reuse guard test\n");
+        goto cleanup;
+    }
+    uint64_t slot = prepared.start;
+
+    client_test_fill_root_with_index(&first_message, 0x1357u);
+    client_test_fill_root_with_index(&second_message, 0x2468u);
+
+    if (validator_sign_with_key(&validator, slot, &first_message, true, &first_signature)
+        != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "initial proposal signing failed in reuse guard test\n");
+        goto cleanup;
+    }
+    if (!lantern_signature_verify_pk(pub, slot, &first_signature, &first_message)) {
+        fprintf(stderr, "initial proposal signature did not verify in reuse guard test\n");
+        goto cleanup;
+    }
+    if (validator_sign_with_key(&validator, slot, &first_message, true, &repeat_signature)
+        != LANTERN_CLIENT_OK) {
+        fprintf(stderr, "idempotent repeat signing failed in reuse guard test\n");
+        goto cleanup;
+    }
+    if (memcmp(first_signature.bytes, repeat_signature.bytes, LANTERN_SIGNATURE_SIZE) != 0) {
+        fprintf(stderr, "idempotent repeat did not return cached proposal signature\n");
+        goto cleanup;
+    }
+    if (validator_sign_with_key(&validator, slot, &second_message, true, &rejected_signature)
+        != LANTERN_CLIENT_ERR_VALIDATOR) {
+        fprintf(stderr, "different proposal root for same slot was not rejected\n");
+        goto cleanup;
+    }
+    if (validator_sign_with_key(&validator, slot, &first_message, true, &repeat_signature)
+        != LANTERN_CLIENT_OK
+        || memcmp(first_signature.bytes, repeat_signature.bytes, LANTERN_SIGNATURE_SIZE) != 0) {
+        fprintf(stderr, "cached proposal signature was not preserved after rejection\n");
+        goto cleanup;
+    }
+
+    rc = 0;
+
+cleanup:
+    lantern_client_local_validator_cleanup(&validator);
+    secret = NULL;
     if (pub) {
         pq_public_key_free(pub);
     }
@@ -4154,10 +4236,13 @@ int main(void) {
     if (test_record_vote_rejects_future_slot() != 0) {
         return 1;
     }
-    if (test_validator_refresh_cached_vote_updates_source() != 0) {
+    if (test_validator_refresh_cached_vote_rejects_changed_root_reuse() != 0) {
         return 1;
     }
     if (test_validator_sign_with_key_advances_only_selected_secret() != 0) {
+        return 1;
+    }
+    if (test_validator_sign_with_key_rejects_different_message_same_slot() != 0) {
         return 1;
     }
     if (test_validator_build_block_leaves_attestation_key_untouched() != 0) {

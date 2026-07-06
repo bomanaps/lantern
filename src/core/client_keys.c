@@ -89,6 +89,17 @@ static void free_local_secret_key_handles(struct lantern_local_validator *valida
     validator->has_proposal_secret_handle = false;
 }
 
+static void validator_signature_history_reset(
+    struct lantern_validator_signature_history *history)
+{
+    if (!history)
+    {
+        return;
+    }
+    free(history->records);
+    memset(history, 0, sizeof(*history));
+}
+
 
 /* ============================================================================
  * Local Validator Lifecycle
@@ -123,6 +134,8 @@ void lantern_client_local_validator_cleanup(struct lantern_local_validator *vali
     validator->has_secret = false;
 
     free_local_secret_key_handles(validator);
+    validator_signature_history_reset(&validator->attestation_signature_history);
+    validator_signature_history_reset(&validator->proposal_signature_history);
 
     validator->last_proposed_slot = UINT64_MAX;
     validator->last_attested_slot = UINT64_MAX;
