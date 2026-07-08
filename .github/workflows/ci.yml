@@ -163,8 +163,8 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=lantern-docker-amd64
-          cache-to: type=gha,mode=max,scope=lantern-docker-amd64
+            LANTERN_FORCE_REBUILD=1
+          no-cache: true
 
   publish-docker-arm64:
     name: Publish Docker Image (arm64)
@@ -195,8 +195,8 @@ jobs:
           build-args: |
             GIT_COMMIT=${{ github.sha }}
             GIT_BRANCH=${{ github.ref_name }}
-          cache-from: type=gha,scope=lantern-docker-arm64
-          cache-to: type=gha,mode=max,scope=lantern-docker-arm64
+            LANTERN_FORCE_REBUILD=1
+          no-cache: true
 
   publish-docker-manifest:
     name: Publish Docker Manifest
