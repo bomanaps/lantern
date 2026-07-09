@@ -1801,6 +1801,9 @@ static int test_import_persists_finalized_replay_base(void)
     }
 
     initial_finalized = fixture.client.state.latest_finalized;
+    fixture.client.network_view.network_finalized_slot = initial_finalized.slot;
+    fixture.client.network_view.has_network_finalized_slot = true;
+
     LanternRoot initial_head_root;
     if (test_state_latest_block_root(&fixture.client.state, &initial_head_root) != 0) {
         fprintf(stderr, "failed to compute initial head root for replay base test\n");
@@ -1847,6 +1850,11 @@ static int test_import_persists_finalized_replay_base(void)
 
     if (!finalized_advanced) {
         fprintf(stderr, "finalized checkpoint did not advance in replay base test\n");
+        goto cleanup;
+    }
+    if (!fixture.client.network_view.has_network_finalized_slot
+        || fixture.client.network_view.network_finalized_slot != advanced_finalized.slot) {
+        fprintf(stderr, "network finalized view did not refresh after finalized import\n");
         goto cleanup;
     }
 

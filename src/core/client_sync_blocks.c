@@ -163,6 +163,25 @@ static void update_network_view_after_import(
         return;
     }
 
+    uint64_t finalized_slot = 0;
+    bool has_finalized_slot = false;
+    bool state_locked = lantern_client_lock_state(client);
+    if (state_locked || client->has_state)
+    {
+        finalized_slot = client->state.latest_finalized.slot;
+        has_finalized_slot = true;
+        if (client->has_fork_choice)
+        {
+            const LanternCheckpoint *fork_finalized =
+                lantern_fork_choice_latest_finalized(&client->fork_choice);
+            if (fork_finalized && !lantern_root_is_zero(&fork_finalized->root))
+            {
+                finalized_slot = fork_finalized->slot;
+            }
+        }
+    }
+    lantern_client_unlock_state(client, state_locked);
+
     bool locked = false;
     if (client->status_lock_initialized)
     {
@@ -179,6 +198,13 @@ static void update_network_view_after_import(
     {
         client->network_view.latest_observed_head_slot = block_slot;
         client->network_view.has_latest_observed_head_slot = true;
+        changed = true;
+    }
+    if (has_finalized_slot
+        && client->network_view.has_network_finalized_slot
+        && finalized_slot > client->network_view.network_finalized_slot)
+    {
+        client->network_view.network_finalized_slot = finalized_slot;
         changed = true;
     }
     uint64_t head = client->network_view.latest_observed_head_slot;
