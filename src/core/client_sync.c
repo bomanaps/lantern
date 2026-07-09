@@ -3499,7 +3499,7 @@ bool lantern_client_enqueue_pending_block(
         {
             (void)lantern_string_copy(peer_copy, sizeof(peer_copy), peer_text);
         }
-        if (backfill_depth < existing->backfill_depth)
+        if (backfill_depth > existing->backfill_depth)
         {
             existing->backfill_depth = backfill_depth;
         }
