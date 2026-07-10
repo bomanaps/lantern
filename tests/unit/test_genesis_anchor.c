@@ -149,7 +149,6 @@ static void cleanup_init_data_dir(const char *data_dir)
     static const char *const dirs[] = {
         "blocks",
         "invalid_blocks",
-        "invalid_gossip",
         "states",
         "indices",
     };

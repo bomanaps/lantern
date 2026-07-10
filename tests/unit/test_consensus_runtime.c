@@ -64,17 +64,6 @@ static int test_runtime_time_update(void) {
         goto cleanup_runtime;
     }
 
-    struct lantern_duty_schedule schedule;
-    if (lantern_consensus_runtime_schedule_slot(&runtime, 2, &schedule) != 0) {
-        fprintf(stderr, "schedule slot failed\n");
-        goto cleanup_runtime;
-    }
-    if (schedule.phase_start_times[0] != 9000) {
-        fprintf(stderr, "unexpected proposal start time %llu\n",
-            (unsigned long long)schedule.phase_start_times[0]);
-        goto cleanup_runtime;
-    }
-
     rc = 0;
 
 cleanup_runtime:

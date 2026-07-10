@@ -8,7 +8,6 @@
  * blocks_by_root requests, plus peer status processing logic.
  *
  * Related files:
- * - client_reqresp_stream.c: Low-level stream I/O utilities
  * - client_reqresp_blocks.c: Block request operations
  *
  * @note Lock ordering (acquire in this order to prevent deadlocks):
@@ -247,7 +246,7 @@ static void log_status_failure(
                 "reqresp",
                 &meta,
                 "peer does not support %s error=%d (%s)",
-                LANTERN_STATUS_PROTOCOL_ID,
+                LANTERN_REQRESP_STATUS_PROTOCOL,
                 error,
                 reason ? reason : "-");
         }
@@ -257,7 +256,7 @@ static void log_status_failure(
                 "reqresp",
                 &meta,
                 "peer still misses %s support error=%d (%s)",
-                LANTERN_STATUS_PROTOCOL_ID,
+                LANTERN_REQRESP_STATUS_PROTOCOL,
                 error,
                 reason ? reason : "-");
         }

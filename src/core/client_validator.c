@@ -76,7 +76,7 @@ static size_t validator_attestation_committee_count(const struct lantern_client 
 
 void lantern_signature_set_stage_timings(struct lantern_block_build_stage_timings *timings);
 
-static int validator_publish_aggregated_attestations(struct lantern_client *client, uint64_t slot);
+int validator_publish_aggregated_attestations(struct lantern_client *client, uint64_t slot);
 static lantern_client_error collect_aggregation_votes(
     struct lantern_client *client,
     LanternAttestations *out_attestations,
@@ -84,7 +84,7 @@ static lantern_client_error collect_aggregation_votes(
     const uint64_t *scope_slot,
     struct lantern_block_build_stage_timings *stage_timings,
     bool *out_missing_state);
-static lantern_client_error validator_collect_and_aggregate_attestation_signatures(
+lantern_client_error validator_collect_and_aggregate_attestation_signatures(
     struct lantern_client *client,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures,
@@ -881,46 +881,6 @@ static lantern_client_error aggregate_attestation_signatures(
     }
     return rc;
 }
-
-lantern_client_error lantern_client_debug_aggregate_attestation_signatures(
-    struct lantern_client *client,
-    LanternAggregatedAttestations *out_attestations,
-    LanternAttestationSignatures *out_signatures)
-{
-    return validator_collect_and_aggregate_attestation_signatures(
-        client,
-        out_attestations,
-        out_signatures,
-        NULL,
-        NULL,
-        NULL);
-}
-
-int lantern_client_debug_publish_aggregated_attestations(
-    struct lantern_client *client,
-    uint64_t slot)
-{
-    return validator_publish_aggregated_attestations(client, slot);
-}
-
-int lantern_client_debug_run_interval_aggregation(
-    struct lantern_client *client,
-    uint64_t slot)
-{
-    if (!client) {
-        return LANTERN_CLIENT_ERR_INVALID_PARAM;
-    }
-    if (client->validator_duty.slot_aggregated || !client->validator_duty.slot_attested) {
-        return LANTERN_CLIENT_ERR_IGNORED;
-    }
-
-    int rc = validator_publish_aggregated_attestations(client, slot);
-    if (rc == LANTERN_CLIENT_OK) {
-        client->validator_duty.slot_aggregated = true;
-    }
-    return rc;
-}
-
 
 /* ============================================================================
  * Mutex Utilities
@@ -2965,7 +2925,7 @@ static lean_metrics_aggregator_skipped_reason_t validator_aggregator_skipped_rea
     }
 }
 
-static lantern_client_error validator_collect_and_aggregate_attestation_signatures(
+lantern_client_error validator_collect_and_aggregate_attestation_signatures(
     struct lantern_client *client,
     LanternAggregatedAttestations *out_attestations,
     LanternAttestationSignatures *out_signatures,
@@ -3007,7 +2967,7 @@ static lantern_client_error validator_collect_and_aggregate_attestation_signatur
     return rc;
 }
 
-static int validator_publish_aggregated_attestations(struct lantern_client *client, uint64_t slot)
+int validator_publish_aggregated_attestations(struct lantern_client *client, uint64_t slot)
 {
     if (!client || !client->assigned_validators || !client->assigned_validators->enr.is_aggregator) {
         if (client) {

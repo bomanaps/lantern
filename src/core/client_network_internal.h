@@ -89,34 +89,6 @@ struct lantern_peer_status_entry
     uint32_t consecutive_ping_failures;   /**< Count of consecutive ping failures */
 };
 
-/**
- * Block request context for async operations.
- *
- * @spec subspecs/networking/reqresp.py - blocks by root request
- */
-struct block_request_ctx
-{
-    struct lantern_client *client;  /**< Client instance */
-    uint64_t request_id;            /**< Internal request tracking ID */
-    struct lantern_peer_id *peer_id;             /**< Peer ID structure */
-    char peer_text[128];            /**< Peer ID as text */
-    LanternRoot *roots;             /**< Roots being requested */
-    uint32_t *depths;               /**< Backfill depth per root */
-    size_t root_count;              /**< Number of roots requested */
-    const char *protocol_id;        /**< Protocol ID string */
-};
-
-
-/**
- * Block request worker thread arguments.
- */
-struct block_request_worker_args
-{
-    struct block_request_ctx *ctx;  /**< Request context */
-    struct lantern_reqresp_stream *stream;        /**< libp2p stream */
-};
-
-
 /* ============================================================================
  * Peer Status Functions
  * ============================================================================ */
