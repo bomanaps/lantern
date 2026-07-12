@@ -132,20 +132,6 @@ struct lantern_peer_status_entry *lantern_client_ensure_status_entry_locked(
 
 
 /**
- * Find a peer vote metric entry by peer ID.
- *
- * @param client   Client instance
- * @param peer_id  Peer ID to find
- * @return Pointer to entry if found, NULL otherwise
- *
- * @note Thread safety: Caller must hold peer_vote_lock
- */
-struct lantern_peer_vote_metric *lantern_client_find_vote_metric_locked(
-    struct lantern_client *client,
-    const char *peer_id);
-
-
-/**
  * Find or create a peer vote metric entry.
  *
  * @param client   Client instance
@@ -379,24 +365,14 @@ void peer_dialer_sleep(struct lantern_client *client, unsigned seconds);
 
 
 /**
- * Attempt to redial a peer that disconnected due to timeout.
+ * Attempt to redial a disconnected genesis peer.
  *
  * @param client  Client instance
  * @param peer    Peer ID to redial
  *
  * @note Thread safety: This function acquires connection_lock
  */
-void redial_peer_on_timeout(struct lantern_client *client, const struct lantern_peer_id *peer);
-
-
-/**
- * Redial a peer by text peer id after req/resp observes that it is disconnected.
- *
- * @param client        Client instance
- * @param peer_id_text  Text form of the peer id to redial
- */
-void lantern_client_redial_peer_by_text(struct lantern_client *client, const char *peer_id_text);
-
+void redial_peer(struct lantern_client *client, const struct lantern_peer_id *peer);
 
 /**
  * Attempt to dial peers from genesis ENRs.

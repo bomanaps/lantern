@@ -43,7 +43,6 @@ int lantern_consensus_runtime_local_proposer(
     bool *out_is_local,
     uint64_t *out_local_validator_index);
 
-uint64_t lantern_consensus_runtime_validator_count(const struct lantern_consensus_runtime *runtime);
 
 #ifdef __cplusplus
 }

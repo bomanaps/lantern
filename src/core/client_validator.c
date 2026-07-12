@@ -2239,74 +2239,6 @@ cleanup:
 
 
 /**
- * Refresh a cached vote with updated checkpoints and re-sign if needed.
- *
- * Compares the vote's source checkpoint with the provided source. If they
- * differ, builds a candidate vote and signs it only if the validator has not
- * already used this slot's attestation key for a different message root.
- *
- * @param validator  Local validator with an attestation signing key
- * @param slot       Slot for signing context
- * @param head       New head checkpoint
- * @param target     New target checkpoint
- * @param source     New source checkpoint
- * @param vote       Vote to update (modified in place)
- * @param out_refreshed Optional output flag set to true when the vote is
- *        updated and re-signed
- *
- * @return LANTERN_CLIENT_OK on success
- * @return LANTERN_CLIENT_ERR_INVALID_PARAM on NULL parameters
- * @return LANTERN_CLIENT_ERR_VALIDATOR when the validator key is missing,
- *         signing fails, or refreshing would reuse a slot key for a different
- *         attestation root
- *
- * @note Thread safety: Caller must ensure exclusive access to validator
- */
-int lantern_validator_refresh_cached_vote(
-    struct lantern_local_validator *validator,
-    uint64_t slot,
-    const LanternCheckpoint *head,
-    const LanternCheckpoint *target,
-    const LanternCheckpoint *source,
-    LanternSignedVote *vote,
-    bool *out_refreshed)
-{
-    bool refreshed = false;
-
-    if (out_refreshed)
-    {
-        *out_refreshed = false;
-    }
-    if (!validator || !head || !target || !source || !vote)
-    {
-        return LANTERN_CLIENT_ERR_INVALID_PARAM;
-    }
-    /* If the source checkpoint is unchanged, no refresh is required. */
-    if (vote->data.source.slot != source->slot
-        || memcmp(vote->data.source.root.bytes, source->root.bytes, LANTERN_ROOT_SIZE) != 0)
-    {
-        LanternSignedVote candidate = *vote;
-        candidate.data.head = *head;
-        candidate.data.target = *target;
-        candidate.data.source = *source;
-
-        if (validator_sign_vote(validator, slot, &candidate) != 0)
-        {
-            return LANTERN_CLIENT_ERR_VALIDATOR;
-        }
-        *vote = candidate;
-        refreshed = true;
-    }
-
-    if (out_refreshed)
-    {
-        *out_refreshed = refreshed;
-    }
-    return LANTERN_CLIENT_OK;
-}
-
-
-/**
  * Store a vote in the client state.
  *
  * @param client  Client instance
@@ -2744,8 +2676,7 @@ int validator_publish_attestations(struct lantern_client *client, uint64_t slot)
 
     for (size_t i = 0; i < client->local_validator_count; ++i)
     {
-        bool enabled = client->validator_enabled ? client->validator_enabled[i] : true;
-        if (!enabled)
+        if (client->local_validators[i].disabled)
         {
             continue;
         }

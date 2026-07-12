@@ -56,7 +56,6 @@ set(LANTERN_LIBRARY_SOURCES
 		    src/genesis/genesis.c
 		    src/genesis/genesis_parse.c
 		    src/genesis/genesis_parse_helpers.c
-		    src/genesis/genesis_parse_registry.c
 		    src/genesis/genesis_validator_config.c
 		    src/encoding/snappy.c
 	    src/networking/enr.c
@@ -66,7 +65,6 @@ set(LANTERN_LIBRARY_SOURCES
     src/networking/libp2p.c
     src/networking/reqresp_service.c
     src/networking/messages.c
-    src/encoding/rlp.c
     src/metrics/lean_metrics.c
     src/metrics/server.c
     src/http/client.c
@@ -275,11 +273,6 @@ if(LANTERN_BUILD_TESTS)
             LANTERN_TEST_FIXTURE_DIR="${PROJECT_SOURCE_DIR}/tests/fixtures"
     )
     add_test(NAME lantern_validator_selection COMMAND lantern_validator_selection_test)
-
-    add_executable(lantern_rlp_test tests/unit/test_rlp.c)
-    target_link_libraries(lantern_rlp_test PRIVATE ${LANTERN_TEST_LINK_LIB})
-    add_test(NAME lantern_rlp COMMAND lantern_rlp_test)
-
 
     add_executable(lantern_enr_test tests/unit/test_enr.c)
     target_link_libraries(lantern_enr_test PRIVATE ${LANTERN_TEST_LINK_LIB})
@@ -538,7 +531,6 @@ if(LANTERN_BUILD_TESTS)
         lantern_genesis_anchor
         lantern_genesis_bootstrap
         lantern_validator_selection
-        lantern_rlp
         lantern_enr
         lantern_ssz
         lantern_duties

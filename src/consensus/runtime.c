@@ -106,10 +106,3 @@ int lantern_consensus_runtime_local_proposer(
     }
     return 0;
 }
-
-uint64_t lantern_consensus_runtime_validator_count(const struct lantern_consensus_runtime *runtime) {
-    if (!runtime || !runtime->initialized) {
-        return 0;
-    }
-    return runtime->validator_count;
-}

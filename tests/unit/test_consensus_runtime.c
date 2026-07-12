@@ -16,8 +16,6 @@ static int init_range_assignment(
     if (!assignment->indices) {
         return -1;
     }
-    assignment->start_index = start_index;
-    assignment->count = count;
     assignment->length = (size_t)count;
     for (uint64_t i = 0; i < count; ++i) {
         assignment->indices[i] = start_index + i;
@@ -112,7 +110,7 @@ static int test_local_proposer_detection(void) {
         goto cleanup_runtime;
     }
 
-    if (lantern_consensus_runtime_validator_count(&runtime) != 4) {
+    if (runtime.validator_count != 4) {
         fprintf(stderr, "validator count mismatch\n");
         goto cleanup_runtime;
     }

@@ -681,17 +681,6 @@ int lantern_client_configure_xmss_sources(
  */
 int lantern_client_load_xmss_keys(struct lantern_client *client);
 
-
-/**
- * Free all loaded public key handles.
- *
- * @param client  Client instance
- *
- * @note Thread safety: Caller must ensure exclusive access during shutdown
- */
-void lantern_client_free_xmss_pubkeys(struct lantern_client *client);
-
-
 #ifdef __cplusplus
 }
 #endif

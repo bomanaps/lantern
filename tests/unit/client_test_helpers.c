@@ -20,6 +20,39 @@
 
 static int client_test_load_fixture_genesis_time(uint64_t *out_time);
 
+int client_test_set_connected_peer(struct lantern_client *client, const char *peer_id_text) {
+    if (!client || !peer_id_text) {
+        return -1;
+    }
+    struct lantern_peer_id peer;
+    if (lantern_peer_id_from_text(peer_id_text, &peer) != 0) {
+        return -1;
+    }
+    struct lantern_connection_peer_ref *ref = calloc(1u, sizeof(*ref));
+    if (!ref) {
+        return -1;
+    }
+    free(client->connection_peer_refs);
+    ref->conn = client;
+    ref->peer = peer;
+    client->connection_peer_refs = ref;
+    client->connection_peer_ref_count = 1u;
+    client->connection_peer_ref_capacity = 1u;
+    client->connected_peers = 1u;
+    return 0;
+}
+
+void client_test_clear_connected_peers(struct lantern_client *client) {
+    if (!client) {
+        return;
+    }
+    free(client->connection_peer_refs);
+    client->connection_peer_refs = NULL;
+    client->connection_peer_ref_count = 0u;
+    client->connection_peer_ref_capacity = 0u;
+    client->connected_peers = 0u;
+}
+
 lantern_client_error validator_collect_and_aggregate_attestation_signatures(
     struct lantern_client *client,
     LanternAggregatedAttestations *out_attestations,
@@ -49,6 +82,15 @@ int client_test_gossip_block(struct lantern_client *client, const LanternSignedB
 int client_test_gossip_vote(struct lantern_client *client, const LanternSignedVote *vote) {
     return client && vote
         ? gossip_vote_handler(vote, NULL, NULL, 0, client)
+        : LANTERN_CLIENT_ERR_INVALID_PARAM;
+}
+
+int client_test_gossip_vote_from(
+    struct lantern_client *client,
+    const LanternSignedVote *vote,
+    const struct lantern_peer_id *from) {
+    return client && vote && from
+        ? gossip_vote_handler(vote, from, NULL, 0, client)
         : LANTERN_CLIENT_ERR_INVALID_PARAM;
 }
 
@@ -599,7 +641,6 @@ static int client_test_setup_vote_validation_client_common(
         fprintf(stderr, "failed to process child block into vote test state\n");
         goto finish;
     }
-
     if (anchor_root) {
         *anchor_root = anchor_root_local;
     }

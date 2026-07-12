@@ -20,8 +20,6 @@ static int init_range_assignment(
     if (!assignment->indices) {
         return -1;
     }
-    assignment->start_index = start_index;
-    assignment->count = count;
     assignment->length = (size_t)count;
     for (uint64_t i = 0; i < count; ++i) {
         assignment->indices[i] = start_index + i;
@@ -142,7 +140,7 @@ int main(void) {
         return 1;
     }
 
-    if (lantern_consensus_runtime_validator_count(&runtime) != cfg.validator_count) {
+    if (runtime.validator_count != cfg.validator_count) {
         fprintf(stderr, "validator count mismatch\n");
         return 1;
     }

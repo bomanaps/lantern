@@ -12,6 +12,8 @@ extern "C" {
 
 void client_test_fill_root(LanternRoot *root, uint8_t seed);
 void client_test_fill_root_with_index(LanternRoot *root, uint32_t index);
+int client_test_set_connected_peer(struct lantern_client *client, const char *peer_id_text);
+void client_test_clear_connected_peers(struct lantern_client *client);
 
 int client_test_slot_for_root(struct lantern_client *client, const LanternRoot *root, uint64_t *out_slot);
 bool client_test_pending_contains_root(const struct lantern_client *client, const LanternRoot *root);
@@ -53,6 +55,10 @@ int client_test_record_vote(
     const char *peer_id_text);
 int client_test_gossip_block(struct lantern_client *client, const LanternSignedBlock *block);
 int client_test_gossip_vote(struct lantern_client *client, const LanternSignedVote *vote);
+int client_test_gossip_vote_from(
+    struct lantern_client *client,
+    const LanternSignedVote *vote,
+    const struct lantern_peer_id *from);
 int client_test_gossip_aggregated_attestation(
     struct lantern_client *client,
     const LanternSignedAggregatedAttestation *attestation);

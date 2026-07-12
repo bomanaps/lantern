@@ -29,7 +29,6 @@ extern "C" {
 #define LANTERN_DEFAULT_GENESIS_CONFIG "./genesis/config.yaml"
 #define LANTERN_DEFAULT_VALIDATOR_CONFIG_DIR "./genesis"
 #define LANTERN_DEFAULT_NODES_FILE "./genesis/nodes.yaml"
-#define LANTERN_DEFAULT_GENESIS_STATE "./genesis/genesis.ssz"
 #define LANTERN_DEFAULT_NODE_ID "lantern_0"
 #define LANTERN_DEFAULT_LISTEN_ADDR "/ip4/0.0.0.0/udp/9000/quic-v1"
 #define LANTERN_DEFAULT_HTTP_PORT 5052
@@ -64,8 +63,6 @@ struct lantern_client_options {
     const char *genesis_config_path;
     const char *validator_config_dir;
     const char *nodes_path;
-    const char *genesis_state_path;
-    bool use_genesis_state;
     const char *node_id;
     const char *node_key_hex;
     const char *node_key_path;
@@ -98,15 +95,6 @@ struct lantern_peer_status_entry;
 struct lantern_active_blocks_request;
 struct lantern_async_block_import_job;
 struct lantern_async_block_proposal_job;
-struct lantern_backfill_entry {
-    LanternRoot root;
-    LanternRoot parent_root;
-    uint64_t slot;
-    uint32_t depth;
-    char peer_text[128];
-    bool imported;
-};
-
 struct lantern_backfill_session {
     bool active;
     LanternRoot head_root;
@@ -115,11 +103,11 @@ struct lantern_backfill_session {
     uint64_t anchor_slot;
     uint32_t frontier_depth;
     char peer_text[128];
-    struct lantern_backfill_entry *entries;
+    LanternRoot *roots;
     size_t length;
     size_t capacity;
     uint64_t persisted_count;
-    uint64_t imported_count;
+    size_t imported_count;
     uint64_t dropped_gossip_hints;
 };
 
@@ -130,7 +118,6 @@ struct lantern_pending_block {
     char peer_text[128];
     bool parent_requested;
     uint64_t parent_requested_ms;
-    uint64_t received_ms;
     uint32_t backfill_depth;
 };
 
@@ -195,7 +182,7 @@ struct lantern_validator_signature_history {
 
 struct lantern_local_validator {
     uint64_t global_index;
-    const struct lantern_validator_record *registry;
+    bool disabled;
     uint8_t *secret;
     size_t secret_len;
     bool has_secret;
@@ -233,15 +220,10 @@ struct lantern_client {
     bool gossip_running;
     struct lantern_reqresp_service reqresp;
     bool reqresp_running;
-    uint8_t node_private_key[32];
-    bool has_node_private_key;
     const struct lantern_validator_config_entry *assigned_validators;
     struct lantern_local_validator *local_validators;
     size_t local_validator_count;
     struct lantern_validator_assignment validator_assignment;
-    bool has_validator_assignment;
-    struct PQSignatureSchemePublicKey **validator_pubkeys;
-    size_t validator_pubkey_count;
     struct lantern_consensus_runtime runtime;
     bool has_runtime;
     struct lantern_validator_duty_state validator_duty;
@@ -252,7 +234,6 @@ struct lantern_client {
     bool has_state;
     pthread_mutex_t state_lock;
     bool state_lock_initialized;
-    bool *validator_enabled;
     pthread_mutex_t validator_lock;
     bool validator_lock_initialized;
     struct lantern_peer_vote_metric *peer_vote_stats;
@@ -283,14 +264,10 @@ struct lantern_client {
     uint64_t start_time_seconds;
     struct lantern_http_server http_server;
     bool http_running;
-    bool genesis_fallback_used;
     size_t connected_peers;
     pthread_mutex_t connection_lock;
     bool connection_lock_initialized;
     struct lantern_string_list dialer_peers;
-    struct lantern_string_list connected_peer_ids;
-    struct lantern_string_list connected_peer_refs;
-    struct lantern_string_list inbound_peer_ids;
     struct lantern_connection_peer_ref *connection_peer_refs;
     size_t connection_peer_ref_count;
     size_t connection_peer_ref_capacity;
@@ -314,7 +291,6 @@ struct lantern_client {
     uint64_t sync_last_requested_root_ms;
     uint64_t sync_started_ms;
     uint64_t sync_last_log_ms;
-    uint64_t sync_last_imported_blocks;
     uint64_t sync_imported_blocks;
     uint64_t sync_target_slot;
     LanternSyncState sync_state;
@@ -374,34 +350,6 @@ void lantern_shutdown(struct lantern_client *client);
 int lantern_client_aggregation_subnet_id(
     const struct lantern_client *client,
     size_t *out_subnet_id);
-
-/**
- * Refresh a cached vote's checkpoints and signature if the source checkpoint
- * has changed and the slot's attestation key has not already signed a
- * different vote root.
- *
- * @param validator     Local validator with signing key
- * @param slot          Slot used for signing context
- * @param head          Updated head checkpoint
- * @param target        Updated target checkpoint
- * @param source        Updated source checkpoint
- * @param vote          Vote to refresh, unchanged if signing is refused
- * @param out_refreshed Optional output flag set to true when the vote was
- *                      re-signed
- *
- * @return LANTERN_CLIENT_OK on success
- * @return LANTERN_CLIENT_ERR_INVALID_PARAM on NULL inputs
- * @return LANTERN_CLIENT_ERR_VALIDATOR when signing fails, the key is missing,
- *         or refreshing would reuse a slot key for a different vote root
- */
-int lantern_validator_refresh_cached_vote(
-    struct lantern_local_validator *validator,
-    uint64_t slot,
-    const LanternCheckpoint *head,
-    const LanternCheckpoint *target,
-    const LanternCheckpoint *source,
-    LanternSignedVote *vote,
-    bool *out_refreshed);
 
 /**
  * Publish a signed block to the gossip network.
